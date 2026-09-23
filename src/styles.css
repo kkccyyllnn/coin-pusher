@@ -1,0 +1,902 @@
+:root {
+  --ink: #f2e8d2;
+  --ink-dim: rgba(242, 232, 210, 0.66);
+  --ink-faint: rgba(242, 232, 210, 0.34);
+  --panel: rgba(12, 20, 16, 0.78);
+  --panel-solid: #101a15;
+  --line: rgba(242, 232, 210, 0.22);
+  --brass: #e0b061;
+  --brass-deep: #a9762c;
+  --mint: #6fd3a5;
+  --danger: #d0674a;
+  color: var(--ink);
+  background: #0a0f0c;
+  font-family: "Avenir Next", Avenir, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-synthesis: none;
+  text-rendering: geometricPrecision;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  min-width: 320px;
+}
+
+#app {
+  position: relative;
+  background:
+    radial-gradient(circle at 50% 34%, rgba(31, 82, 60, 0.5), transparent 62%),
+    radial-gradient(circle at 12% 92%, rgba(169, 118, 44, 0.16), transparent 46%),
+    #0a0f0c;
+}
+
+#game-canvas {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+  outline: none;
+  touch-action: none;
+}
+
+/* 高潮反馈：只在边缘闪一下，不遮挡盘面，避免「用特效盖住因果」。 */
+#climax-flash {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+#climax-flash.gold {
+  animation: climax-gold 520ms ease-out;
+}
+
+#climax-flash.green {
+  animation: climax-green 560ms ease-out;
+}
+
+@keyframes climax-gold {
+  0% {
+    opacity: 1;
+    box-shadow: inset 0 0 70px 8px rgba(224, 176, 97, 0.45);
+  }
+  100% {
+    opacity: 0;
+    box-shadow: inset 0 0 150px 34px rgba(224, 176, 97, 0);
+  }
+}
+
+@keyframes climax-green {
+  0% {
+    opacity: 1;
+    box-shadow: inset 0 0 70px 8px rgba(111, 211, 165, 0.45);
+  }
+  100% {
+    opacity: 0;
+    box-shadow: inset 0 0 150px 34px rgba(111, 211, 165, 0);
+  }
+}
+
+/* ── HUD ─────────────────────────────────────────────────────────────── */
+
+#hud {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right))
+    max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+  pointer-events: none;
+}
+
+#hud-top {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+}
+
+#level-chip {
+  flex: 0 0 auto;
+}
+
+/*
+ * 本局赚进：顶部中间那一格。
+ *
+ * v3 摘掉了战役与分数制，所以这里不再有目标进度条——剩下三个数字：
+ * 赚进（本局成绩）/ 最高（历史成绩）/ 钱包（跨局购买力）。
+ */
+#earned-block {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+  min-width: 110px;
+  max-width: 420px;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+}
+
+#earned-block strong {
+  font-size: 0.98rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+#hud-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.hud-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 84px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+}
+
+.hud-label {
+  color: var(--ink-faint);
+  font-size: 0.66rem;
+  letter-spacing: 0.04em;
+}
+
+.hud-chip strong {
+  font-size: 0.98rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+#best-value,
+#wallet-value {
+  color: var(--ink-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+#earned-value {
+  display: inline-block;
+  color: var(--brass);
+  font-variant-numeric: tabular-nums;
+}
+
+#earned-value.bump {
+  animation: earned-bump 320ms ease-out;
+}
+
+@keyframes earned-bump {
+  0% {
+    transform: scale(1);
+  }
+  40% {
+    transform: scale(1.22);
+    color: #ffd88a;
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+#pause-button,
+#collection-button,
+#endless-button,
+#giveup-button,
+#resume-button,
+#retry-button,
+#next-button {
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+  background: var(--panel);
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+#pause-button:hover,
+#collection-button:hover,
+#endless-button:not(:disabled):hover,
+#resume-button:hover,
+#retry-button:hover {
+  border-color: var(--brass);
+}
+
+#endless-button {
+  border-color: var(--brass-deep);
+  color: #ffe1a8;
+}
+
+#endless-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ── 破产弹窗 ────────────────────────────────────────────────────────── */
+
+#ruin-panel {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 30;
+  width: min(88vw, 440px);
+  transform: translate(-50%, -50%);
+  padding: 20px 22px;
+  border: 1px solid var(--danger);
+  border-radius: 14px;
+  background: var(--panel-solid);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.6);
+  text-align: center;
+  pointer-events: auto;
+}
+
+#ruin-panel:not([hidden]) {
+  animation: result-slide-in 280ms cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+
+#ruin-panel h2 {
+  margin: 0 0 10px;
+  color: var(--danger);
+  font-size: 1.15rem;
+  font-weight: 500;
+}
+
+#ruin-taunt {
+  margin: 0 0 14px;
+  color: #ffd88a;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+#ruin-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 12px;
+  margin: 0 0 12px;
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.82rem;
+}
+
+#ruin-stats dt {
+  color: var(--ink-faint);
+  text-align: left;
+}
+
+#ruin-stats dd {
+  margin: 0;
+  color: var(--ink);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+#ruin-board {
+  margin: 0 0 14px;
+  color: var(--ink-dim);
+  font-size: 0.76rem;
+  line-height: 1.6;
+}
+
+#ruin-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#beg-button {
+  padding: 12px 16px;
+  border: 1px solid var(--brass);
+  border-radius: 10px;
+  color: #1a1206;
+  background: linear-gradient(180deg, #ffd88a, var(--brass));
+  font: inherit;
+  font-size: 0.94rem;
+  font-weight: 600;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+#quit-button {
+  padding: 9px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink-dim);
+  background: transparent;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+#quit-button:hover {
+  border-color: var(--ink-faint);
+}
+
+/* ── 图鉴面板 ─────────────────────────────────────────────────────────── */
+
+#collection-panel {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 30;
+  width: min(92vw, 460px);
+  max-height: 84vh;
+  overflow-y: auto;
+  transform: translate(-50%, -50%);
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel-solid);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+  pointer-events: auto;
+}
+
+#collection-panel header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+#collection-panel h2 {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 500;
+}
+
+#collection-panel h3 {
+  margin: 16px 0 8px;
+  color: var(--ink-dim);
+  font-size: 0.82rem;
+  font-weight: 500;
+}
+
+#ticket-count {
+  flex: 1;
+  color: var(--brass);
+  font-size: 0.82rem;
+}
+
+.collection-note {
+  margin: 0 0 4px;
+  color: var(--ink-faint);
+  font-size: 0.74rem;
+  line-height: 1.6;
+}
+
+.skin-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.skin-card {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  grid-template-rows: auto auto;
+  gap: 6px 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.skin-card.selected {
+  border-color: var(--brass);
+  background: rgba(224, 176, 97, 0.12);
+}
+
+.skin-card.locked {
+  opacity: 0.66;
+}
+
+.skin-swatch {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--ink-faint);
+  border-radius: 50%;
+}
+
+.skin-name {
+  font-size: 0.84rem;
+}
+
+.skin-card button {
+  grid-column: 1 / -1;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.05);
+  font: inherit;
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+
+.skin-card button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.skin-card button:not(:disabled):hover {
+  border-color: var(--brass);
+}
+
+/* XIXI 集章：贴在币床上缘的一排小圆点，top 由 Game 按镜头投影写入。 */
+#xixi-marks {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  transform: translate(-50%, -50%);
+}
+
+.mark {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid rgba(242, 232, 210, 0.42);
+  border-radius: 50%;
+  background: rgba(8, 14, 11, 0.62);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.45);
+  transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
+}
+
+.mark .mark-glyph {
+  font-size: 0.72rem;
+  color: var(--ink-dim);
+}
+
+.mark.lit {
+  border-color: var(--brass);
+  background: rgba(224, 176, 97, 0.42);
+  box-shadow: 0 0 12px rgba(224, 176, 97, 0.55);
+}
+
+.mark.lit .mark-glyph {
+  color: #ffe1a8;
+}
+
+.mark.disabled {
+  opacity: 0.36;
+}
+
+#mark-note {
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: rgba(8, 14, 11, 0.62);
+  color: var(--ink-dim);
+  font-size: 0.68rem;
+}
+
+/* 越线得分：从币的屏幕位置飘向进度条。 */
+.fly-score {
+  position: absolute;
+  z-index: 15;
+  color: #ffd88a;
+  font-size: 0.92rem;
+  font-weight: 600;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.7);
+  pointer-events: none;
+  will-change: transform, opacity;
+}
+
+/* 徽标飞行：集齐三路与跪求赏赐到账都用它。 */
+.fly-chip {
+  position: absolute;
+  z-index: 40;
+  padding: 4px 10px;
+  border: 1px solid var(--brass);
+  border-radius: 999px;
+  background: rgba(12, 20, 16, 0.92);
+  color: #ffe1a8;
+  font-size: 0.72rem;
+  white-space: nowrap;
+  pointer-events: none;
+  will-change: transform, opacity;
+}
+
+#combo-toast {
+  align-self: center;
+  margin-top: 6px;
+  padding: 5px 14px;
+  border-radius: 999px;
+  color: #ffe1a8;
+  background: rgba(224, 176, 97, 0.16);
+  font-size: 0.86rem;
+  opacity: 0;
+}
+
+#drain-prompt {
+  align-self: center;
+  max-width: 420px;
+  margin-top: 8px;
+  padding: 12px 16px;
+  border: 1px solid var(--brass);
+  border-radius: 10px;
+  background: var(--panel);
+  text-align: center;
+  pointer-events: auto;
+}
+
+#drain-prompt p {
+  margin: 0 0 10px;
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
+#drain-prompt button {
+  border-color: var(--brass);
+}
+
+#status-line {
+  align-self: center;
+  max-width: 90%;
+  margin: 8px 0 auto;
+  padding: 6px 14px;
+  border-left: 3px solid var(--mint);
+  border-radius: 0 6px 6px 0;
+  background: rgba(12, 20, 16, 0.62);
+  color: var(--ink-dim);
+  font-size: 0.78rem;
+  text-align: center;
+}
+
+#hud-bottom {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+#resource-readout {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+}
+
+#credits-value {
+  font-size: 1.7rem;
+  font-weight: 500;
+  line-height: 1.05;
+  color: var(--brass);
+  font-variant-numeric: tabular-nums;
+}
+
+#action-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+#action-column {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* 机关行：次要操作，尺寸压小，不与投币主按钮抢注意力。 */
+#mechanism-row {
+  display: flex;
+  gap: 6px;
+}
+
+#sweeper-button,
+#grapple-button,
+#reload-button,
+#wheel-button,
+#bet-button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--ink);
+  background: var(--panel);
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+#sweeper-button small,
+#grapple-button small,
+#reload-button small,
+#wheel-button small,
+#bet-button small {
+  color: var(--ink-faint);
+  font-size: 0.6rem;
+}
+
+#sweeper-button:not(:disabled):hover,
+#grapple-button:not(:disabled):hover,
+#reload-button:not(:disabled):hover,
+#wheel-button:not(:disabled):hover,
+#bet-button:not(:disabled):hover {
+  border-color: var(--brass);
+}
+
+#wheel-button:not(:disabled) {
+  border-color: var(--danger);
+}
+
+#bet-button {
+  border-color: var(--brass);
+}
+
+#bet-button[hidden] {
+  display: none;
+}
+
+#sweeper-button:disabled,
+#grapple-button:disabled,
+#reload-button:disabled,
+#wheel-button:disabled,
+#bet-button:disabled {
+  opacity: 0.34;
+  cursor: default;
+}
+
+#boost-button,
+#drop-button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 12px 20px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  background: var(--panel);
+  font: inherit;
+  font-size: 1rem;
+  cursor: pointer;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+#boost-button small,
+#drop-button small {
+  color: var(--ink-faint);
+  font-size: 0.66rem;
+}
+
+#drop-button {
+  min-width: 108px;
+  border-color: var(--brass-deep);
+  background: linear-gradient(180deg, rgba(224, 176, 97, 0.26), rgba(169, 118, 44, 0.16));
+}
+
+#boost-button:not(:disabled) {
+  border-color: var(--mint);
+  box-shadow: 0 0 14px rgba(111, 211, 165, 0.28);
+}
+
+#boost-button:disabled,
+#drop-button:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+/* 加力未充能时隐藏。必须显式写 display:none——上面的 display:flex 会压过 [hidden] 的默认样式。 */
+#boost-button[hidden] {
+  display: none;
+}
+
+#boost-button:not(:disabled) {
+  animation: boost-breathe 1600ms ease-in-out infinite;
+}
+
+@keyframes boost-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 10px rgba(111, 211, 165, 0.22);
+  }
+  50% {
+    box-shadow: 0 0 20px rgba(111, 211, 165, 0.5);
+  }
+}
+
+#boost-button:active:not(:disabled),
+#drop-button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+/* ── 面板 ────────────────────────────────────────────────────────────── */
+
+#pause-panel {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 20;
+  width: min(88vw, 420px);
+  transform: translate(-50%, -50%);
+  padding: 20px 22px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel-solid);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+  text-align: center;
+}
+
+#pause-panel h2 {
+  margin: 0 0 10px;
+  font-size: 1.15rem;
+  font-weight: 500;
+}
+
+#pause-panel p {
+  margin: 0 0 14px;
+  color: var(--ink-dim);
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+
+/* 面板从底部滑入，不是瞬间弹出（破产弹窗与暂停面板共用）。 */
+@keyframes result-slide-in {
+  from {
+    transform: translate(-50%, calc(-50% + 28px));
+    opacity: 0;
+  }
+  to {
+    transform: translate(-50%, -50%);
+    opacity: 1;
+  }
+}
+
+#result-summary {
+  margin: 0 0 14px;
+  color: var(--ink-dim);
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+
+#result-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 12px;
+  margin: 0 0 16px;
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.82rem;
+}
+
+#result-stats dt {
+  color: var(--ink-faint);
+  text-align: left;
+}
+
+#result-stats dd {
+  margin: 0;
+  color: var(--ink);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+#result-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+}
+
+#next-button:not(:disabled) {
+  border-color: var(--brass);
+  background: rgba(224, 176, 97, 0.2);
+}
+
+/* ── 小屏 ────────────────────────────────────────────────────────────── */
+
+@media (pointer: coarse), (max-width: 760px) {
+  #hud {
+    padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right))
+      max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+  }
+
+  #hud-top {
+    gap: 6px;
+  }
+
+  .hud-chip {
+    min-width: 0;
+    padding: 5px 8px;
+  }
+
+  .hud-chip strong,
+  #earned-block strong {
+    font-size: 0.82rem;
+  }
+
+  #earned-block {
+    padding: 5px 8px;
+  }
+
+  #level-chip .hud-label {
+    display: none;
+  }
+
+  #mark-note {
+    display: none;
+  }
+
+  #credits-value {
+    font-size: 1.4rem;
+  }
+
+  #drop-button {
+    min-width: 92px;
+    padding: 14px 18px;
+  }
+
+  #status-line {
+    font-size: 0.72rem;
+  }
+}
+
+/*
+ * 动效降级。信号由 MotionPrefs 写到 <html data-motion>，
+ * CSS 与 JS 读同一个值（以前是 CSS 媒体查询与 JS 标志两套割裂实现）。
+ * 降级只关表现，不关物理：推板推进与台面输送照常跑。
+ */
+[data-motion='reduced'] #earned-value.bump,
+[data-motion='reduced'] #climax-flash.gold,
+[data-motion='reduced'] #climax-flash.green,
+[data-motion='reduced'] #boost-button:not(:disabled) {
+  animation: none;
+}
+
+[data-motion='reduced'] .mark {
+  transition: none;
+}
+
+[data-motion='reduced'] .fly-score,
+[data-motion='reduced'] .fly-chip {
+  display: none;
+}
+
+/* JS 还没跑起来之前的兜底（MotionPrefs 会立刻把同一信号写到 data-motion）。 */
+@media (prefers-reduced-motion: reduce) {
+  #earned-value.bump,
+  #climax-flash.gold,
+  #climax-flash.green,
+  #boost-button:not(:disabled) {
+    animation: none;
+  }
+}

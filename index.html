@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0d0b08" />
+    <link rel="icon" href="data:," />
+    <title>币塔街机 · 网页推币机</title>
+  </head>
+  <body>
+    <main id="app">
+      <canvas id="game-canvas" aria-label="推币机游戏画面"></canvas>
+      <div id="climax-flash" aria-hidden="true"></div>
+
+      <section id="hud" aria-live="polite">
+        <header id="hud-top">
+          <div class="hud-chip" id="level-chip">
+            <span class="hud-label">本局</span>
+            <strong id="level-label">无尽 · xixi 大王大赏</strong>
+          </div>
+
+          <div id="earned-block">
+            <span class="hud-label">本局赚进</span>
+            <strong id="earned-value">0</strong>
+            <span class="hud-label">最高 <strong id="best-value">0</strong></span>
+            <span class="hud-label">钱包 <strong id="wallet-value">0</strong></span>
+          </div>
+
+          <div id="hud-actions">
+            <button id="pause-button" type="button">暂停</button>
+            <button id="collection-button" type="button">图鉴</button>
+          </div>
+        </header>
+
+        <!-- 三路集章：贴在币床上缘（top 由 Game 按镜头投影写入），不挡盘面。 -->
+        <div id="xixi-marks" aria-label="XIXI 集章状态">
+          <div class="mark" data-slot="0"><span class="mark-glyph">X</span></div>
+          <div class="mark" data-slot="1"><span class="mark-glyph">I</span></div>
+          <div class="mark" data-slot="2"><span class="mark-glyph">X</span></div>
+          <div class="mark" data-slot="3"><span class="mark-glyph">I</span></div>
+          <span id="mark-note">投币点亮 XIXI 四槽，集齐摇老虎机</span>
+        </div>
+
+        <div id="combo-toast" role="status" aria-live="polite"></div>
+        <div id="drain-prompt" hidden>
+          <p>收尾阶段：仍持有加力。使用它，或放弃并结算。</p>
+          <button id="giveup-button" type="button">放弃加力并结算</button>
+        </div>
+        <div id="status-line">左右自动选位，轻点机台投币</div>
+
+        <footer id="hud-bottom">
+          <div id="resource-readout">
+            <span class="hud-label">局内筹码</span>
+            <strong id="credits-value">0</strong>
+          </div>
+          <div id="action-column">
+            <div id="mechanism-row">
+              <button id="sweeper-button" type="button">
+                <span>扫板</span>
+                <small id="sweeper-state">收尾可用</small>
+              </button>
+              <button id="grapple-button" type="button">
+                <span>抓斗</span>
+                <small id="grapple-state">剩 2 次 · 花 2 筹码</small>
+              </button>
+              <button id="reload-button" type="button">
+                <span>后装填</span>
+                <small id="reload-state">花 1 筹码 · 注入 3 枚</small>
+              </button>
+              <button id="wheel-button" type="button">
+                <span>转轮</span>
+                <small id="wheel-state">收尾押注</small>
+              </button>
+              <button id="bet-button" type="button">
+                <span>加注</span>
+                <small id="bet-state">1 投 · ×1</small>
+              </button>
+            </div>
+            <div id="action-row">
+              <button id="boost-button" type="button" disabled hidden>
+                <span>加力</span>
+                <small id="boost-state">未充能</small>
+              </button>
+              <button id="drop-button" type="button">
+                <span>投币</span>
+                <small id="drop-state">普通铜币</small>
+              </button>
+            </div>
+          </div>
+        </footer>
+      </section>
+
+      <section id="pause-panel" hidden>
+        <h2>已暂停</h2>
+        <p>推板与物理都已冻结，恢复后不会补算暂停时间。</p>
+        <button id="resume-button" type="button">继续</button>
+      </section>
+
+      <section id="collection-panel" hidden>
+        <header>
+          <h2>图鉴</h2>
+          <span id="ticket-count">筹码 0</span>
+          <button id="collection-close" type="button">关闭</button>
+        </header>
+        <p class="collection-note">
+          外观只改币纹与机柜配色，不影响返值、投币消耗与推板行程。
+        </p>
+        <h3>币纹</h3>
+        <div id="coin-skin-list" class="skin-list"></div>
+        <h3>机柜配色</h3>
+        <div id="cabinet-skin-list" class="skin-list"></div>
+      </section>
+
+      <!-- 破产弹窗：无尽模式的核心产出，不是失败惩罚。 -->
+      <section id="ruin-panel" hidden>
+        <h2 id="ruin-title">破产</h2>
+        <p id="ruin-taunt"></p>
+        <dl id="ruin-stats"></dl>
+        <p id="ruin-board"></p>
+        <div id="ruin-actions">
+          <button id="beg-button" type="button">跪求 xixi 大王大赏</button>
+          <button id="quit-button" type="button">保留尊严，收工</button>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
