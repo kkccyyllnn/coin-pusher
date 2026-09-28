@@ -22,6 +22,32 @@ export type MechanismResult = {
   affected?: number;
 };
 
+/**
+ * 一次**有演出的机关**的计划（R5）。
+ *
+ * ## 为什么要拆成「计划 / 交付」两步
+ *
+ * R5 之前 `sweep()` 与 `grapple()` 是「调用即生效」：一次 `applyImpulse` 全给、
+ * 一次 `setTranslation` 全搬，画面上**没有任何构件**。玩家看不到是谁推的币，
+ * 机关的观感等于零（对比 `ShowDirector` 至少有锥体喷头与闸板）。
+ *
+ * R5 给它们各配一件实体构件，代价是效果必须**跟着构件的动作走**：
+ * 臂扫到某一枚才推那一枚，爪升到顶才松手。于是「谁被影响」与「什么时候生效」
+ * 变成两件事，这里就是前者——`targets` 在**触发那一刻**快照，
+ * 而次数与成本的扣减也同时发生（玩家按下就有反馈，不等演出）。
+ *
+ * ⚠️ 快照之后币可能已经自己越线消失，所以**交付时要逐枚复核 `active`**：
+ * 对已停用的刚体 `applyImpulse` 不会报错，只会静默改到一枚回收中的币身上。
+ */
+export type MechanismPlan = {
+  ok: boolean;
+  reason?: string;
+  /** 触发瞬间快照的目标币。 */
+  targets: Coin[];
+  /** 计划作用的 x（抓斗的爪要对准它；扫板用不到）。 */
+  x?: number;
+};
+
 /** 每局的机关次数（后装填不限次数，受额度限制）。 */
 export const MECHANISM_USES: Record<Exclude<MechanismId, 'reload'>, number> = {
   sweeper: 1,
@@ -41,6 +67,14 @@ const GRAPPLE_HALF = 0.15;
 const GRAPPLE_TARGET_Z = TABLE.scoreLineZ - 0.2;
 /** 扫板只作用于贴着得分线的这一段。 */
 const SWEEP_ZONE = 0.15;
+/**
+ * 抓斗松手的高度（米）= 推板顶面之上 0.28。
+ *
+ * ★ R5 起它同时是**爪提升到顶的高度**：装置必须与交付点在同一处，否则就是
+ * 「币在半空中凭空出现在爪下面」。所以走常量，不在两处各写一遍
+ * `TABLE.pusherTopY + 0.28`（纪律：不在判断 / 视觉里写第二份公式）。
+ */
+const GRAPPLE_LIFT_Y = TABLE.pusherTopY + 0.28;
 /**
  * 扫板给币的冲量（N·s）。
  *
@@ -89,18 +123,30 @@ export class Mechanisms {
   }
 
   /**
-   * 扫板：把贴着得分线犹豫的币向前送一把。
+   * 扫板：**出计划**。把贴着得分线犹豫的币挑出来，交给横扫臂逐枚送一把。
    *
    * 只给冲量，不直接改 z——推不推得过去仍由物理决定，可能被别的币挡住。
+   * 次数在触发时就扣（与 R5 之前一致）：玩家按下就该看到按钮变灰，不该等演出。
    */
-  sweep(): MechanismResult {
-    if (this.uses.sweeper <= 0) return { ok: false, reason: '本局扫板已用完' };
+  sweep(): MechanismPlan {
+    if (this.uses.sweeper <= 0) return { ok: false, reason: '本局扫板已用完', targets: [] };
     const targets = this.collect((coin) => coin.position.z >= TABLE.scoreLineZ - SWEEP_ZONE);
     this.uses.sweeper -= 1;
-    for (const coin of targets) {
-      coin.body.applyImpulse({ x: 0, y: 0, z: SWEEP_IMPULSE }, true);
-    }
-    return { ok: true, affected: targets.length };
+    return { ok: true, targets };
+  }
+
+  /**
+   * 横扫臂**扫到某一枚**时才给这一枚冲量（R5 的分批交付）。
+   *
+   * 每枚币拿到的仍是同一个 `SWEEP_IMPULSE`，目标集也和老写法一字不差 ——
+   * 改的只有**时刻分布**。正因为总冲量不变，账本类判据对「分批 vs 一次全给」
+   * 完全不敏感，写回老写法照样全绿；所以 `mechanisms` 模式新增了一条
+   * 「首末命中必须有时间跨度」的判据来看住这件事。
+   */
+  sweepHit(coin: Coin): boolean {
+    if (!coin.active) return false;
+    coin.body.applyImpulse({ x: 0, y: 0, z: SWEEP_IMPULSE }, true);
+    return true;
   }
 
   /**
@@ -108,28 +154,49 @@ export class Mechanisms {
    *
    * 搬运风险由物理承担：抬到高处再落，落点会散、可能撞开别的币——
    * 不写任何保护逻辑，物理是唯一裁判。
+   *
+   * R5 起这里只出计划，真正的搬运在 `grappleRelease()`（爪升到顶才调用）。
    */
-  grapple(centerX: number): MechanismResult {
-    if (this.uses.grapple <= 0) return { ok: false, reason: '本局抓斗已用完' };
+  grapple(centerX: number): MechanismPlan {
+    if (this.uses.grapple <= 0) return { ok: false, reason: '本局抓斗已用完', targets: [] };
     const targets = this.collect(
       (coin) =>
         Math.abs(coin.position.x - centerX) <= GRAPPLE_HALF &&
         Math.abs(coin.position.z - TABLE.pusherFrontZAtRest) <= 0.6,
     );
-    if (targets.length === 0) return { ok: false, reason: '这个位置没有可抓的币' };
+    if (targets.length === 0) return { ok: false, reason: '这个位置没有可抓的币', targets: [] };
 
     this.uses.grapple -= 1;
-    targets.forEach((coin, index) => {
+    return { ok: true, targets, x: centerX };
+  }
+
+  /**
+   * 抓斗**松手**：把整堆搬到前沿（爪提升到顶的那一刻由演出调用）。
+   *
+   * R5 之前这就是 `grapple()` 的全部动作。返回交付对账：
+   * `skipped` 是演出期间已经自己越线消失的币，判据拿
+   * `delivered + skipped === targeted` 看住「爪吞币」这种静默错。
+   */
+  grappleRelease(plan: MechanismPlan): { delivered: number; skipped: number } {
+    let delivered = 0;
+    let skipped = 0;
+    const centerX = plan.x ?? 0;
+    plan.targets.forEach((coin, index) => {
+      if (!coin.active) {
+        skipped += 1;
+        return;
+      }
       // 横向摊开，避免整堆落在同一个点上互相穿透。间距随币径走（原尺寸 0.055 / 0.06 米），
       // 否则 ×1.2 时 0.055 的间距还不到币径的一半，几枚币会叠在同一个位置反复解穿透。
       const spread = (index % 5) - 2;
       const x = clamp(centerX + spread * 0.055 * COIN_SCALE, -TABLE.drop.halfLane, TABLE.drop.halfLane);
       const z = GRAPPLE_TARGET_Z - Math.floor(index / 5) * 0.06 * COIN_SCALE;
-      coin.body.setTranslation({ x, y: TABLE.pusherTopY + 0.28, z }, true);
+      coin.body.setTranslation({ x, y: GRAPPLE_LIFT_Y, z }, true);
       coin.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
       coin.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      delivered += 1;
     });
-    return { ok: true, affected: targets.length };
+    return { delivered, skipped };
   }
 
   /**
@@ -170,5 +237,7 @@ export const MECHANISM_CONSTANTS = {
   grappleHalf: GRAPPLE_HALF,
   sweepZone: SWEEP_ZONE,
   sweepImpulse: SWEEP_IMPULSE,
+  grappleTargetZ: GRAPPLE_TARGET_Z,
+  grappleLiftY: GRAPPLE_LIFT_Y,
   coinBudget: COIN.budget,
 } as const;

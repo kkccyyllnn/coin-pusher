@@ -41,6 +41,7 @@ import { DebugTools, createDefaultTuning, type GameTuning } from '../systems/Deb
 import { ModelMode } from '../systems/ModelMode';
 import { Hud, type MechanismSnapshot } from '../systems/Hud';
 import { Mechanisms, MECHANISM_COST } from '../systems/Mechanisms';
+import { MechanismShows } from '../systems/MechanismShows';
 import { BOOST_OVERFLOW_FALLBACK, ShowDirector, type ShowId } from '../systems/ShowDirector';
 import { MotionPrefs } from '../systems/MotionPrefs';
 import { PerformanceGovernor, type QualityTier } from '../systems/PerformanceGovernor';
@@ -173,6 +174,14 @@ export class Game {
   private readonly pusher: Pusher;
   /** 三个机关：扫板 / 抓斗 / 后装填（P7 起风险转轮已删除）。 */
   private readonly mechanisms: Mechanisms;
+  /**
+   * 机关构件（R5）：扫板的横扫臂与抓斗的爪。
+   *
+   * 与 `ShowDirector` 分开持有：那边管「庄家发币」的投放演出（有队列、有承诺数、
+   * 中止时不补发），这边只是**玩家当场花钱买的机关**的交付动画（无队列、中止前先把货给完）。
+   * 两者的中止语义**相反**，合成一个类迟早会在注释里打架。
+   */
+  private readonly mechanismShows: MechanismShows;
   private readonly shows: ShowDirector;
   /**
    * 纯视觉币通道（S16）：喷泉演出时从机柜顶部溢流口喷出去、飞到机柜外的筹码。
@@ -397,6 +406,10 @@ export class Game {
       reducedMotion: () => this.motion.reduced,
       spray: this.spray,
     });
+    this.mechanismShows = new MechanismShows({
+      mechanisms: this.mechanisms,
+      reducedMotion: () => this.motion.reduced,
+    });
     this.slotMachine = new SlotMachine({
       shows: this.shows,
       telemetry: this.telemetry,
@@ -549,6 +562,7 @@ export class Game {
     this.audio.dispose();
     this.debugTools.dispose();
     this.coins.dispose();
+    this.mechanismShows.dispose();
     // 视觉币通道（S16）：它自带一份圆柱几何与一份材质，**不是**币池的资源，
     // 所以要单独释放 —— 漏了这一行会在重开游戏时漏掉几何体与一张贴图。
     this.spray.dispose();
@@ -594,6 +608,7 @@ export class Game {
     this.updateFlashes(delta);
     this.updateXixiFlash(delta);
     this.shows.update(delta);
+    this.mechanismShows.update(delta);
     // 视觉币自己积分（没有 Rapier 刚体）。放在演出之后：演出这一帧刚喷出来的币
     // 当帧就动起来，不会出现「先停一帧再飞」。
     this.spray.update(delta);
@@ -1052,13 +1067,16 @@ export class Game {
       this.hud.setStatus('先决定加力：用掉或放弃，然后再扫板');
       return false;
     }
-    const result = this.mechanisms.sweep();
-    if (!result.ok) {
-      this.hud.setStatus(result.reason ?? '扫板不可用');
+    const plan = this.mechanisms.sweep();
+    if (!plan.ok) {
+      this.hud.setStatus(plan.reason ?? '扫板不可用');
       return false;
     }
     this.audio.payoutReturn();
-    this.hud.setStatus(`扫板：把 ${result.affected} 枚贴线的币向前送了一把`);
+    // ★ R5：冲量交给横扫臂**扫到哪里推哪里**，所以这一行返回时币还没动 ——
+    //   `mechanisms` 的判据要等演出落地再读账。
+    this.mechanismShows.runSweep(plan);
+    this.hud.setStatus(`扫板：横扫臂去送 ${plan.targets.length} 枚贴线的币`);
     return true;
   }
 
@@ -1073,15 +1091,17 @@ export class Game {
       this.hud.setStatus(`筹码不足：抓斗要花 ${MECHANISM_COST.grapple} 枚`);
       return false;
     }
-    const result = this.mechanisms.grapple(centerX);
-    if (!result.ok) {
-      this.hud.setStatus(result.reason ?? '抓斗不可用');
+    const plan = this.mechanisms.grapple(centerX);
+    if (!plan.ok) {
+      this.hud.setStatus(plan.reason ?? '抓斗不可用');
       return false;
     }
     // 成本从局内筹码里扣，和直接投币用的是同一个池子——这就是它的机会成本。
     this.run.spendChips(MECHANISM_COST.grapple);
     this.audio.boostUse();
-    this.hud.setStatus(`抓斗：把 ${result.affected} 枚币搬到了前沿`);
+    // ★ R5：爪「下降 → 夹紧 → 提升到前沿」之后才松手搬运，同样是延迟交付。
+    this.mechanismShows.runGrapple(plan);
+    this.hud.setStatus(`抓斗：爪去搬 ${plan.targets.length} 枚币，送到前沿`);
     return true;
   }
 
@@ -1595,6 +1615,8 @@ export class Game {
     // 收工即收摊：在途演出/摇奖一并作废，本局成绩单不再被「收工后才落地的币」追改
     // （那些迟到越线会让 earned 在快照之后继续涨，快照与实时读数就对不上了）。
     this.shows.abort();
+    // 机关构件收摊前**先把交付结清**（钱已经扣了），再拆件。
+    this.mechanismShows.abort();
     this.slotMachine.abort();
     this.pendingXixiSpin = false;
     // 视觉币与演出同生命周期：本局已经结清，在飞的筹码不该继续出现在收工画面上。
@@ -1698,6 +1720,7 @@ export class Game {
     // 在途演出与摇奖必须随本局作废：不中止的话，上一局的塔/喷泉会把剩余承诺数
     // 吐进**这一局**的开局盘面（实测重开后 318 变 324 枚）。
     this.shows.abort();
+    this.mechanismShows.abort();
     this.slotMachine.abort();
     this.pendingXixiSpin = false;
     // 视觉币与演出同生命周期：上一局飞出去的筹码不能飘进这一局的画面。
@@ -1830,6 +1853,8 @@ export class Game {
     this.scene.add(this.pusher.group);
     this.scene.add(this.coins.group);
     this.scene.add(this.shows.group);
+    // 机关构件（R5）与投放演出分开挂：臂与爪只在各自机关的演出期存在。
+    this.scene.add(this.mechanismShows.group);
     // 视觉币通道（S16）。挂 `spray.group` 而不是让演出装置自己持有 ——
     // 在飞的币必须活过演出（见 `CoinSpray` 的模块注释）。
     this.scene.add(this.spray.group);
@@ -2221,6 +2246,15 @@ export class Game {
       reload: () => this.tryReload(),
       cycleBet: () => this.cycleBet(),
       mechanisms: () => this.mechanismSnapshot(),
+      /**
+       * 机关构件的在场与**交付剖面**（R5）。
+       *
+       * 为什么必须暴露：扫板「分批给冲量」与老写法「一次全给」在**账本上完全等价**
+       * （总冲量一样、越线一样），任何计数型判据都读不出区别。只有交付时刻
+       * （`firstHitAt` ~ `lastHitAt` 的跨度、抓斗 `deliveredAt` 晚于提升）能证明这件事，
+       * 而那两个字段的唯一出处就是这里。
+       */
+      mechanismShow: () => this.mechanismShows.report(),
       /** 开一局新的 / 跪求 / 收工，供自动化试玩。 */
       startRun: () => {
         this.startRun();

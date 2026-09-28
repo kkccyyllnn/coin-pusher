@@ -522,6 +522,28 @@ interface ThreeGameTestHooks {
   /** 无尽模式：切换加注档位。 */
   cycleBet?(): boolean;
   mechanisms?(): { sweeper: number; grapple: number; reload: number };
+  /**
+   * 机关构件（R5）：横扫臂 / 抓斗爪的在场与**交付剖面**。
+   *
+   * 为什么必须有这条通道：「分批给冲量」与老写法「一次全给」在账本上**完全等价**
+   * （总冲量、落点、越线全一样），任何计数型判据都读不出区别。只有交付**时刻**
+   * （`firstHitAt`~`lastHitAt` 的跨度、抓斗 `deliveredAt` 晚于提升）能证明改造生效。
+   * 时刻记在引擎自己的时间轴上（降动效只压墙钟、不压这条轴），所以判据不抖。
+   */
+  mechanismShow?(): {
+    active: 'sweep' | 'grapple' | null;
+    busy: boolean;
+    mesh: { name: string; x: number; y: number; z: number; mounted: boolean } | null;
+    last: {
+      id: 'sweep' | 'grapple';
+      targeted: number;
+      delivered: number;
+      skipped: number;
+      firstHitAt: number;
+      lastHitAt: number;
+      deliveredAt: number;
+    } | null;
+  };
   /** 无尽模式：开局 / 跪求 / 收工。 */
   startRun?(): boolean;
   beg?(): boolean;

@@ -3517,10 +3517,17 @@ async function runMechanisms(page) {
   );
 
   // ── 抓斗：花 2 筹码，把选位附近区域的币搬到前沿 ──
+  // ★ R5 起抓斗有了**演出**（爪下降 → 夹紧 → 提升到顶才松手），效果改成**延迟交付**了。
+  //   所以判据必须在触发之后**先等演出落地**再读账：不等就是假红 ——
+  //   币还留在原位，前沿枚数与 chips 一分未动，而钱已经扣了。
   await startRun(page, 'playing');
   await dropUntilAccepted(page, 0);
   const beforeGrapple = await readStateFresh(page);
   const grappled = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.grapple?.(0) ?? false);
+  // 触发后第一件事是确认**装置真的在场**。机关原来是零构件的，
+  // 任何计数型判据都读不出「爪没了」，所以这里读的是网格本身。
+  const clawShown = await waitForShow(page, (r) => r?.mesh?.name === 'grappleClaw' && r.mesh.mounted, 2_000);
+  const grappleShow = await waitForShow(page, (r) => r?.busy === false, 15_000);
   const afterGrapple = await readStateFresh(page);
   const frontCoins = (await readCoins(page)).filter((coin) => coin.z > 0.9);
   const usedGrapple = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.mechanisms?.());
@@ -3546,6 +3553,22 @@ async function runMechanisms(page) {
       `窗口内真实越线返值 +${grappleGain}），` +
       `前沿币 ${frontCoins.length} 枚，剩余次数 ${usedGrapple?.grapple}`,
   );
+  // ★ R5 新增：抓斗爪是**一件实体的机械构件**，而且它「升到顶才松手」。
+  //   `deliveredAt` 由引擎自己的时间轴累积，不拿墙钟去抢跑，所以这条不抖。
+  //   `delivered + skipped === targeted` 是交付对账：中途越线消失的币算流失，不算漏发。
+  const grappleDelivered = grappleShow?.last ?? null;
+  check(
+    '抓斗爪：网格在场，且币在**提升之后**才交付（延迟交付，不是调用即 teleport）',
+    clawShown?.mesh?.name === 'grappleClaw' &&
+      clawShown?.mesh?.mounted === true &&
+      grappleDelivered !== null &&
+      grappleDelivered.id === 'grapple' &&
+      grappleDelivered.delivered + grappleDelivered.skipped === grappleDelivered.targeted &&
+      grappleDelivered.deliveredAt >= 0.4,
+    `网格 ${clawShown?.mesh?.name ?? '缺件'}（挂在场景=${clawShown?.mesh?.mounted}，x=${clawShown?.mesh?.x?.toFixed(3)}），` +
+      `交付 ${grappleDelivered?.delivered ?? 0}/${grappleDelivered?.targeted ?? 0} 枚` +
+      `（流失 ${grappleDelivered?.skipped ?? 0}）在第 ${((grappleDelivered?.deliveredAt ?? 0) * 1000).toFixed(0)} 毫秒`,
+  );
 
   // ── 扫板：收尾停板之后才开放 ──
   // 开放窗口很窄，所以带重试：停板后盘面静止 0.8 秒（`RULES.restHold`）收尾就走完，
@@ -3563,6 +3586,8 @@ async function runMechanisms(page) {
   let usedSweep = null;
   let beforeSweep = draining;
   let afterSweep = draining;
+  let armShown = null;
+  let sweepEnd = null;
   for (let attempt = 0; attempt < 20 && swept !== true; attempt += 1) {
     if (attempt > 0) {
       const again = await enterDrain();
@@ -3570,6 +3595,9 @@ async function runMechanisms(page) {
       beforeSweep = again;
     }
     swept = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.sweep?.() ?? false);
+    // ★ R5：冲量改成**臂扫到哪里就推哪里**，所以账目要等臂扫完才对得上。
+    armShown = await waitForShow(page, (r) => r?.mesh?.name === 'sweepArm' && r.mesh.mounted, 2_000);
+    sweepEnd = await waitForShow(page, (r) => r?.busy === false, 15_000);
     afterSweep = await readStateFresh(page);
     usedSweep = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.mechanisms?.());
   }
@@ -3586,6 +3614,25 @@ async function runMechanisms(page) {
       sweepGain >= 0 &&
       ledgerOk(afterSweep),
     `扫板后赚进 +${sweepGain} 筹码（全部来自真实越线，扫板本身不扣筹码），剩余次数 ${usedSweep?.sweeper}`,
+  );
+  // ★ R5 新增：**分批**是这一轮改造的全部意义。一次把冲量全给 vs 臂扫到哪里推哪里，
+  //   对**账本完全等价**（总冲量一样、越线一样），所以只有**首末命中的时刻跨度**能区分二者：
+  //   写回一次性 `applyImpulse` 的话 `spread` 归零，这条立刻红。
+  const sweepDelivered = sweepEnd?.last ?? null;
+  const spread = (sweepDelivered?.lastHitAt ?? 0) - (sweepDelivered?.firstHitAt ?? 0);
+  check(
+    '扫板臂：网格在场，且冲量按臂的行程**分批**给（首末命中有跨度）',
+    armShown?.mesh?.name === 'sweepArm' &&
+      armShown?.mesh?.mounted === true &&
+      sweepDelivered !== null &&
+      sweepDelivered.id === 'sweep' &&
+      sweepDelivered.delivered + sweepDelivered.skipped === sweepDelivered.targeted &&
+      // 只有一枚贴线币时本来就没有「分批」可言，那种盘面不判跨度。
+      (sweepDelivered.targeted <= 1 || spread >= 0.05),
+    `网格 ${armShown?.mesh?.name ?? '缺件'}（挂在场景=${armShown?.mesh?.mounted}，x=${armShown?.mesh?.x?.toFixed(3)}），` +
+      `命中 ${sweepDelivered?.delivered ?? 0}/${sweepDelivered?.targeted ?? 0} 枚` +
+      `（流失 ${sweepDelivered?.skipped ?? 0}），跨度 ${(spread * 1000).toFixed(0)} 毫秒` +
+      `（第 ${(sweepDelivered?.firstHitAt ?? 0).toFixed(2)}~${(sweepDelivered?.lastHitAt ?? 0).toFixed(2)} 秒）`,
   );
 
   // ── P7：停板窗口加宽（已知欠账）──
@@ -5303,6 +5350,24 @@ async function runCamera(page, context) {
 }
 
 /** 轮询视觉币读数直到满足条件（`sprayReport` 没有事件，只能轮询）。 */
+/**
+ * 等**机关演出**（R5：扫板臂 / 抓斗爪）。与 `waitForSpray` 同构，读的是
+ * `mechanismShow()` 而不是诊断快照。
+ *
+ * 为什么判据非等不可：R5 起两个机关的效果是**延迟交付**的（臂扫到才推、爪升到顶才松手），
+ * 触发后立刻读账会得到「钱扣了、币没动」的假红。
+ */
+async function waitForShow(page, predicate, timeoutMs = 8_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.mechanismShow?.() ?? null);
+    if (predicate(last)) return last;
+    await page.waitForTimeout(50);
+  }
+  return last;
+}
+
 async function waitForSpray(page, predicate, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   let last = null;
