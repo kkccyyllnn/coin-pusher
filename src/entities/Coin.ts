@@ -13,6 +13,20 @@ export interface CoinRenderHooks {
   detach(coin: Coin): void;
 }
 
+/**
+ * `clampSpeed` 压到了一次时交出去的读数（R4-P3 的 ⑥ 冷热配对判据读它）：
+ *
+ * - `pre`：**截断前总速率**（`Math.hypot`，含横向）——不是向上分量，也不是截断后的值。
+ *   它的合法上界是落体预算 6.68 米/秒（见 `COIN.maxUpwardSpeed` 注释第 ④ 条），
+ *   不是喷泉初速度 2.2；把这两个量混了就是一条假红。
+ * - `postUpward`：**截断后向上分量**。「泄流律只减不增」需要的是这个直接观测量；
+ *   只有 `pre` 的话那句话就只是推断。
+ */
+export interface SpeedClampSample {
+  pre: number;
+  postUpward: number;
+}
+
 // sync() 每帧对几百枚币各跑一次，矩阵与向量全部模块级复用，不在堆上分配。
 const _position = new THREE.Vector3();
 const _quaternion = new THREE.Quaternion();
@@ -64,6 +78,17 @@ export class Coin {
    * 全绿。补币的第一条行为判据（币床枚数要回升）才把它照出来。
    */
   preset = false;
+  /**
+   * 这枚币是**投放演出**（塔 / 闸门 / 喷泉 / 宝箱）从 `spawnOne` 生成的。
+   *
+   * 只为一件事存在：R4-4b 之后柱体会真的推币，于是「越线一枚币」在账本上是同一个读数，
+   * 但经济意义完全不同 —— 演出自己顶出来的币（水源）vs **柱子把存量币床拱过线**（白送）。
+   * 后者是 4b 唯一没被测过的风险，而且只有币自己知道自己出自哪里；
+   * 让验证脚本去反推就等于抄第二份口径（纪律 2）。
+   *
+   * ⚠️ 池化对象 ⇒ 必须在 `spawn()` 里归位，否则一枚币演过一次塔就永远是「演出币」。
+   */
+  fromShow = false;
   /** 已经登记过 XIXI 槽位（每枚只登记首次）。 */
   xixiMarked = false;
   /** 已越过得分线，防止重复结算。 */
@@ -186,6 +211,7 @@ export class Coin {
     this.kind = kind;
     this.playerDropped = playerDropped;
     this.preset = preset;
+    this.fromShow = false;
     this.xixiMarked = false;
     this.settled = false;
     this.betMul = 1;
@@ -259,16 +285,30 @@ export class Coin {
    * 速度护栏：把求解器**凭空造出来的**速度压回这台机器物理上可能的值。
    *
    * 两个上限的取值依据见 `COIN.maxSpeed` / `COIN.maxUpwardSpeed` 的注释。
-   * 返回**压之前的速率**（没压到就返回 0）——调用方拿它做遥测，
-   * 这样「求解器还在不在造能量」是可观测的，而不是被悄悄抹平。
+   * 一次压到就交出一个 `SpeedClampSample`（没压到返回 null）——调用方拿它做遥测，
+   * 这样「求解器还在不在造能量」与「压完还剩多少」都是可观测的，而不是被悄悄抹平。
    *
    * 只在**醒着**的币上调用：睡着的币不参与积分，不可能产生速度尖峰。
+   *
+   * **向上那一路是连续泄流（R4-P3），不是硬截断**：
+   * `y -= (y - maxUpward) × (1 - exp(-dt / tau))`，`tau = coinPhysics.upwardBleedTau`。
+   * 阈值处修正量恰好为 0 ⇒ 整条律对速度连续，于是「同一次弹跳是否被削、削多少」
+   * 不再取决于尖峰落在哪一子步（原来的 `if (y > maxUpward) y = maxUpward` 在阈值处
+   * 有折角，本身就是噪声源）。代价：超阈部分存续更久 ⇒ `peakSpikeSpeed` 会合理地变高，
+   * 所以判据 6.3 的口径与 `tau` 的标定是绑在一起的，见 `COIN.upwardBleedTau`。
+   *
+   * `dt` 由调用方传**子步长**（`Game.fixedUpdate` 的 `fixedDt`），不在这里读常量：
+   * 这条律的自变量是积分步长，写死会随 `maxSubSteps` 的变化悄悄改变含义。
+   * `tau` 读 `coinPhysics` 注册表（**仍然没有滑块**，理由见那个键的注释）：
+   * A/B 要在一次页面加载里换臂，而改常量会触发整页刷新、作废进行中的验证批。
    */
-  clampSpeed(maxSpeed: number, maxUpward: number): number {
+  clampSpeed(maxSpeed: number, maxUpward: number, dt: number): SpeedClampSample | null {
     const v = this.body.linvel();
     let { x, y, z } = v;
     const before = Math.hypot(x, y, z);
-    if (y > maxUpward) y = maxUpward;
+    if (y > maxUpward) {
+      y -= (y - maxUpward) * (1 - Math.exp(-dt / coinPhysics.upwardBleedTau));
+    }
 
     let after = Math.hypot(x, y, z);
     if (after > maxSpeed) {
@@ -279,9 +319,9 @@ export class Coin {
       after = maxSpeed;
     }
 
-    if (after === before) return 0;
+    if (after === before) return null;
     this.body.setLinvel({ x, y, z }, true);
-    return before;
+    return { pre: before, postUpward: y };
   }
 
   /** 台面输送：只补足向前速度，不覆盖横向与垂直运动。 */

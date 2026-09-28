@@ -30,6 +30,11 @@ interface ThreeGameDiagnostics {
   /** 收尾阶段推板是否已停板（扫板的开放条件）。 */
   plateStopped: boolean;
   activeCoins: number;
+  /**
+   * 本局累计越线结算枚数。与 `activeCoins` 配成守恒式用（见 `Game.settledCoins`）：
+   * 「两个时刻的活跃币变少」本身不是丢币，期间推板照常在结算。
+   */
+  settledCoins: number;
   anomalies: number;
   /**
    * 掉进币床前侧角下水道的币数（P10 的「汇」）。
@@ -75,6 +80,13 @@ interface ThreeGameDiagnostics {
    */
   spikeClamps: number;
   peakSpikeSpeed: number;
+  /**
+   * 护栏压**之后**剩下的向上速度峰值（R4-P3「只减不增」的直接观测量）。
+   * ⚠️ 它与 `peakSpikeSpeed` 不是同一个量的前后：那条是截断前**总速率**，
+   * 这条是截断后**向上分量**。泄流律只逼近阈值、不越过，所以本值**允许大于阈值**，
+   * 有效的上界是「≤ 截断前总速率」。
+   */
+  peakPostClampUpward: number;
   /** 钉阵：网格长度是显示值，碰撞体长度是物理值，两者刻意不同。 */
   pegs: {
     count: number;
@@ -178,6 +190,12 @@ interface ThreeGameDiagnostics {
         angularDamping: number;
         maxSpeed: number;
         maxUpwardSpeed: number;
+        /**
+         * 上抛泄流时间常数（秒）。A/B 用它标注参数组：
+         * `post ≤ 阈值` 这条判据**只在 τ→极小（硬截断）时成立**，
+         * 读数不带走 τ 就没法复现（见 `Coin.clampSpeed`）。
+         */
+        upwardBleedTau: number;
       };
       pusher: {
         /** 单程行程（米）。 */
@@ -451,6 +469,11 @@ interface ThreeGameTestHooks {
    * `showColliders` 这几个布尔项在脚本里设不了（`Object.assign` 运行时本来就支持）。
    */
   setTuning?(patch: Record<string, number | boolean>): Record<string, unknown>;
+  /**
+   * 直接写 `coinPhysics` 注册表（不经调参表、不上滑块）。
+   * 拼错的键会抛错，不会静悄悄写进一个不存在的属性。
+   */
+  setCoinPhysics?(patch: Record<string, number>): Record<string, number>;
 
   // ── 音频调试 ────────────────────────────────────────────────────────────
   // 这一组与调试面板的「音效」folder 共用同一张事件表（`audioCatalog.ts`），
@@ -758,6 +781,10 @@ interface ThreeGameTestHooks {
   setXixi?(slots: boolean[]): ThreeXixiLaneReport;
   /** 推板前缘 XIXI 标牌的实际状态与几何（判据按计数比对，不看截图）。 */
   xixiLanes?(): ThreeXixiLaneReport;
+  /** 世界里的碰撞体总数（R4-4b 塔柱体的生命周期自证用，按需调、不进每帧 diagnostics）。 */
+  countColliders?(): number;
+  /** 演出窗口内越线的分类累计（R4-4b 的「汇」）：见 `Game.showWindowCrossings`。 */
+  showWindow?(): { crossings: number; foreign: number };
   /** 往钱包补筹码（测试/调试）：反复 `startRun` 会把钱包掏空，用例前先补满。 */
   refillWallet?(amount?: number): { wallet: number; refilled: number };
   /** 把钱包设成指定值：用来确定性构造「钱包见底」场景。 */

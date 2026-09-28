@@ -34,7 +34,13 @@ export type CoinPhysicsKey =
   | 'linearDamping'
   | 'angularDamping'
   | 'maxSpeed'
-  | 'maxUpwardSpeed';
+  | 'maxUpwardSpeed'
+  /**
+   * 上抛泄流的时间常数（秒）。R4-P3 起进注册表，但**不给滑块**：
+   * 它是「护栏以什么形状生效」的定义，不是手感旋钮；进注册表只为了
+   * τ 的 A/B 能在**同一次页面加载**里换臂（改常量＝整页刷新，会作废进行中的批）。
+   */
+  | 'upwardBleedTau';
 
 /**
  * 出厂默认值 —— **一律取自 `COIN.*`**。
@@ -50,6 +56,7 @@ export const COIN_PHYSICS_DEFAULTS: Readonly<Record<CoinPhysicsKey, number>> = {
   angularDamping: COIN.angularDamping,
   maxSpeed: COIN.maxSpeed,
   maxUpwardSpeed: COIN.maxUpwardSpeed,
+  upwardBleedTau: COIN.upwardBleedTau,
 };
 
 /**
@@ -58,6 +65,14 @@ export const COIN_PHYSICS_DEFAULTS: Readonly<Record<CoinPhysicsKey, number>> = {
  * ⚠️ `friction` 只有**一半**效果：Rapier 默认使用 **Average** 合并规则，
  * 币↔台面的实际摩擦是 `(coin.friction + 台面摩擦) / 2`，台面值在
  * `TableBuilder.ts` 的 `floorFriction`（0.45）。单改币侧改不动一半。
+ * **摩擦是推进率（`perDrop`）的输入，R4 刻意没有给它换规则** —— 它继续走 Average，
+ * 否则「改弹性」会连带把节拍基线打翻。
+ *
+ * ✅ `restitution` **已经不走 Average**：R4-P2 把弹性合并规则统一设成 **Min**
+ * （见 `systems/PhysicsWorld.ts` 的 `RESTITUTION_COMBINE_RULE`），于是这里改币侧是
+ * **单边生效**的 `min(币, 对面)`。两点后果，拖滑块前要先知道：
+ *   · 给它 0 会抹平整台机器的回弹 —— 地板、背墙、围板对面本来就是 0～0.02；
+ *   · 把它抬过某一面自己的弹性之后，对那一对接触就再也无效（Min 取的是对面）。
  *
  * ⚠️ `maxUpwardSpeed` 与侧向围板 `GLASS_TOP` 是**配套**的：放太开会飞越围板、
  * 触发 `anomalies`。

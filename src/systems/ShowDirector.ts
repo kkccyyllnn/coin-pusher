@@ -1,8 +1,10 @@
 import * as THREE from 'three';
+import * as RAPIER from '@dimforge/rapier3d-compat';
 import type { CoinPool } from '../entities/CoinPool';
 import { coinColliderHeight, coinColliderSpec } from '../entities/coinModels';
 import { COIN, TABLE, type CoinKind } from '../game/constants';
 import { makeToonMaterial } from '../render/ToonMaterial';
+import { RESTITUTION_COMBINE_RULE } from './PhysicsWorld';
 import type { Telemetry } from './Telemetry';
 import { SPILL_ORIFICE, SPILL_ORIFICE_SIZE, type CoinSpray } from './CoinSpray';
 
@@ -45,6 +47,14 @@ export type ShowResult = {
 
 type ShowDeps = {
   coins: CoinPool;
+  /**
+   * Rapier 世界。**目前只有一个消费者**：R4-4b 的塔柱顶要建 kinematic 碰撞体，
+   * 让「柱子升起」真的推币，而不是像改前那样只是一根纯视觉 Mesh、币穿它而过。
+   *
+   * 其余装置一律不碰它——铁律 1「演出 ≠ 视觉假币」靠的是 `CoinPool` 的真币，
+   * 不是靠这里能拿到世界。给它只是为了 4b，别顺手把喷泉也改成推币。
+   */
+  world: RAPIER.World;
   telemetry: Telemetry;
   /** HUD 文案反馈（拒绝/降级必须让玩家看得见）。 */
   notify: (message: string) => void;
@@ -414,6 +424,7 @@ export class ShowDirector {
     const coin = deps.coins.acquire();
     if (!coin) return false;
     coin.spawn(kind, x, y, z, yaw, false);
+    coin.fromShow = true;
     if (velocity) coin.body.setLinvel(velocity, true);
     return true;
   }
@@ -569,6 +580,89 @@ class TowerShow extends TimedShow {
     return 0.03 + this.layers * this.layerStep();
   }
 
+  /**
+   * R4-4b：柱顶的**真碰撞体**。一根 kinematic 圆柱，跟着网格一起长。
+   *
+   * 改前 `this.cylinder` 是纯视觉 Mesh、没有碰撞体 ⇒「塔顶开」画面上有根柱子升起来，
+   * 物理上什么都不推，币只是 spawn 在柱顶再落回原有缝隙。加了碰撞体之后柱子会真的
+   * 拱起币床——这正是计划里点名的风险（白送结算），所以配套要求见下面 `syncCollider`
+   * 的**有界重建**规则，以及验证侧的 `DRAIN` 成对判据。
+   *
+   * 三个字段各管一件事，别合并：`towerBody` 是资源（必须在 dispose 里还回世界）、
+   * `towerCollider` 是形状的载体（`setShape` 只能换整块）、
+   * `colliderHalfHeight` 是**碰撞体自己的当前高度**——判据要拿「网格高度」和它比，
+   * 拿两次网格高度互相比是比不出滞后的。
+   */
+  private towerBody: RAPIER.RigidBody | null = null;
+  private towerCollider: RAPIER.Collider | null = null;
+  private colliderHalfHeight = 0;
+
+  /** 柱体的世界落点：与 `buildMeshes` 里网格的 `position.set(this.x, 0, 0.3)` 同一处。 */
+  private static readonly COLUMN_Z = 0.3;
+
+  /**
+   * 懒建 kinematic 柱体。**第一帧 `tick` 才建**，不在 `ShowDirector` 构造期建：
+   * 演出是按需的，构造期建等于每局都往世界里塞一根没人看的柱子。
+   *
+   * 三处刻意的设计：
+   * - 形状先给 `0.0005` 半高（≈看不见），随后由 `syncCollider` 立刻追上真实高度。
+   * - `setRestitutionCombineRule` **必须自己设**：开机那次 `forEachCollider` 扫描
+   *   （`PhysicsWorld.applyRestitutionCombineRule`）只覆盖扫描那一刻存在的碰撞体，
+   *   演出期新建的吃不到——这是 R4-P2 就写进注释的已知边界。漏了它，币↔柱这一对
+   *   会静默退回 Average，弹性变成「看谁先建」的函数。
+   * - 摩擦给 0.35，与推板立面（`Pusher` 的两块碰撞体）同值：都是「装置顶着币床走」的
+   *   接触面，用同一个数才不会出现「同样是推动面，一个拖一个滑」。
+   *   弹性给 0：柱子不该把币弹开，Min 规则下它同时保证了币↔柱 = 0。
+   */
+  private ensureCollider(): void {
+    if (this.towerBody) return;
+    const radius = towerCylinderRadius(this.kind);
+    this.towerBody = this.deps.world.createRigidBody(
+      RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(
+        this.x,
+        0,
+        TowerShow.COLUMN_Z,
+      ),
+    );
+    this.towerCollider = this.deps.world.createCollider(
+      RAPIER.ColliderDesc.cylinder(0.0005, radius)
+        .setFriction(0.35)
+        .setRestitution(0)
+        .setRestitutionCombineRule(RESTITUTION_COMBINE_RULE),
+      this.towerBody,
+    );
+    this.colliderHalfHeight = 0.0005;
+  }
+
+  /**
+   * 把碰撞体追上网格高度：位置每帧跟、**形状按有界规则重建**。
+   *
+   * Rapier 不能热改碰撞体尺寸，只能 `setShape` 换一块 ⇒ 逐帧换会把 `perf` 的
+   * 帧率判据打崩。但「只在层边界重建」也不够：`tick()` 是**逐帧**改高度的
+   * （升起段线性长、`hold` 之后线性缩），而 `spawnedLayers` 只在层边界自增，
+   * 跟着层走的话**回缩段会让碰撞体停在旧高度继续顶币**——那是「没有理由地把币
+   * 拱过得分线」，比升起段滞后危险得多。
+   *
+   * ⇒ 采用「网格高度与碰撞体当前高度差 ≥ 一层 `layerStep()` 就重建」：
+   *   每层最多两次（边界一次 + 回缩穿越一次），滞后被压在一层以内，且**回缩段同样覆盖**。
+   *
+   * 位置走 `setNextKinematicTranslation` 而不是直接改 collider 的相对平移：
+   * kinematic 刚体的速度是 Rapier 从「下一位置 − 当前位置」推出来的，只有走这条口
+   * 柱子才是「以某个速度顶上去」；直接改 collider 平移等于瞬移，求解器会按穿透处理，
+   * 每一帧都注一次能量（`anomalies` / `peakSpikeSpeed` 就是抓这个的）。
+   */
+  private syncCollider(height: number): void {
+    this.ensureCollider();
+    const body = this.towerBody;
+    if (!body) return;
+    const half = Math.max(0.0005, height / 2);
+    body.setNextKinematicTranslation({ x: this.x, y: half, z: TowerShow.COLUMN_Z });
+    if (Math.abs(half - this.colliderHalfHeight) * 2 >= this.layerStep()) {
+      this.towerCollider?.setShape(new RAPIER.Cylinder(half, towerCylinderRadius(this.kind)));
+      this.colliderHalfHeight = half;
+    }
+  }
+
   protected tick(t: number): void {
     if (!this.cylinder) return;
     const hold = this.rise + this.layers * this.perLayer;
@@ -588,7 +682,26 @@ class TowerShow extends TimedShow {
     }
     this.cylinder.scale.y = Math.max(0.001, height);
     this.cylinder.position.y = height / 2;
+    // 碰撞体与网格**同一条派生**：都只吃这一个 `height`，不引入第二个高度来源。
+    this.syncCollider(height);
     this.tickHalo(t, hold);
+  }
+
+  /**
+   * 拆演出时把刚体**还回世界**。
+   *
+   * ⚠️ 基类 `TimedShow.dispose()` 只遍历 mount 拆几何与材质——它不知道物理世界的存在。
+   * 漏这一步等于每次塔演出泄漏一根 kinematic 圆柱：币床里会莫名出现「看不见的墙」,
+   * 而 `activeCoins`、`anomalies` 一类判据**全都读不出它**（没有币、也没有穿透，
+   * 只是多了一个碰撞体）。所以这里显式 `removeRigidBody`，并在删后置空。
+   */
+  dispose(): void {
+    if (this.towerBody) {
+      this.deps.world.removeRigidBody(this.towerBody);
+      this.towerBody = null;
+      this.towerCollider = null;
+    }
+    super.dispose();
   }
 
   /**

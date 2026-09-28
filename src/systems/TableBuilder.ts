@@ -326,7 +326,10 @@ export function buildTable(world: RAPIER.World): TableBuild {
           FIELD_CENTER_Z,
         )
         .setFriction(0.24)
-        .setRestitution(0.14),
+        /* R4-P1：0.14 → 0.08，和钉子收进同一条窄带。侧墙原本是仅次于钉子的软面，
+           Average 下给币↔墙留 0.07 的回弹 —— 「回弹忽强忽弱」里的『忽强』有一半是它。
+           内侧面位置不动（x = ±0.80），这里只改材料属性。 */
+        .setRestitution(0.08),
     );
 
     /*
@@ -453,7 +456,11 @@ export function buildTable(world: RAPIER.World): TableBuild {
           .setTranslation(x, row.y, TABLE.drop.z)
           .setRotation(pegQuaternion)
           .setFriction(0.12)
-          .setRestitution(0.3),
+          /* R4-P1：0.3 → 0.08。0.3 是全机台最软的一处弹性，比其余表面高一个数量级，
+             在 Average 下给币→钉留下 0.15 的有效回弹 —— 观感就是「撞钉乱蹦、其余全黏」。
+             收进和围板同一窄带（.08），钉子的散射只保留在**几何**层面（打散落点），
+             不再兼任弹射器。 */
+          .setRestitution(0.08),
       );
       pegPosition.set(x, row.y, TABLE.drop.z);
       pegMatrix.compose(pegPosition, pegWorldQuat, pegScale);

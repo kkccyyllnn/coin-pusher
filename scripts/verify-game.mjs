@@ -51,6 +51,82 @@ const BASE = (() => {
 })();
 const MODE = process.argv[2] ?? 'probe';
 
+/**
+ * 虚拟时钟泵（只有 ECON_CLOCK=1 才开，默认关）。
+ *
+ * ## 为什么需要它
+ *
+ * 实测本机仿真**正好跑在实时**：仿真秒 / 墙钟秒 = 1.000，60.0 fps，每帧 dt 16.7 ms
+ * （满盘 331 枚币、软件渲染）。所以 ECON_RUNS=200 的十几个小时是 rAF 墙钟锁死的，
+ * 跟光栅化无关——把内部分辨率降到 160x100 只把加速比从 2.40x 抬到 2.42x，
+ * 说明「换 GPU 就快了」是错的。
+ *
+ * page.clock 把 rAF 的时间戳变成可编程推进：每帧 dt 仍是 16 ms（与 60 fps 真机
+ * 同一条子步序列，物理世界每仿真秒照样 60 个 step），只是不再等实时。
+ *
+ * ## 为什么默认关
+ *
+ * 泵会改变 waitFor 的超时语义（同样的真实超时能跑到 ~2.4 倍的仿真时间）。
+ * 其他模式的既有读数都建立在「墙钟 = 仿真钟」上，不能被它悄悄改掉。
+ */
+/* 泵只对 `economy` 安全，所以门控收在这**一个**标志位上，而不是只挡 `page.clock.install()`：
+   `openGame` 的 install、`simTick` 的 runFor、`startClockPump` 的外层泵全部读同一个标志。
+   原来只靠 env，非 economy 模式会「装上假时钟却没人泵」——Playwright 的 clock 装了之后
+   不 `runFor` 就不走时间，rAF 时间戳停住 ⇒ 循环停摆 ⇒ 一片看着像物理回归的超时红。
+   放在这里之后，`ECON_CLOCK=1 node scripts/verify-game.mjs perf` 就是**逐字节等价于不开泵**。 */
+const CLOCK_ENABLED = process.env.ECON_CLOCK === '1' && MODE === 'economy';
+
+/**
+ * 「等 ms 毫秒」的两种口径：默认（真实墙钟）与开泵（仿真时间）。
+ *
+ * 为什么必须成对存在：harness 的等待粒度原本写的是**墙钟**（waitFor 每 250 ms 轮询、
+ * 投币重试每 70 ms、投币之间 sleep 300 ms），而引擎的推板循环与结算跑在**仿真钟**上。
+ * 实时跑时两者 1:1；一旦开泵（实测吞吐 ~2.4x），同样的墙钟等待就变成几倍的仿真间隔，
+ * **事件落到仿真轴的位置被改掉** ⇒ 量到的是协议差而不是物理差。
+ *
+ * ⚠️ 这里原先写的证据（「越线/投币从 0.456 涨到 0.848」）出自**修协议之前**的 n=4 批，
+ * 修好之后的 n=20 配对批读数反向（实时 0.778 / 泵 0.514），所以它不能当判据用；
+ * 真正的机制是上面那句「事件在仿真轴上的位置」，不是子步丢失
+ * （2026-09-29 四腿对照实测：每仿真秒 60 帧、每帧 1 个子步，泵腿与实时腿同构）。
+ */
+async function simTick(page, ms) {
+  if (CLOCK_ENABLED) {
+    await page.clock.runFor(ms);
+    return;
+  }
+  await page.waitForTimeout(ms);
+}
+
+/**
+ * 泵的时间量子，默认 200 ms（实测约 2.4x 吞吐）：更长会让 Playwright 的输入/求值调用
+ * 排队等太久，更短则 Node 侧调度开销占比过高。
+ *
+ * ★ 但它同时是**仿真轴上的网格间距**：`simTick(70)` 之类按仿真毫秒请求的等待，
+ * 落地时仍被后台泵向上取整到 200 ms ⇒ 事件只能对齐到 200 ms 网格。
+ * 要做「同种子、两腿逐位对照」这类等价性判据，粒度必须不超过最窄的那条等待
+ * （`dropUntilAccepted` 的 70 ms），所以留 `ECON_PUMP_STEP` 这个旋钮。
+ */
+const PUMP_STEP_MS = Math.max(1, Math.round(Number(process.env.ECON_PUMP_STEP ?? 200)));
+
+function startClockPump(page) {
+  if (!CLOCK_ENABLED) return async () => {};
+  let stopped = false;
+  const run = async () => {
+    while (!stopped) {
+      try {
+        await page.clock.runFor(PUMP_STEP_MS);
+      } catch {
+        return; // 页面已关闭
+      }
+    }
+  };
+  const promise = run();
+  return async () => {
+    stopped = true;
+    await promise;
+  };
+}
+
 const results = [];
 function check(name, ok, detail = '') {
   results.push({ name, ok, detail });
@@ -65,10 +141,18 @@ async function openGame(browser) {
   page.on('console', (message) => {
     if (message.type() === 'error') errors.push(message.text());
   });
+  // 时钟必须在导航之前接管：goto 之后建立的 rAF 时间戳就不归 page.clock 管了。
+  if (CLOCK_ENABLED) await page.clock.install();
   await page.goto(BASE, { waitUntil: 'domcontentloaded' });
-  await page.waitForFunction(() => (window.__THREE_GAME_DIAGNOSTICS__?.frame ?? 0) > 10, null, {
-    timeout: 20_000,
-  });
+  // 引导要真的帧才数得到 frame > 10，未开泵时这个 stop 是空操作。
+  const bootPump = startClockPump(page);
+  try {
+    await page.waitForFunction(() => (window.__THREE_GAME_DIAGNOSTICS__?.frame ?? 0) > 10, null, {
+      timeout: 20_000,
+    });
+  } finally {
+    await bootPump();
+  }
   // 币的几何量随 `?coin=1.1/1.2` 变，所以**每开一次页面就读一次**（见 `geo()` 的注释）。
   COIN_GEO = await readCoinGeometry(page);
   if (COIN_GEO) {
@@ -136,7 +220,10 @@ async function guarded(label, fn) {
 
 /** 诊断快照在上一帧发布，动作后立刻读会落后一帧。 */
 async function readStateFresh(page) {
-  await page.waitForTimeout(140);
+  // 走 `simTick` 而不是墙钟：这一等经常卡在「动作 → 读账本」之间（economy ③ 的
+  // `ledgerOk(await readStateFresh(page))` 就是一例），开泵时真实等待里泵还在灌仿真，
+  // 读到的就不是动作那一刻的账本了。不开泵时两者等价。
+  await simTick(page, 140);
   return readState(page);
 }
 
@@ -185,7 +272,12 @@ async function dropUntilAccepted(page, lane, budgetMs = 6000) {
     } catch (error) {
       if (!isNavigationError(error)) throw error;
     }
-    await page.waitForTimeout(70);
+    /* ★ 重试间隔走**仿真毫秒**，不走墙钟。
+       墙钟 70 ms 在开泵时对应 ~0.3 仿真秒，于是「投币被冷却拒绝 → 重试」这条节奏
+       在实时腿与泵腿上是两个不同的自变量：同一局在两腿里落到**推板行程的不同相位**。
+       币落在推板刚起步还是快到头，直接决定它这一循环有没有被推出去 ⇒ 越线/投币差。
+       不开泵时 `simTick` 逐字节等于 `waitForTimeout`，实时腿读数不变。 */
+    await simTick(page, 70);
   }
   return false;
 }
@@ -222,7 +314,7 @@ async function waitFor(page, predicate, timeoutMs) {
       continue;
     }
     if (predicate(last)) return last;
-    await page.waitForTimeout(250);
+    await simTick(page, 250);
   }
   return null;
 }
@@ -239,7 +331,7 @@ async function waitForTelemetry(page, predicate, timeoutMs) {
   while (Date.now() < deadline) {
     last = await readTelemetry(page);
     if (predicate(last)) return last;
-    await page.waitForTimeout(250);
+    await simTick(page, 250);
   }
   return last;
 }
@@ -256,9 +348,23 @@ async function waitForTelemetry(page, predicate, timeoutMs) {
  * 机器人选择把加力用掉——这也验证了这条规则确实可被正常解决。
  */
 async function waitForRunEnd(page, timeoutMs = 150_000) {
-  const deadline = Date.now() + timeoutMs;
+  /*
+   * 局长预算按**仿真秒**算，不按墙钟。
+   *
+   * `timeoutMs` 这个数字当初是在实时下定的，那时「150 秒墙钟」和「150 仿真秒」是同一件事
+   * （实测仿真锁在实时 1.000×）。开泵之后它不再等价：同样的墙钟会灌进 ~2.4 倍仿真秒，
+   * 于是每一局都跑得更长——而 `越线/投币` 是**局长主导**的：
+   * 2026-09-28 实时腿干净尾逐局量到 短局（27~34 投）0.19~0.48、长局（91~156 投）0.78~1.15，
+   * **同一次跑法内部就有 6 倍跨度**。所以拿墙钟当上限去比「实时 vs 泵」，量到的是协议差而不是物理差。
+   *
+   * 改成仿真秒之后：实时腿的行为与改动前**逐位一致**（sim ≈ wall），泵腿则被拉回同一条局长口径。
+   * 墙钟这里只留一条**更宽**的安全网（防页面死了以后无限轮询），不再参与局长判定。
+   */
+  const simBudgetSeconds = timeoutMs / 1000;
+  const wallDeadline = Date.now() + Math.max(timeoutMs * 4, 600_000);
+  const startedAt = (await readState(page))?.elapsed ?? 0;
   let boostResolved = 0;
-  while (Date.now() < deadline) {
+  while (Date.now() < wallDeadline) {
     let state;
     try {
       state = await readState(page);
@@ -269,11 +375,18 @@ async function waitForRunEnd(page, timeoutMs = 150_000) {
     }
     if (state?.endless?.ruinVisible === true) return { state, boostResolved, end: 'ruin' };
     if (state?.phase === 'settled') return { state, boostResolved, end: 'settled' };
+    if ((state?.elapsed ?? 0) - startedAt >= simBudgetSeconds) {
+      return { state, boostResolved, end: 'timeout' };
+    }
     if (state?.phase === 'drainOut' && (state?.boostCharges ?? 0) > 0) {
       const used = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.boost?.() ?? false);
       if (used) boostResolved += 1;
     }
-    await page.waitForTimeout(400);
+    /* ★ 轮询间隔走仿真毫秒：终态（破产窗 / settled）是**瞬时事件**，
+       用墙钟轮询时泵腿每 400 ms 墙钟跳过 ~1 仿真秒，终态会被**读晚**，
+       于是同一局在两条腿里的 `runSeconds` 与最后一投的位置都不同。
+       不开泵时 `simTick` = `waitForTimeout`，实时腿读数不变。 */
+    await simTick(page, 400);
   }
   return { state: await readState(page), boostResolved, end: 'timeout' };
 }
@@ -291,6 +404,11 @@ async function waitForRunEnd(page, timeoutMs = 150_000) {
  */
 async function playRun(page, { drops = 240, lanes, waitEnd = true } = {}) {
   await startRun(page, 'playing');
+  /* 本局长度的零点必须取在 `startRun` **之后**。
+     `Game.ts:1739` 每次开局把 `elapsed` 归零，所以它是「本局自己的钟」而不是会话钟：
+     在开局前取零点就会跨局相减，实测把 193 投的一局读成 `仿真 0s`
+     （2026-09-28 自证批）。这个字段是局长口径的直接证据，不能猜。 */
+  const runStart = (await readState(page))?.elapsed ?? 0;
   const pickLanes = lanes ?? [-0.85, -0.45, 0, 0.45, 0.85];
 
   // 冷启动兜底：首投必须**真的被接受**（见 `primeFirstDrop` 的说明）。
@@ -300,17 +418,31 @@ async function playRun(page, { drops = 240, lanes, waitEnd = true } = {}) {
     const state = await readState(page);
     if (state?.endless?.ruinVisible === true || state?.phase === 'settled') break;
     if (state?.phase !== 'drainOut') {
+      // 这个 20 秒是**死循环兜底**，不是局长来源：每圈都以「推板多走一个循环」为进度条件，
+      // 所以投币节奏本身已经是仿真对齐的。局长口径只在 `waitForRunEnd` 里定。
       const advanced = await waitFor(page, (current) => (current?.pusher?.cycles ?? 0) > lastCycle, 20_000);
       if (!advanced) break;
       lastCycle = advanced.pusher.cycles;
     }
     const accepted = await dropUntilAccepted(page, pickLanes[index % pickLanes.length]);
-    if (!accepted) await page.waitForTimeout(300);
+    if (!accepted) await simTick(page, 300);
   }
 
-  if (!waitEnd) return { ...(await readState(page)), end: 'cap' };
+  if (!waitEnd) {
+    const capped = await readState(page);
+    return {
+      ...capped,
+      end: 'cap',
+      runSeconds: Math.max(0, (capped?.elapsed ?? runStart) - runStart),
+    };
+  }
   const { state, boostResolved, end } = await waitForRunEnd(page);
-  return { ...state, boostResolved, end };
+  return {
+    ...state,
+    boostResolved,
+    end,
+    runSeconds: Math.max(0, (state?.elapsed ?? runStart) - runStart),
+  };
 }
 
 /**
@@ -887,6 +1019,130 @@ async function runPhysics(page) {
       `最低币心 ${bedLowest.toFixed(4)} 米（下限 ${FLAT_REST_Y}）`,
   );
 
+  // ── ⑥ R4-P3 的泄流律：既得**冷得下来**，也得**热得起来** ──
+  /*
+   * P3 把「向上超速就硬截断」换成连续律 `y -= (y − maxUpward) × (1 − e^(−dt/τ))`，
+   * 落地之后 pace 的护栏列读到的是**这条分支一次都没进过**（压 0 次 / 峰值 0）。
+   * 「没进过」有两种解释：① 律是对的且合法玩法碰不到阈值；② 律根本没接上。
+   * 单靠正常玩法的 0 分不出这两者，所以这里**成对**测：
+   *
+   * - **A 冷**：默认阈值 3 + 打一针喷泉 ⇒ 护栏必须**一次都不压**。
+   *   机内唯一的合法上抛源就是喷泉，它的设计初速度 `vy ≤ 2.2 < 3`（见 `ShowDirector`
+   *   喷泉段注释），所以「冷」不是运气，是这台机器的能量预算决定的。
+   *   ⚠️ 这条同时否证了「P3 把律写坏了所以从不触发」之外的另一半：
+   *   如果哪天有人把阈值往下降、或把喷泉初速度往上涨，这条会立刻红。
+   * - **B 热**：把阈值临时压到 0.5（同一针喷泉就必然越阈）⇒ 计数必须**开始涨**，
+   *   并且**压的过程不造能量**：异常 0、一枚币都不少、
+   *   峰值速度不超过喷泉自己的设计上限 **2.2 米/秒**
+   *   （2.2 不是新写的魔数：它就是上面那条设计约束，律只许往下削、不许往上顶）。
+   *
+   * 两段都在**同一个 run** 里（`spikeClamps` 是每局归零的），比的是同局内的增量。
+   */
+  const setMaxUpward = (value) =>
+    page.evaluate((v) => window.__THREE_GAME_TEST_HOOKS__?.setTuning?.({ coinMaxUpwardSpeed: v }), value);
+  // ⚠️ `waitForTelemetry` 的谓词是**同步**读的（`predicate(last)`，不 await）——
+  // 传 async 函数会得到一个永远为真的 Promise，等不到东西却立刻返回。
+  // 所以计数只能在外面先读一次，谓词里就地过滤同一份 `t`，不要再异步取数。
+  const fountainCount = (t) =>
+    (t?.showEvents ?? []).filter((event) => event.id === 'fountain' && event.phase === 'completed').length;
+  const forceFountain = async () => {
+    const before = fountainCount(await readTelemetry(page));
+    // 老虎机正在转时 `xixiSpin` 返回 null：等它空出来，不硬抢（照 xixi 的模式）。
+    let spun = null;
+    const deadline = Date.now() + 6000;
+    while (!spun && Date.now() < deadline) {
+      spun = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.xixiSpin?.('fountain'));
+      if (!spun) await page.waitForTimeout(200);
+    }
+    const seen = await waitForTelemetry(page, (t) => fountainCount(t) > before, 20_000);
+    return fountainCount(seen) > before;
+  };
+
+  await startRun(page, 'playing');
+  const coldDelivered = await forceFountain();
+  const cold = await readStateFresh(page);
+  /*
+   * ⚠️ 「冷」的第一版写成「必须 0 次」，**被实测否证**（同一二进制两次跑：0 次 / 5 次）。
+   * 5 次那种是 318 枚满盘 + 一针喷泉：币被挤在堆里，求解器把某枚币顶到 `vy > 3`
+   * （截断前峰值 5.985 米/秒）。所以「阈值 3 在正常玩法里永远碰不到」这句话是错的，
+   * `constants.ts` 里那条口径已经按这次读数改掉。
+   *
+   * 能立得住的判据是**稀有 + 在能量预算内**两件事：
+   * - 次数只许个位数（满盘 + 演出都不该常触；一旦成百就是 P4 那种能量注入回来了）；
+   * - 截断前峰值不超过这台机器自己的落体预算
+   *   `√(2 × 13 × (1.45 + 0.08 + 0.186)) ≈ 6.67 米/秒`
+   *   —— 1.45 是落币口高度、0.08 是出币托盘深度、0.186 = 2.2²/(2·13) 是喷泉设计上限
+   *   `vy ≤ 2.2` 能多升的那一截，13 是 `PHYSICS.gravity`。
+   *   ⚠️ 这里**不能再加一次 `2.2²`**：上抛的动能已经换算成那 0.186 米顶高了，
+   *   两项都算就等于给同一份能量记两遍账（我第一版就这么写错，读出 7.03）。
+   *   超过预算才说明「币的能量不是重力给的」，正是要抓的形态。
+   */
+  const fallBudget = Math.sqrt(2 * 13 * (1.45 + 0.08 + 0.186));
+  check(
+    `⑥ 冷：默认阈值 3 下护栏只许个位数、且截断前峰值 ≤ 落体预算 ${fallBudget.toFixed(2)} 米/秒`,
+    coldDelivered &&
+      (cold?.spikeClamps ?? -1) >= 0 &&
+      (cold?.spikeClamps ?? Infinity) <= 8 &&
+      (cold?.peakSpikeSpeed ?? Infinity) <= fallBudget,
+    `喷泉 ${coldDelivered ? '已交付' : '未交付'}，护栏压 ${cold?.spikeClamps} 次，` +
+      `截断前峰值 ${cold?.peakSpikeSpeed} 米/秒（预算 ${fallBudget.toFixed(2)}），` +
+      `活跃币 ${cold?.activeCoins}`,
+  );
+
+  await setMaxUpward(0.5);
+  const hotDelivered = await forceFountain();
+  const hot = await readStateFresh(page);
+  await setMaxUpward(3);
+  check(
+    '⑥ 热：阈值压到 0.5 之后泄流律必须真的被走到（计数开始涨）',
+    hotDelivered && (hot?.spikeClamps ?? 0) > (cold?.spikeClamps ?? 0),
+    `护栏压 ${cold?.spikeClamps}→${hot?.spikeClamps} 次，峰值 ${hot?.peakSpikeSpeed} 米/秒` +
+      `（阈值 0.5，喷泉交付 ${hotDelivered ? '是' : '否'}）`,
+  );
+  /*
+   * ⚠️ 这一条**第一版写错了口径**（实测红）：原本断言「峰值 ≤ 2.2 米/秒」，
+   * 而 `Coin.clampSpeed` 返回的是**截断前**的速度（`Coin.ts:309` 的 `return before`），
+   * `peakSpikeSpeed` 记的正是这个返回值 ⇒ 它读的是「这枚币进护栏之前有多快」，
+   * **不是**「律把币顶到了多快」。强制阈值 0.5 之后实测峰值 **6.671 米/秒**，
+   * 而这个数恰好在这台机器自己的能量预算内：喷泉把币以 `vy ≤ 2.2` 向上抛出，
+   * 币从更高处落回出币线 ≈ √(2.2² + 2·13·1.72) ≈ **6.7 米/秒** ——
+   * 也就是说 6.671 是「合法落速」，不是求解器造出来的能量。
+   * 判据写错会把一条正常的读数变成假红，所以这里只保留**量得住的两项**：
+   * 异常必须为 0、币必须一枚不少（喷泉给了 10 枚，所以只许升不许降）。
+   *
+   * 截断后遥测（`peakPostClampUpward`）已经补上，且 τ A/B（2026-09-29，阈值压 0.5）实测过：
+   * 截断后向上峰值 = **2.033 米/秒**，是阈值 0.5 的 4.07 倍 ⇒ 上界**只能取截断前总速率**。
+   * 指数逼近只缩小超阈部分、永不清零，所以「post ≤ 阈值」是稳定误红的假判据（τ→1e-4 才成立）。
+   */
+  // 「币少了几枚」在这两条快照之间是**合法结算**，不是丢币：期间推板一直在跑。
+  // 所以守恒式必须把越线枚数加回来读（引擎侧 `settledCoins`，开局归零、这里两读同局）。
+  const settledCold = cold?.settledCoins ?? 0;
+  const settledHot = hot?.settledCoins ?? 0;
+  check(
+    '⑥ 热：泄流律不造异常、不吞币 —— 异常 0 且「活跃币 + 期间越线」≥ 之前的活跃币',
+    (hot?.anomalies ?? -1) === 0 &&
+      (hot?.activeCoins ?? 0) + (settledHot - settledCold) >= (cold?.activeCoins ?? Infinity),
+    `异常 ${hot?.anomalies}，活跃币 ${cold?.activeCoins}→${hot?.activeCoins}，` +
+      `期间越线 ${settledHot - settledCold} 枚，截断前峰值 ${hot?.peakSpikeSpeed} 米/秒` +
+      `（对照：自由落体 6.3 / 含喷泉上抛回落 6.68 / 横向护栏 8。` +
+      `热分支的截断前峰值在 3.8~8.8 之间抖，四次观测里有一次 8.81 超出落体预算 ⇒ 逼热之后` +
+      `横向护栏偶尔真会被等上；原因未查，这条**只作记录、不当判据**）`,
+  );
+
+  check(
+    '⑥ 热：泄流律只减不增 —— 截断后向上峰值 > 0（律真的动了 y）且 ≤ 截断前总速度峰值',
+    (hot?.peakPostClampUpward ?? 0) > 0 && (hot?.peakPostClampUpward ?? Infinity) <= hot?.peakSpikeSpeed,
+    `截断后向上峰值 ${hot?.peakPostClampUpward} 米/秒 ≤ 截断前总速度峰值 ${hot?.peakSpikeSpeed} 米/秒` +
+      `（冷侧对照 ${cold?.peakPostClampUpward}）`,
+  );
+  /*
+   * ⚠️ 这条判据的**不等号方向是算出来的，不是抄来的**：泄流律是
+   * `y -= (y - maxUpward) × (1 - exp(-dt/τ))`，它只把超阈部分按比例往阈值**逼近**，
+   * 单子步后必然还剩 `0.717 ×` 的余量 ⇒ 截断后的 y **允许大于阈值**。
+   * 所以「post ≤ 阈值」是一条假判据（会稳定误红），能断言的只有
+   * 「post ≤ pre 的总速度」：后者的上界是 `y_pre ≤ |v_pre|`，而两道护栏都只缩不放。
+   */
+
   return {
     preset,
     deckStart,
@@ -1425,14 +1681,30 @@ async function runEconomy(page) {
   let cashOutTotal = 0;
 
   for (let index = 0; index < RUNS; index += 1) {
+    // 本局的**仿真秒**要打印出来：它是局长口径的自变量。
+    // `越线/投币` 随局长变化（实测 0.19~1.15），所以没有这一列就无法判断
+    // 「两批读数不同」是物理不同还是局长不同——`waitForRunEnd` 改成仿真秒上限之后，
+    // 这一列就是那条上限是否真的生效的直接证据。
+    // 长度由 `playRun` 在**本局内**取零点算出来（`runSeconds`）；这里不能再跨局相减，
+    // `elapsed` 每局开局归零（`Game.ts:1739`），跨局减法会读出 0 或负数。
     const final = await playRun(page);
+    const simSeconds = final?.runSeconds ?? 0;
     // 破产弹窗里本局还没结束，必须先收工才会回存——钱包守恒要按「完整一局」量。
+    //
+    // ★ `cashOut` 取**收工之前**的读数（与 endless 模式 `:1418` 那个
+    // `ledgerBeforeCashOut` 同一个口径）。`ledger()` 是活 getter：收工之后再去读，
+    // 读到的是「此刻这一局能回存多少」，不是本局实际入账的那一笔。
+    // 两笔都留着打印出来，差值就是任务 #14（② 钱包守恒差 26）的判据。
+    let cashOutAtQuit = 0;
     if (final?.end === 'ruin') {
+      cashOutAtQuit =
+        (await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.()))?.cashOut ?? 0;
       await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.quitRun?.());
-      await page.waitForTimeout(400);
+      await simTick(page, 400);
     }
     const after = await readStateFresh(page);
     const ledger = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
+    const cashOutPostQuit = ledger?.cashOut ?? 0;
     const { scoreEvents, cycles } = await readTelemetry(page);
     const crossed = cycles.length ? cycles[cycles.length - 1].coins : 0;
 
@@ -1445,26 +1717,30 @@ async function runEconomy(page) {
     spentTotal += after?.spent ?? 0;
     earnedTotal += after?.earned ?? 0;
     buyInTotal += after?.buyIn ?? 0;
-    cashOutTotal += ledger?.cashOut ?? 0;
+    cashOutTotal += cashOutAtQuit;
 
     runs.push({
       end: final?.end,
       drops: final?.endless?.drops ?? 0,
       crossed,
+      simSeconds,
       chips: after?.chips ?? 0,
       buyIn: after?.buyIn ?? 0,
       earned: after?.earned ?? 0,
       begged: after?.begged ?? 0,
       spent: after?.spent ?? 0,
       wallet: after?.wallet ?? 0,
-      cashOut: ledger?.cashOut ?? 0,
+      cashOut: cashOutAtQuit,
+      cashOutPostQuit,
       ledgerOk: ledgerOk(after),
     });
     console.log(
       `  第 ${index + 1} 局：投 ${runs[index].drops} 枚 → 越线 ${crossed} 枚，` +
+        `仿真 ${simSeconds.toFixed(0)}s（${final?.end}），` +
         `买入 ${runs[index].buyIn} + 赚进 ${runs[index].earned} + 跪求 ${runs[index].begged} ` +
-        `− 消耗 ${runs[index].spent} = ${runs[index].chips} 筹码，回存 ${runs[index].cashOut}，` +
-        `钱包 ${runs[index].wallet}（${final?.end}）`,
+        `− 消耗 ${runs[index].spent} = ${runs[index].chips} 筹码，` +
+        `回存 ${runs[index].cashOut}（收工后活读 ${runs[index].cashOutPostQuit}），` +
+        `钱包 ${runs[index].wallet}`,
     );
   }
 
@@ -1508,7 +1784,12 @@ async function runEconomy(page) {
   const begLedger = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
   const walletBeforeQuit = begLedger?.wallet ?? -1;
   await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.quitRun?.());
-  await page.waitForTimeout(400);
+  /* 这一等必须是**仿真等**，不能是墙钟等。这条判据断言「跪来的脏钱不可回存」，
+     测的是收工那一刻账本上的现金流出；开泵之后 400 ms 真实等待里泵仍在灌仿真
+     （~1 仿真秒），期间在途的币可以正常越线赚到**干净**筹码 ⇒ `cashOut > 0` 是合法结果，
+     而判据按「立刻收工」写死，于是只在泵下报红（2026-09-28 实测：两种泵配置都红、实时绿）。
+     不开泵时 `simTick` 就是 `waitForTimeout`，实时腿读数不变。 */
+  await simTick(page, 400);
   const quitLedger = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
   check(
     '③ 跪求的筹码记进 begged，收工回存为 0（脏钱不可回存）',
@@ -1956,6 +2237,11 @@ async function runXixi(page) {
   // 承诺数从引擎规模表读（S6 把塔改到阵型规模是配置变更，不是回归）。
   const specs = (await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.showSpecs?.())) ?? {};
   const towerSpec = specs.tower?.count ?? 0;
+  // ★ R4-4b「汇」的窗口基线：**演出前**先读一次累计值，演出后再读差值。
+  // 计数器在引擎侧按出处分类（`Coin.fromShow`）；脚本只做差值，不抄第二份公式。
+  const windowBefore = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.showWindow?.() ?? { crossings: -1, foreign: -1 },
+  );
   const towerReward = await spinAndWaitReward('tower');
   const showEventsAfterTower = (await readTelemetry(page))?.showEvents ?? [];
   const towerRegistered = showEventsAfterTower.find((e) => e.id === 'tower' && e.phase === 'registered');
@@ -1967,8 +2253,62 @@ async function runXixi(page) {
     `granted=${towerReward?.granted} delivered=${towerReward?.delivered}（规模表 ${towerSpec}）` +
       ` 登记=${JSON.stringify(towerRegistered)}`,
   );
-  // 「奖励不走 gainChips」由力力力判据钉死；塔交付带出的 Cascading 越线是合法结算，
-  // 不是奖励入账——这里不再重复断言 earned。
+  // ★ R4-4b 的生命周期自证：**演出期间比演出后多一个碰撞体**。
+  // ⚠️ 第一版探针是错的（实测「演出中读数 -1」）：它等的是 `showEvents` 里
+  // 「phase 不是 completed 且 spawned > 0」那一帧，而事件只在**演出结束**时落一条
+  // `completed` —— 中间态根本不在事件表里，于是 20 秒空转、判据红在探针自己身上。
+  // 判据先改对再拿它当证据：改成**对整个演出期采样取峰值**，不依赖事件表的中间态。
+  // 也不写绝对值——世界里有币池那 700 多个休眠碰撞体（实测 732），比的是**差**：
+  // 演出结束后那一个必须被 `removeRigidBody` 还回世界。不等只有两种解释：
+  // 柱体压根没建（4b 白做），或泄漏了（每演一次塔多一根看不见的墙）——
+  // 后者 `activeCoins` / `anomalies` 都读不出来，所以这条必须是独立判据。
+  let towerColliderPeak = -1;
+  let towerCollidersAfter = -1;
+  const lifecycleDeadline = Date.now() + 20_000;
+  for (;;) {
+    const n = await page.evaluate(
+      () => window.__THREE_GAME_TEST_HOOKS__?.countColliders?.() ?? -1,
+    );
+    if (n > towerColliderPeak) towerColliderPeak = n;
+    const t = await readTelemetry(page);
+    if ((t?.showEvents ?? []).some((e) => e.id === 'tower' && e.phase === 'completed')) {
+      towerCollidersAfter = n;
+      break;
+    }
+    if (Date.now() >= lifecycleDeadline) break;
+    await page.waitForTimeout(80);
+  }
+  check(
+    '塔演出：柱体碰撞体随演出建立、随 dispose 归还（R4-4b 生命周期）',
+    towerColliderPeak > 0 && towerCollidersAfter === towerColliderPeak - 1,
+    towerCollidersAfter > 0
+      ? `演出期峰值 ${towerColliderPeak} 个 → 演出结束 ${towerCollidersAfter} 个（期望 −1）`
+      : `20 秒内没等到塔的 completed（峰值 ${towerColliderPeak}）`,
+  );
+  // ★ R4-4b 的**「汇」**（纪律「源汇成对」的另一半）：柱子把币拱过线时，
+  // 账本只看得到「越线一枚币」，分不出这枚是**演出自己顶的**（水源，应当入账）
+  // 还是**存量币床被拱过去的**（白送）。后者是 4b 唯一没被测过的风险，
+  // 之前只有「四组门没红」这种间接证据。
+  //
+  // 上限从**这场演出自己的承诺数**取（`towerSpec`，引擎规模表）：
+  // 「柱子拱掉的存量币」如果比它答应发的币还多，就等于这个装置发的是负数 ——
+  // 不新写魔数，也不读盘面枚数（xixi 这一点的盘面枚数不由脚本控制）。
+  const windowAfter = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.showWindow?.() ?? { crossings: -1, foreign: -1 },
+  );
+  const windowCrossings = windowAfter.crossings - windowBefore.crossings;
+  const windowForeign = windowAfter.foreign - windowBefore.foreign;
+  check(
+    `塔演出：不白送结算 —— 演出窗口内被柱子拱过线的「存量币」≤ 演出承诺 ${towerSpec} 枚（R4-4b 汇）`,
+    windowBefore.crossings >= 0 &&
+      windowAfter.crossings >= 0 &&
+      windowCrossings >= 0 &&
+      windowForeign >= 0 &&
+      windowForeign <= towerSpec,
+    `窗口内越线 ${windowCrossings} 枚，其中存量币 ${windowForeign} 枚` +
+      `（演出币 ${windowCrossings - windowForeign} 枚，承诺 ${towerSpec} 枚）` +
+      `；累计读数 ${windowBefore.crossings}→${windowAfter.crossings}`,
+  );
   // 等塔演完再继续：演出队列一次一场，别让交付与后面的集章搅在一起。
   await waitForTelemetry(
     page,
@@ -2038,16 +2378,23 @@ async function runXixi(page) {
   const fineReward = await spinAndWaitReward('fine');
   const afterFine = await readStateFresh(page);
   const finedDelta = (afterFine?.fines ?? 0) - (beforeFine?.fines ?? 0);
-  const chipsDelta = (beforeFine?.chips ?? 0) - (afterFine?.chips ?? 0);
+  const spentDelta = (afterFine?.spent ?? 0) - (beforeFine?.spent ?? 0);
+  // ⚠️ 这里原本断言的是「筹码**净**减少 ≥ 罚款」——判据本身是错的（实测红）：
+  // 摇奖那几秒盘面照常越线结算，读到的是「罚 6、筹码 169→208」。
+  // 净变化混进了盘面节奏，而经济本身没毛病（恒等式 208 = 20 + 194 − 6 两边都对得上）
+  // ⇒ 假红。改成**只走账本**：罚款必须逐笔落在 `spent` 上（唯一扣减入口），
+  // 且演出前后两端三账本恒等式都成立 —— 「扣的是本局筹码」被严格证明，
+  // 且与盘面节奏无关（这条判据从此不会再因为「恰好赚了一笔」而红）。
   check(
     '胡萝卜四连：扣本局筹码（fined 可对账、fines 单调、spent ≥ fines、恒等式成立）',
     fineReward?.outcome === 'fine' &&
       fineReward?.fined > 0 &&
       finedDelta === fineReward.fined &&
-      chipsDelta >= finedDelta &&
+      spentDelta === finedDelta &&
       (afterFine?.spent ?? 0) >= (afterFine?.fines ?? 0) &&
+      ledgerOk(beforeFine) &&
       ledgerOk(afterFine),
-    `罚 ${fineReward?.fined}（fines ${beforeFine?.fines}→${afterFine?.fines}），` +
+    `罚 ${fineReward?.fined}（fines ${beforeFine?.fines}→${afterFine?.fines}，spent +${spentDelta}），` +
       `筹码 ${beforeFine?.chips}→${afterFine?.chips}，${ledgerText(afterFine)}`,
   );
   // 惩罚的图标必须是胡萝卜四连——`fine` 的停格画面在上面已经断言过，
@@ -2149,6 +2496,22 @@ async function runXixi(page) {
     '集齐 → 老虎机触发（spin 事件，不靠定时采样）',
     Boolean(spinSeen?.xixiEvents?.some((e) => e.phase === 'spin')),
     `事件链 ${JSON.stringify((spinSeen?.xixiEvents ?? []).map((e) => e.phase))}`,
+  );
+
+  // ★ **正对照**：上面那条「不白送」的判据读到的可能是 0，而 0 有两种解释 ——
+  // 「演出窗口内确实没有币越线」与「计数器根本没接上」。这一条专门否证后者：
+  // 一整场 xixi 跑了十几次演出（塔 / 宝箱 / 闸门补币 / 兜底补货），每次 1.5~4 秒，
+  // 盘面在演出期间照常结算（P7 只暂停收尾计时，见 `Game.ts:1508` 那条注释），
+  // 所以全 run 的演出窗口累计越线**必须 > 0**。它为 0 就说明探针是空的，
+  // 「不白送」那条绿也就不能当证据用。
+  const windowTotal = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.showWindow?.() ?? { crossings: -1, foreign: -1 },
+  );
+  check(
+    '演出窗口计数器非真空：全 run 演出窗口内累计越线 > 0（R4-4b 汇判据的正对照）',
+    windowTotal.crossings > 0,
+    `全 run 演出窗口内越线 ${windowTotal.crossings} 枚，其中存量币 ${windowTotal.foreign} 枚` +
+      `、演出币 ${windowTotal.crossings - windowTotal.foreign} 枚`,
   );
 
   const finalState = await readStateFresh(page);
@@ -3460,12 +3823,17 @@ async function runPace(page) {
       );
       const final = await playRun(page, { drops: 24, waitEnd: false });
       const { cycles } = await readTelemetry(page);
+      // 速度护栏（R4-P3 的连续泄流律）在这一遍里到底有没有被触发：
+      // `spikeClamps` 是「压之前的速率 > 0 的次数」，0 就意味着这一遍**根本没碰到那条律**，
+      // 于是 pace 的读数变化不能归因于 P3（律没跑 = 改动是 no-op）。见计划 P3 段。
+      const guard = await readStateFresh(page);
       const pace = coinsPerCycle(cycles);
       runs.push({ earned: final?.earned ?? 0, cycles: cycles.length, ...pace });
       console.log(
         `  行程 ${travel.toFixed(2)} 米 · 第 ${attempt + 1} 遍：赚进 ${String(runs[attempt].earned).padStart(4)}，` +
           `循环 ${cycles.length}，推下 ${pace.total} 枚，平均 ${pace.average.toFixed(3)} 枚/循环，` +
-          `单循环最多 ${pace.maxCycle} 枚，最长空档 ${pace.longestGap} 个循环`,
+          `单循环最多 ${pace.maxCycle} 枚，最长空档 ${pace.longestGap} 个循环，` +
+          `护栏压 ${guard?.spikeClamps ?? -1} 次/峰值 ${guard?.peakSpikeSpeed ?? -1} 米/秒`,
       );
     }
 
@@ -3922,7 +4290,7 @@ async function runRefill(page) {
       break;
     }
     refillsDuringSettle = Math.max(refillsDuringSettle, state?.refills ?? 0);
-    await page.waitForTimeout(250);
+    await simTick(page, 250);
   }
   const settleState = await readStateFresh(page);
   check(
@@ -4556,9 +4924,10 @@ async function runCabinetTex(page) {
       valance: maps.hoodValance ?? null,
       roof: maps.hoodRoof ?? null,
       glowL: glows['sideWall.tall.L'] ?? null,
-      // 只有侧墙该发光：檐板（招牌）走的是**亮**色带，`color × map` 本来就够亮，
-      // 给它加 emissive 会把招牌刷成过曝白 —— 所以「glow 只在侧墙」也是判据。
+      // 该发光的是两件「`color × map` 乘不出来的高对比亮线」：侧墙的灯管条、顶板的板缝与铆钉。
+      // 檐板（招牌）**不该**发光：它本来就走亮色带，再加 emissive 就过曝成白。
       glowValance: glows.hoodValance ?? null,
+      glowRoof: glows.hoodRoof ?? null,
     };
   });
   check(
@@ -4566,8 +4935,6 @@ async function runCabinetTex(page) {
     mapsByPart.tallL !== null &&
       mapsByPart.tallL === mapsByPart.tallR &&
       new Set([mapsByPart.valance, mapsByPart.roof, mapsByPart.back]).size === 3 &&
-      // 只有侧墙该发光：檐板（招牌）走的是**亮**色带，color × map 本来就够亮，
-      // 给它加 emissive 会把招牌刷成过曝白。顶板与背板同理（它们吃 trim / panel 色带）。
       mapsByPart.glowL !== null &&
       mapsByPart.glowValance === null,
     JSON.stringify(mapsByPart),
@@ -4580,6 +4947,17 @@ async function runCabinetTex(page) {
       mapsByPart.glowL === mapsByPart.tallL &&
       mapsByPart.glowValance === null,
     `glow=${mapsByPart.glowL} sameAsMap=${mapsByPart.glowL === mapsByPart.tallL} valanceGlow=${mapsByPart.glowValance}`,
+  );
+  // 顶板从「不该发光」改成「该发光」是**改判据**，不是顺手放宽：原先那条推理
+  // （「它吃 trim 色带，加 emissive 会像招牌一样过曝」）只对亮色带的檐板成立；
+  // 顶板在演奏相机下是一大片近乎平行于视线的暗面，不走自发光通道就什么都看不见。
+  // 这条同时守住「并回共用材质」那种静默退化：挂的必须**就是顶板自己那张**。
+  check(
+    '顶板走自发光通道（板缝 / 铆钉在演奏相机下可见），且用的就是自己那张图',
+    mapsByPart.glowRoof !== null &&
+      mapsByPart.glowRoof === mapsByPart.roof &&
+      mapsByPart.glowValance === null,
+    `roofGlow=${mapsByPart.glowRoof} roofMap=${mapsByPart.roof} 同图=${mapsByPart.glowRoof === mapsByPart.roof}`,
   );
 
   // 三张贴图实测在 page 内，cache 同 UUID ⇒ 切肤时会撞 dispose 链；
@@ -5826,7 +6204,15 @@ async function main() {
   try {
     if (MODE === 'probe' || MODE === 'all') await runProbe(page);
     if (MODE === 'endless' || MODE === 'all') await runEndless(page);
-    if (MODE === 'economy') await runEconomy(page);
+    if (MODE === 'economy') {
+      // 长批泵：runEconomy 期间持续灌虚拟时间，结束（含抛错）立刻停。
+      const economyPump = startClockPump(page);
+      try {
+        await runEconomy(page);
+      } finally {
+        await economyPump();
+      }
+    }
     if (MODE === 'xixi' || MODE === 'all') await runXixi(page);
     if (MODE === 'layout') await runLayout(page);
     if (MODE === 'physics') await runPhysics(page);

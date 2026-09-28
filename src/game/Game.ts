@@ -348,6 +348,12 @@ export class Game {
    */
   private spikeClamps = 0;
   private peakSpikeSpeed = 0;
+  /**
+   * 泄流律压完之后剩下的**向上**速度峰值（R4-P3 的「只减不增」判据）。
+   * 与 `peakSpikeSpeed` 成对：那条是截断前总速率，这条是截断后向上分量。
+   * 只有前者时「律不造能量」只能靠 `anomalies === 0` 间接推断。
+   */
+  private peakPostClampUpward = 0;
   /** 本局累计越线枚数（遥测用：节奏测量不能被热度倍率污染）。 */
   private settledCoins = 0;
   private drainPromptVisible = false;
@@ -401,6 +407,9 @@ export class Game {
     this.spray = new CoinSpray(this.coins.currentSkin);
     this.shows = new ShowDirector({
       coins: this.coins,
+      // R4-4b：塔的柱顶要上真碰撞（kinematic 圆柱），所以演出系统现在拿着物理世界。
+      // 只有 `TowerShow` 用它建刚体，其余装置照旧纯视觉（见 `ShowDeps.world` 的注释）。
+      world: physics.world,
       telemetry: this.telemetry,
       notify: (message) => this.announce(message),
       now: () => this.elapsed,
@@ -448,6 +457,10 @@ export class Game {
     }
 
     const table = buildTable(physics.world);
+    /* R4-P2：弹性合并规则统一成 Min，且**必须在台面建完之后**扫。
+       币池（`:396`）与推板（`:397`）比这一步早，台面是最后一批，所以这一扫覆盖全部。
+       放在 `buildTable` 之前会漏掉整层台面 + 钉子 + 围板。 */
+    physics.applyRestitutionCombineRule();
     // S24：外壳单独留一份引用 —— `?model` 模型模式要能把它整具拆掉重建。
     // 台面 / 钉子 / 推板都与碰撞体绑定，**不参与**热重建（用户明确要求不动碰撞边界）。
     this.cabinetShell = table.cabinetShell;
@@ -991,10 +1004,19 @@ export class Game {
 
       // 读注册表而不是 `COIN.*` 常量：这两个护栏要能被调试面板实时改，
       // 而且注册表是唯一真源（`applyCoinPhysics` 把调参值写进去）。
-      const spike = coin.clampSpeed(coinPhysics.maxSpeed, coinPhysics.maxUpwardSpeed);
-      if (spike > 0) {
+      // 第三个参数是**子步长**：向上的那一路按 `COIN.upwardBleedTau` 连续泄流，
+      // 律的自变量必须跟着积分步长走（见 `Coin.clampSpeed`）。
+      const spike = coin.clampSpeed(
+        coinPhysics.maxSpeed,
+        coinPhysics.maxUpwardSpeed,
+        fixedDt,
+      );
+      if (spike) {
         this.spikeClamps += 1;
-        if (spike > this.peakSpikeSpeed) this.peakSpikeSpeed = spike;
+        if (spike.pre > this.peakSpikeSpeed) this.peakSpikeSpeed = spike.pre;
+        if (spike.postUpward > this.peakPostClampUpward) {
+          this.peakPostClampUpward = spike.postUpward;
+        }
       }
     });
 
@@ -1333,6 +1355,22 @@ export class Game {
   }
 
   /**
+   * **演出窗口内**的越线分类计数（R4-4b 的「汇」）。**累计、不按局归零**——
+   * 判据读的是某场演出前后的**差值**，跟 `cycles.coins` 一个口径。
+   *
+   * 为什么要在引擎里分这一刀：柱子上真碰撞体之后，「越线一枚币」在账本上是同一个读数，
+   * 但「演出自己顶出来的币」是水源、「柱子把存量币床拱过线」是**白送**。
+   * 让脚本按时刻自己配对分类就是抄第二份口径（纪律 2）。
+   *
+   * ★ 窗口取「**任意**演出在跑」而不是只取 `tower`，两个理由：
+   * ① 演出队列一次一场（`shows.busy` 拒并行），所以某场演出前后的差值仍是它的专属窗口；
+   * ② 这条判据要能被**正对照**否证——只数 tower 的话一局里只有一场塔、读数又是 0，
+   *    永远分不清「没拱到币」和「线没接上」。整个 run 的累计值 > 0 才把后者否证掉。
+   */
+  private showWindowCrossings = 0;
+  private showWindowForeign = 0;
+
+  /**
    * 一枚币越过得分线：结算筹码。
    *
    * 顺序不能反：**先算连落**（热度倍率挂在 combo 上），再算返值，最后入账。
@@ -1358,6 +1396,15 @@ export class Game {
     const chipsBefore = this.run.chips;
     this.run.gainChips(outcome.chips);
     const chipsAfter = this.run.chips;
+
+    // ★ 4b 的汇判据：**这一枚**越线时是不是有装置正在跑。
+    // 读 `activeId` 而不是「距演出开始多久」：窗口由演出自己定义，
+    // 降动效（`speed` 压时长）与 P7 的「演出期间暂停收尾计时」都自动跟着变
+    // （P7 只暂停计时，物理照跑、结算照记，见 `Game` 里那处 `shows.busy` 的注释）。
+    if (this.shows.activeId !== null) {
+      this.showWindowCrossings += 1;
+      if (!coin.fromShow) this.showWindowForeign += 1;
+    }
 
     coin.settled = true;
     this.settledCoins += 1;
@@ -1756,6 +1803,7 @@ export class Game {
     this.bedCoins = 0;
     this.spikeClamps = 0;
     this.peakSpikeSpeed = 0;
+    this.peakPostClampUpward = 0;
     this.settledCoins = 0;
     this.setDrainPrompt(false);
     this.hud.resetCombo();
@@ -2373,6 +2421,27 @@ export class Game {
         this.applyTuning();
         return { ...this.tuning, physics: this.physics.tuning };
       },
+      /**
+       * 直接写 `coinPhysics` 注册表——**不经调参表、不上滑块**。
+       *
+       * 存在的唯一理由：有些注册表键刻意不给滑块（`upwardBleedTau` 是「护栏以什么形状
+       * 生效」的定义，不是手感旋钮），但它的 A/B 仍然必须能在**同一次页面加载**里换臂。
+       * 换臂的另一条路是改 `constants.ts` ⇒ 整页刷新 ⇒ 进行中的验证批全部作废。
+       *
+       * 键名逐个校验（与 `requireSelectorKey` 同一条理由）：拼错的键会静悄悄写进一个
+       * 不存在的属性，然后 A/B 的两条臂测的是同一个东西。
+       */
+      setCoinPhysics: (patch: Record<string, number>) => {
+        for (const key of Object.keys(patch)) {
+          if (!(key in coinPhysics)) {
+            throw new Error(
+              `未知的硬币物理键「${key}」。可用键：${Object.keys(coinPhysics).join(', ')}`,
+            );
+          }
+        }
+        Object.assign(coinPhysics, patch);
+        return { ...coinPhysics };
+      },
       // ── 音频调试 ──────────────────────────────────────────────────────
       // 这组钩子与调试面板共用同一条路径（`audioCatalog` 的事件表），
       // 所以脚本能试听到与面板完全一致的东西。
@@ -2877,6 +2946,13 @@ export class Game {
        *
        * 充值额记进 `SaveStore.refilled`，钱包守恒算式把它算进去（`run()` 钩子暴露）。
        */
+      // R4-4b 的生命周期自证用（见 `PhysicsWorld.countColliders` 为何不进 diagnostics）。
+      countColliders: () => this.physics.countColliders(),
+      // R4-4b 的「汇」：演出窗口内越线的枚数，按出处分成「演出币 / 存量币」。
+      showWindow: () => ({
+        crossings: this.showWindowCrossings,
+        foreign: this.showWindowForeign,
+      }),
       refillWallet: (amount = 200) => {
         this.save.refillWallet(amount);
         this.publishHud();
@@ -3536,6 +3612,12 @@ export class Game {
       /** 收尾阶段推板是否已停板（扫板的开放条件）。 */
       plateStopped: snapshot.plateStopped,
       activeCoins: this.coins.activeCount(),
+      /**
+       * 本局累计越线结算枚数（`settledCoins`，开局归零）。
+       * 和 `activeCoins` 配成一条**守恒式**才判得了「币有没有凭空消失」：
+       * 只比两个时刻的 `activeCoins` 是把「推板照常结算」也算成了丢币（实测假红过 330→323）。
+       */
+      settledCoins: this.settledCoins,
       anomalies: this.anomalyCount,
       /**
        * 掉进币床前侧角下水道的币数（P10 的「汇」，见 `DRAIN`）。
@@ -3577,6 +3659,7 @@ export class Game {
        */
       spikeClamps: this.spikeClamps,
       peakSpikeSpeed: round3(this.peakSpikeSpeed),
+      peakPostClampUpward: round3(this.peakPostClampUpward),
       // 钉阵：网格是显示长度，碰撞体是物理长度，两者刻意不同（只改显示不改物理）。
       pegs: {
         count: this.pegs.count,
@@ -3667,6 +3750,7 @@ export class Game {
             angularDamping: coinPhysics.angularDamping,
             maxSpeed: coinPhysics.maxSpeed,
             maxUpwardSpeed: coinPhysics.maxUpwardSpeed,
+            upwardBleedTau: coinPhysics.upwardBleedTau,
           },
           pusher: {
             travel: this.pusher.travel,
@@ -3808,7 +3892,13 @@ function pickCabinetMap(
   if (part === 'hotZone') return { map: createArcaneHotZoneTexture(palette), glow: false };
   // 檐板＝招牌画布（S21）。顶板 R2-T1-5 起走自己那份构图。
   if (part === 'hoodValance') return { map: createArcaneMarqueeTexture(palette), glow: false };
-  if (part === 'hoodRoof') return { map: createArcaneRoofSeamTexture(palette), glow: false };
+  // 顶板 R2-T1-5 起走自己那份构图。原先 `glow: false` 的理由是「它吃 trim 色带，
+  // 加 emissive 会像檐板那样被刷成过曝白」——那条推理对**招牌**成立（它本来就是亮色带），
+  // 对顶板不成立：顶板在演奏相机下是一大片几乎平行于视线的暗面，`color × map` 乘出来的
+  // 就是「没有内容」，板缝与铆钉只有在自发光通道才活得下来（同 `sideWall.tall` 的结论）。
+  // 过曝风险由构图自己挡住：`paintRoofSeamCanvas` 的底是 `ink`、底噪用 `deep`，
+  // 亮部只剩板缝高光线与铆钉，整面不会糊成白。
+  if (part === 'hoodRoof') return { map: createArcaneRoofSeamTexture(palette), glow: true };
   // 背板：可见的只有币堆上沿那一条，构图把信息量全放在顶部拱线（见 painters 的注释）。
   if (part === 'backPanel') return { map: createArcaneBackPanelTexture(palette), glow: false };
   // 侧板高段＝内凹灯饰（S25 / R1-M3 的贴图近似版）。两件共用 `panelArt` 一份材质，

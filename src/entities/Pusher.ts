@@ -230,9 +230,61 @@ export class Pusher {
       RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(0, 0, 0),
     );
 
+    /* R4-4d：碰撞体从「一整块长方体」换成**和可见轮廓同一块料**。
+     *
+     * 改前：`cuboid(halfWidth, HALF_HEIGHT, HALF_DEPTH)` 是一整块到 `pusherTopY` 的长方体，
+     * 而可视体（`buildVisuals` 里那段五边形）在前上棱切了 45° 的 `FRONT_CHAMFER`。
+     * ⇒ 立面顶部那 5 厘米高、5 厘米深的一条**看得见却撞不到**：币堆表层（币心正好在
+     * 这个高度带）会在离可见斜面还有 5 厘米的空中被一堵隐形的竖直墙挡住。
+     *
+     * 改后两块：
+     *   ① 立面本体 = 五边形截面沿 x 挤出的**凸包**（拿直线切掉矩形的一个角，剩下的仍是
+     *      凸集 ⇒ 一个 `convexMesh` 就够，不用拆成楔形拼接），斜面从此是真的能爬的坡；
+     *   ② 上层薄板 = 独立长方体，**整深、不裁**，顶面照旧到 `pusherTopY = HALF_HEIGHT * 2`
+     *      （`?model` 的下界 `DECK_MIN_Y` 由这个高度派生，动不得）。
+     *      薄板刻意留着正是 S21 的结论：台面前缘必须在 `pusherFrontZAtRest` 上，
+     *      否则币会在真正掉下去的那条边之前「悬空」。
+     *
+     * 两个碰撞体挂在**同一个** kinematic body 上，同体之间不互相碰撞（Rapier 的规则），
+     * 所以共面的那条接缝不会自己跟自己打架。摩擦/弹性两条一致，保持与改前同一材料。
+     */
+    const hullVertices = (() => {
+      // 截面点按 (z, y) 写，z 是**碰撞体局部值**（本碰撞体放在 `CENTER_Z`，所以 ±HALF_DEPTH）。
+      const profile: Array<[number, number]> = [
+        [-HALF_DEPTH, 0],
+        [HALF_DEPTH, 0],
+        [HALF_DEPTH, BODY_TOP_Y - FRONT_CHAMFER],
+        [HALF_DEPTH - FRONT_CHAMFER, BODY_TOP_Y],
+        [-HALF_DEPTH, BODY_TOP_Y],
+      ];
+      const halfX = TABLE.pusherHalfWidth;
+      const out = new Float32Array(profile.length * 2 * 3);
+      let i = 0;
+      for (const [z, y] of profile) {
+        for (const x of [-halfX, halfX]) {
+          out[i] = x;
+          out[i + 1] = y;
+          out[i + 2] = z;
+          i += 3;
+        }
+      }
+      return out;
+    })();
+    const faceDesc = RAPIER.ColliderDesc.convexMesh(hullVertices);
+    if (!faceDesc) {
+      // 凸包点退化才会走到这里（共面或重复点）。**宁可开机就炸，也不要悄悄少一块碰撞体** ——
+      // 那等于币能穿过推板，而所有判据都只会读成「推进率变了」。
+      throw new Error('推板斜面凸包构建失败：检查 FRONT_CHAMFER 与截面点');
+    }
     world.createCollider(
-      RAPIER.ColliderDesc.cuboid(TABLE.pusherHalfWidth, HALF_HEIGHT, HALF_DEPTH)
-        .setTranslation(0, HALF_HEIGHT, CENTER_Z)
+      faceDesc.setTranslation(0, 0, CENTER_Z).setFriction(0.35).setRestitution(0.02),
+      this.body,
+    );
+    // ② 上层薄板：底面正好落在 `BODY_TOP_Y`（与①的顶面共面，背靠背）。
+    const slabHalfHeight = TOP_SLAB_THICKNESS / 2;
+    world.createCollider(
+      RAPIER.ColliderDesc.cuboid(TABLE.pusherHalfWidth, slabHalfHeight, HALF_DEPTH)
+        .setTranslation(0, HALF_HEIGHT * 2 - slabHalfHeight, CENTER_Z)
         .setFriction(0.35)
         .setRestitution(0.02),
       this.body,
