@@ -492,6 +492,8 @@ class TowerShow extends TimedShow {
   private readonly perLayer = 0.4;
   private readonly retract = 0.45;
   private cylinder: THREE.Mesh | null = null;
+  /** 塔基发光环，见 `buildMeshes` / `tickHalo`。与 `cylinder` 同一次建立、同一条生命周期。 */
+  private halo: THREE.Mesh | null = null;
   private spawnedLayers = 0;
 
   /**
@@ -526,7 +528,38 @@ class TowerShow extends TimedShow {
     this.cylinder = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, 1, 20), material);
     this.cylinder.position.set(this.x, 0, 0.3);
     this.cylinder.scale.y = 0.001;
-    return this.cylinder;
+
+    // ★ R4b 的**与物理无关**那一半：塔基一圈发光环（计划把它和 kinematic 碰撞体分开，
+    // 因为环不碰求解器，不需要等重标）。
+    //
+    // 为什么要有它：圆柱是从**币床底下**长出来的，升起的前 0.1 秒画面里只有「币自己在动」,
+    // 看不出有东西在顶。环先亮 = 先把「这里要出事件」交代清楚，是事件的**预告**而不是装饰。
+    //
+    // 尺寸全部从 `radius` 派生，不新写数字 —— 环必须**套住**柱体，
+    // 而柱体半径本身已经按该币种的层占地算过一遍（写死第二个半径就是第二份真源）。
+    const haloMaterial = makeToonMaterial({
+      name: 'towerHalo',
+      color: '#3fd2c0',
+      ramp: 'device',
+      emissive: '#2fd8c4',
+      emissiveIntensity: 1.1,
+    });
+    const halo = new THREE.Mesh(
+      new THREE.RingGeometry(radius * 1.15, radius * 1.5, 24),
+      haloMaterial,
+    );
+    // ⚠️ 平躺要 `rotation.x = -π/2`：局部 +z 经 `rotation.x = θ` 映到 `(0, -sinθ, cosθ)`，
+    //   取 **−**π/2 才得到 `(0, 1, 0)`（面朝上）。取 +π/2 会让环面朝地面 ——
+    //   S18 那次「招牌面朝地面而所有计数判据全绿」就是踩在这条上，几何计数读不出朝向。
+    halo.rotation.x = -Math.PI / 2;
+    // 抬高 8 mm：床面本身是个网格，共面必 z-fighting（截图上表现为环忽隐忽现的闪）。
+    halo.position.set(this.x, 0.008, 0.3);
+    // 环与柱体不同高度，但**同一条生命周期**：`TimedShow.dispose()` 遍历 mount 逐个
+    // dispose 几何与材质，所以挂在同一个 Group 下就不用管清理。
+    const group = new THREE.Group();
+    group.add(this.cylinder, halo);
+    this.halo = halo;
+    return group;
   }
 
   /** 圆柱顶的目标高度：刚好托住最后一层。 */
@@ -553,6 +586,28 @@ class TowerShow extends TimedShow {
     }
     this.cylinder.scale.y = Math.max(0.001, height);
     this.cylinder.position.y = height / 2;
+    this.tickHalo(t, hold);
+  }
+
+  /**
+   * 光环时间线：**升起段的前一半**就长到位，之后一路保持，到回缩段才缩回去。
+   *
+   * 它必须比柱体**快**，否则「预告」不成立 —— 柱体 0.8 秒长满，环若跟着走同样 0.8 秒，
+   * 玩家看到环时币已经在动了，环就成了跟随物而不是事件的预告。
+   *
+   * 用 scale 而不是透明度：`transparent = true` 是一次材质状态变更（并且会让这条
+   * 材质进透明队列、排序行为跟着变），而缩放只是矩阵 ⇒ 与计划的 +0 program 一致。
+   * 环平躺后局部 x/y 轴就是世界 x/z，所以 `set(k, k, 1)`。
+   */
+  private tickHalo(t: number, hold: number): void {
+    if (!this.halo) return;
+    const k =
+      t < this.rise * 0.5
+        ? t / (this.rise * 0.5)
+        : t < hold
+          ? 1
+          : Math.max(0, 1 - (t - hold) / this.retract);
+    this.halo.scale.set(k, k, 1);
   }
 
   private spawnLayer(layer: number): void {
