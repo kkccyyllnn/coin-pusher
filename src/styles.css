@@ -260,10 +260,12 @@ body {
 /* ── 通用按钮（R3-U2 / U3）──────────────────────────────────────────────
    风格四条（与 cabinetTexture 的 Arcane 同源）：① 用描边不用投影做层次；
    ② 双色描边（外圈 glow、内圈实线）；③ 主色只有黄铜一支。
-   选择器用 `:is()` 收成一条链：原先每个状态都要重列 7 个 id，
-   **加一个按钮要改 4 处** —— 那就是漂移信号。现在加按钮只改一处。 */
-:is(#pause-button, #collection-button, #endless-button, #giveup-button,
-    #resume-button, #retry-button, #next-button) {
+   选择器不列 id：`:where(#app) button` 覆盖 #app 里的每一个按钮，
+   新按钮（含 CollectionPanel 用 JS 注入的卡片按钮）自动继承，
+   id 清单那种「加一个按钮要改 4 处」的漂移从此没有来源。
+   `:where()` 把特异性归零，所以后面任何按 id / 类写的覆盖都赢，
+   不再依赖源码顺序 —— 这也是各表面敢只写差异项的前提。 */
+:where(#app) button {
   padding: 8px 14px;
   border: 1px solid var(--edge-hi);
   border-radius: 8px;
@@ -284,7 +286,7 @@ body {
 }
 
 /* hover：外圈 glow 变宽（描边亮起），边框颜色不动 —— 动的是光，不是形。 */
-:is(#pause-button, #collection-button, #endless-button, #resume-button, #retry-button):not(:disabled):hover {
+:where(#app) button:not(:disabled):hover {
   box-shadow:
     inset 0 1px 0 rgb(var(--brass-rgb) / 0.3),
     0 0 0 1px var(--edge-lo),
@@ -292,24 +294,17 @@ body {
 }
 
 /* 按下：位移 1 px + 内阴影，把「凸起」翻成「按下去」。 */
-:is(#pause-button, #collection-button, #endless-button, #giveup-button,
-    #resume-button, #retry-button, #next-button):active:not(:disabled) {
+:where(#app) button:active:not(:disabled) {
   transform: translateY(1px);
   box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.6);
 }
 
 /* 禁用：降饱和，不只降 opacity —— 灰掉的按钮才读作「不能按」，
    半透明的按钮读作「还没加载完」。 */
-:is(#pause-button, #collection-button, #endless-button, #giveup-button,
-    #resume-button, #retry-button, #next-button):disabled {
+:where(#app) button:disabled {
   filter: saturate(0.25) brightness(0.8);
   opacity: 0.55;
   cursor: default;
-}
-
-#endless-button {
-  border-color: var(--brass-deep);
-  color: var(--brass-hi);
 }
 
 /* ── 破产弹窗 ────────────────────────────────────────────────────────── */
@@ -506,22 +501,12 @@ body {
 .skin-card button {
   grid-column: 1 / -1;
   padding: 6px 10px;
-  border: 1px solid var(--line);
   border-radius: 7px;
-  color: var(--ink);
-  background: rgba(255, 255, 255, 0.05);
-  font: inherit;
   font-size: 0.76rem;
-  cursor: pointer;
-}
-
-.skin-card button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-.skin-card button:not(:disabled):hover {
-  border-color: var(--brass);
+  background: rgba(255, 255, 255, 0.05);
+  /* 次要表面：图鉴里一排按钮同时发光会读成「一屏待办」。
+     hover 时通用链会把 glow 加回来，所以这里只收静态那一层。 */
+  box-shadow: none;
 }
 
 /*
@@ -683,6 +668,8 @@ body {
   gap: 6px;
 }
 
+/* 机关行与投币主按钮的差别只有尺寸和排布 ——
+   描边、底色、光标、hover / disabled 全部来自上面那条通用链。 */
 #sweeper-button,
 #grapple-button,
 #reload-button,
@@ -692,14 +679,8 @@ body {
   align-items: center;
   gap: 1px;
   padding: 7px 10px;
-  border: 1px solid var(--line);
   border-radius: 9px;
-  color: var(--ink);
-  background: var(--panel);
-  font: inherit;
   font-size: 0.78rem;
-  cursor: pointer;
-  pointer-events: auto;
   touch-action: none;
 }
 
@@ -711,27 +692,12 @@ body {
   font-size: 0.6rem;
 }
 
-#sweeper-button:not(:disabled):hover,
-#grapple-button:not(:disabled):hover,
-#reload-button:not(:disabled):hover,
-#bet-button:not(:disabled):hover {
-  border-color: var(--brass);
-}
-
 #bet-button {
   border-color: var(--brass);
 }
 
 #bet-button[hidden] {
   display: none;
-}
-
-#sweeper-button:disabled,
-#grapple-button:disabled,
-#reload-button:disabled,
-#bet-button:disabled {
-  opacity: 0.34;
-  cursor: default;
 }
 
 #boost-button,
@@ -742,13 +708,7 @@ body {
   gap: 2px;
   padding: 12px 20px;
   border-radius: 12px;
-  border: 1px solid var(--line);
-  color: var(--ink);
-  background: var(--panel);
-  font: inherit;
   font-size: 1rem;
-  cursor: pointer;
-  pointer-events: auto;
   touch-action: none;
 }
 
@@ -769,12 +729,6 @@ body {
   box-shadow: 0 0 14px rgba(111, 211, 165, 0.28);
 }
 
-#boost-button:disabled,
-#drop-button:disabled {
-  opacity: 0.42;
-  cursor: default;
-}
-
 /* 加力未充能时隐藏。必须显式写 display:none——上面的 display:flex 会压过 [hidden] 的默认样式。 */
 #boost-button[hidden] {
   display: none;
@@ -792,11 +746,6 @@ body {
   50% {
     box-shadow: 0 0 20px rgba(111, 211, 165, 0.5);
   }
-}
-
-#boost-button:active:not(:disabled),
-#drop-button:active:not(:disabled) {
-  transform: translateY(1px);
 }
 
 /* ── 面板 ────────────────────────────────────────────────────────────── */
@@ -877,11 +826,6 @@ body {
   gap: 10px;
 }
 
-#next-button:not(:disabled) {
-  border-color: var(--brass);
-  background: rgb(var(--brass-rgb) / 0.2);
-}
-
 /* ── 小屏 ────────────────────────────────────────────────────────────── */
 
 @media (pointer: coarse), (max-width: 760px) {
@@ -944,15 +888,13 @@ body {
   animation: none;
 }
 
-/* R3-U3：新加的按钮 transition / press 位移必须同步进这张表。
-   不同步的后果是「降级静默失效」—— 测试不会红，只是晕的人照旧被晃。 */
-[data-motion='reduced'] :is(#pause-button, #collection-button, #endless-button, #giveup-button,
-    #resume-button, #retry-button, #next-button) {
+/* R3-U3：降级表必须跟着通用链走。通用链现在只有一处，
+   所以这里也只有两处 —— 漏同步导致「降级静默失效」的风险面缩到了最小。 */
+[data-motion='reduced'] :where(#app) button {
   transition: none;
 }
 
-[data-motion='reduced'] :is(#pause-button, #collection-button, #endless-button, #giveup-button,
-    #resume-button, #retry-button, #next-button):active:not(:disabled) {
+[data-motion='reduced'] :where(#app) button:active:not(:disabled) {
   transform: none;
 }
 
