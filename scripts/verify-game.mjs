@@ -2467,6 +2467,23 @@ async function runPerf(page, context) {
     `已编译程序 ${mats?.programs} / 材质 ${mats?.total}`,
   );
 
+  // ── R2-T2：程序**指纹名单** ──
+  // 上面那条只看总数：20 涨到 29 都还绿，而「多出来的是哪一份程序」完全读不出来。
+  // 所以这里把 roster 整张打出来，并钉一条真不变量：**按分组求和必须等于总数**。
+  // 不相等 ⇒ `renderer.info.programs` 与 `materialReport().programs` 取的不是同一批
+  // 东西（例如首帧后又有材质懒编译），那意味着总数判据本身不可信。
+  const roster = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.programRoster?.() ?? []);
+  const rosterSum = roster.reduce((n, entry) => n + entry.variants, 0);
+  console.log(`  [program roster] 共 ${roster.length} 个指纹组 / ${rosterSum} 份程序`);
+  for (const entry of roster) {
+    console.log(`    ×${entry.variants}  ${entry.fingerprint.slice(0, 150)}`);
+  }
+  check(
+    '程序指纹名单与总数对得上（对不上说明 programs 计数本身不可信）',
+    rosterSum === (mats?.programs ?? -1),
+    `roster 求和 ${rosterSum} vs materialReport().programs ${mats?.programs}`,
+  );
+
   // ── V3：程序化表面细节（Triplanar）──
   // 判据同样是**计数**：漏传 `...ROLE_DETAIL.x` 时画面只是「少了一点纹样」，
   // 肉眼几乎看不出来。四种纹样都必须有材质在用。

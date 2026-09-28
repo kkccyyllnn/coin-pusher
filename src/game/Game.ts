@@ -2524,6 +2524,33 @@ export class Game {
         return base;
       },
       /**
+       * 已编译程序的**指纹名单**（R2-T2）。
+       *
+       * `perf` 原来只断言「程序数 < 30」。那条判据从 20 涨到 29 都还是绿的，
+       * 而「谁多要了一份程序」完全读不出来 —— 加参数的人只能猜，守门的人只能看总数。
+       * 这里把 `renderer.info.programs` 的 cacheKey 折叠成**可读指纹**并按指纹分组：
+       * 程序数一旦变化，跑一次 `perf` 就能看到多出来的是哪一行。
+       *
+       * cacheKey 里一半以上是 `true` / `false` 的布尔位，读起来全是噪声；丢掉它们之后剩下的
+       * 就是有语义的部分（shader 组合、`SD|DETAIL|KIND`、`uv`、`customProgramCacheKey` 的
+       * `toon-ramp-v1`）。⚠️ 序号**要留**：丢掉数字会把四种 detail 纹样折叠成同一行指纹，
+       * 而「哪种纹样多要了一份程序」恰恰是这里要看的东西。
+       */
+      programRoster: (): Array<{ fingerprint: string; variants: number }> => {
+        const groups = new Map<string, number>();
+        for (const program of this.renderer.info.programs ?? []) {
+          const key = String((program as unknown as { cacheKey?: string }).cacheKey ?? '');
+          const fingerprint = key
+            .split(',')
+            .filter((token) => token !== '' && token !== 'true' && token !== 'false')
+            .join(',');
+          groups.set(fingerprint, (groups.get(fingerprint) ?? 0) + 1);
+        }
+        return [...groups.entries()]
+          .map(([fingerprint, variants]) => ({ fingerprint, variants }))
+          .sort((a, b) => b.variants - a.variants || a.fingerprint.localeCompare(b.fingerprint));
+      },
+      /**
        * 机柜外壳**实测读数**（S19）：逐件给出世界轴对齐盒 + 那件局部 +z 的世界方向。
        *
        * 判据（`verify-game.mjs cabinet`）拿它比对 `game/cabinetShape.ts` 里的

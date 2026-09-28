@@ -9,6 +9,10 @@ import {
   SURFACE_DETAIL_FRAGMENT_DECL,
   SURFACE_DETAIL_VERTEX_VARYINGS,
 } from './glsl/detail.glsl';
+// GLSL 片段一律放 `render/glsl/`（R2-T2）：注入点集合 = 那个目录的文件清单。
+// 内联在这个文件里时，「到底注入了哪几段」只能靠人肉读 diff 对上程序指纹。
+import { COLOR_RAMP_CHUNK } from './glsl/colorRamp.glsl';
+import { RIM_APPLY, RIM_DECL, RIM_EMISSIVE_APPLY } from './glsl/rim.glsl';
 
 /**
  * 三渲二材质工厂（V2）。
@@ -37,123 +41,6 @@ import {
  *    需要多份同款就多调一次工厂：材质很便宜，编译好的程序由
  *    `customProgramCacheKey` 共享，不会多编译。
  */
-
-/**
- * 替换 `gradientmap_pars_fragment` 的内联版本。
- *
- * 与 stock 的差异只有两处：
- * 1. `coord.y` 从 `0.0` 改成 `0.5`——纹理只有 1 行，0.5 才是那一行的中心；
- *    0.0 落在纹素边界上，部分驱动会串到相邻档。
- * 2. 返回值从 `vec3( texture2D(...).r )` 改成 `texture2D(...).rgb`——**这是彩色色带的核心**。
- *    stock 的标量读法下最终颜色 = `albedo × 标量 × lightColor`，阴影**只能变暗**；
- *    取 RGB 之后色带自带色相，暗部才能整体推到冷色（三渲二的标准做法）。
- */
-const COLOR_RAMP_CHUNK = /* glsl */ `
-#ifdef USE_GRADIENTMAP
-
-	uniform sampler2D gradientMap;
-
-#endif
-
-vec3 getGradientIrradiance( vec3 normal, vec3 lightDirection ) {
-
-	// dotNL will be from -1.0 to 1.0
-	float dotNL = dot( normal, lightDirection );
-	vec2 coord = vec2( dotNL * 0.5 + 0.5, 0.5 );
-
-	#ifdef USE_GRADIENTMAP
-
-		return texture2D( gradientMap, coord ).rgb;
-
-	#else
-
-		// 兜底色也刻意偏冷：漏配 gradientMap 时不该突然跳回中性灰。
-		vec2 fw = fwidth( coord ) * 0.5;
-		return mix(
-			vec3( 0.30, 0.36, 0.50 ),
-			vec3( 1.00, 0.96, 0.86 ),
-			smoothstep( 0.7 - fw.x, 0.7 + fw.x, coord.x )
-		);
-
-	#endif
-
-}
-`;
-
-/**
- * 边缘光 / 菲涅尔（S16）—— **零程序代价的视觉丰富化通道**。
- *
- * ## 为什么只能这么做
- *
- * 想给钻石 / 宝箱单独加效果，直觉是「加一个 `SD_RIM` define，只有那两个材质打开」。
- * **那条路走不通**：`perf` 的判据是 `已编译程序数 ≤ 20`，而现在**正好 20（顶格）**。
- * 新增一个 define 分支 = 新增程序变体 = 21 → 红。
- *
- * 而 `onBeforeCompile` 注入的 GLSL **对程序缓存键完全不可见**
- * （`customProgramCacheKey` 被 `CACHE_KEY` 盖成常量，见下），
- * 所以「对**所有** toon 材质注入同一段 GLSL，再用**每材质** uniform 控强度」
- * 是唯一一条既不加程序、又不加 draw call 的路。
- *
- * ★ 这里成立的依据是 three 的一个实现细节（`three.module.js:18153`）：
- * `acquireProgram` 命中全局 `programsMap` 时只是 `++usedTimes` 返回旧 program，
- * **但 `materialProperties.uniforms = parameters.uniforms` 照常执行** ——
- * 也就是 **program 共享、uniforms 逐材质**。所以同 defines 的材质可以各有各的 rim 强度。
- *
- * ## 代价（诚实记账）
- *
- * 机柜、护栏、币床这些**不需要**边缘光的件也会带上这段代码，只是强度设 0。
- * 换来的是：程序数一个不涨、draw call 一个不涨、色带数一个不涨。
- *
- * ## 注入点与可用量
- *
- * - 声明挂在 `<common>` 之后（只声明**自己的** 3 个 uniform，不碰 `vObjPos` /
- *   `vObjNormal` / `uDetailScale` —— 那是 `detail.glsl.ts` 的条件声明，重复声明会编译失败）。
- * - 运算挂在 `<normal_fragment_maps>` 之后。此时：
- *   - `normal` 已由 `<normal_fragment_begin>` 声明，是**视空间**法线；
- *   - `vViewPosition` 由 `<lights_toon_pars_fragment>` 无条件声明（=`-mvPosition`，
- *     从片元指向相机，也是视空间）。所以 `dot(normal, normalize(vViewPosition))` 就是 NdotV。
- *
- * ## 为什么加在 `diffuseColor` 上（而不是 `outgoingLight`）
- *
- * `diffuseColor` 是**光照之前**的 albedo，色带是**乘**在它上面的。加在这里的效果是
- * 「边缘那些面的 albedo 被抬高 → 色带把其中一部分顶到更亮的一档」——
- * 于是低多面体的**硬切面**会自然分块（钻石尤其明显：逐面法线 ⇒ 逐面 NdotV 恒定 ⇒
- * 每个切面拿到一个**常量**的菲涅尔值，天然就是「切面高光」）。
- * 加在 `outgoingLight` 上则是无视色带的平滑泛光，会破坏三渲二的硬边调性。
- *
- * ## ★ 第二个用途：把**平铺的自发光**收进边缘（S16 实测补的）
- *
- * 第一版只做了上面那一条，截出来一看钻石是**一团发光的白球** —— 根因是
- * `emissive` 是**与法线无关的平铺加色**，强度一高就把逐面差异整个淹没：
- * 自发光项在所有面上完全一样，切面越多反而越平。
- *
- * 所以再加一条：`totalEmissiveRadiance *= mix( uRimEmissiveFloor, 1.0, sdRimFres )`
- * （挂在 `<emissivemap_fragment>` 之后）。效果是**边缘的切面亮、正对镜头的切面通透**——
- * 这恰好就是「宝石」的观感，而且 `uRimEmissiveFloor = 1` 时对既有材质是恒等变换。
- *
- * 注意注入点必须在 `<normal_fragment_maps>` **之后**（`normal` 在那里才定义），
- * 而 `<emissivemap_fragment>` 又在它之后 —— 两处注入的先后关系是 three 的固定顺序，
- * 不是我们排的。
- */
-const RIM_DECL = /* glsl */ `
-uniform vec3 uRimColor;
-uniform float uRimStrength;
-uniform float uRimPower;
-uniform float uRimEmissiveFloor;
-float sdRimFres;
-`;
-
-const RIM_APPLY = /* glsl */ `
-	{
-		vec3 sdRimView = normalize( vViewPosition );
-		sdRimFres = pow( 1.0 - saturate( dot( normal, sdRimView ) ), uRimPower );
-		diffuseColor.rgb += uRimColor * ( sdRimFres * uRimStrength );
-	}
-`;
-
-const RIM_EMISSIVE_APPLY = /* glsl */ `
-	totalEmissiveRadiance *= mix( uRimEmissiveFloor, 1.0, sdRimFres );
-`;
 
 export type ToonMaterialParams = {
   /** 基色（albedo）。色带是**乘**在它上面的，所以这里仍要填真实的材质颜色。 */

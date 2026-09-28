@@ -602,6 +602,14 @@ interface ThreeGameTestHooks {
    */
   materialReport?(): Record<string, number>;
   /**
+   * 已编译程序的**指纹名单**（R2-T2）。
+   *
+   * `materialReport().programs` 只有一个总数 —— 从 20 涨到 29 判据都还绿，
+   * 但「多出来的是哪一份程序」读不出来。这里按 cacheKey 的可读指纹分组给出，
+   * `verify-game.mjs perf` 会把它整张打印出来。
+   */
+  programRoster?(): Array<{ fingerprint: string; variants: number }>;
+  /**
    * 推币机扩展（V4）：币面贴图的实际纹素与采样设置。
    * `center` 是贴图正中心（有字形时是字色），`quarter` 是 1/4 处（纹样/颗粒区）。
    */
