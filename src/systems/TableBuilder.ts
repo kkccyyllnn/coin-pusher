@@ -856,7 +856,8 @@ let cabinetMaterialCache: {
   panel: LitMaterial;
   panelArt: LitMaterial;
   rail: LitMaterial;
-  trim: LitMaterial;
+  trimRoof: LitMaterial;
+  trimValance: LitMaterial;
   screen: LitMaterial;
 } | null = null;
 
@@ -864,7 +865,8 @@ function cabinetMaterials(): {
   panel: LitMaterial;
   panelArt: LitMaterial;
   rail: LitMaterial;
-  trim: LitMaterial;
+  trimRoof: LitMaterial;
+  trimValance: LitMaterial;
   screen: LitMaterial;
 } {
   if (!cabinetMaterialCache) {
@@ -874,6 +876,13 @@ function cabinetMaterials(): {
       // V3：背板 / 侧板的接缝 + 铆钉（格边长 0.5 米）。
       ...ROLE_DETAIL.panel,
     };
+    const trimParams = (name: string) => ({
+      name,
+      color: COLORS.cabinetTrim,
+      ramp: ROLE_RAMP.trim,
+      ...ROLE_DETAIL.trim,
+      ...ROLE_RIM.trim,
+    });
     cabinetMaterialCache = {
       panel: makeToonMaterial({ name: 'panel', ...panelParams }),
       // ★ 与 `panel` **同色带、同纹样、不同实例**，为的是能挂一张不同的 `map`。
@@ -902,13 +911,20 @@ function cabinetMaterials(): {
         //   这是 R2 里唯一被允许破例的一项，判据只看程序数，涨到 ≥ 29 就整块撤掉。
         normalMap: surfaceNormalMap('brushed'),
       }),
-      trim: makeToonMaterial({
-        name: 'trim',
-        color: COLORS.cabinetTrim,
-        ramp: ROLE_RAMP.trim,
-        ...ROLE_DETAIL.trim,
-        ...ROLE_RIM.trim,
-      }),
+      // ★ 顶板与檐板**同色带、同纹样、不同实例**（和上面 panel / panelArt 同一手法），
+      // 为的是 R2-T1-5：两件要挂不同的 Arcane 构图。
+      //
+      // 为什么拆实例是**唯一**办法：一份材质只有一个 map 槽，两件共用时
+      // `pickCabinetMap` 后写的那张会覆盖先写的 —— 零报错，只是两块板变成同一张画。
+      // 这正是 S18「招牌 / 顶沿 / 压条共用 trim ⇒ 三件只能同构图」的根因。
+      //
+      // 代价核算（与 panelArt 那条一样走「只多对象、不多定义」）：
+      //   - defines 一字不差 ⇒ +0 program；
+      //   - 网格件数没变 ⇒ +0 draw call；
+      //   - 但 `materialReport().rim` 会 +1（两份都带金属边缘光）⇒ perf 判据的
+      //     期望值必须跟着改成实测值，**不是**放宽断言。
+      trimRoof: makeToonMaterial(trimParams('trimRoof')),
+      trimValance: makeToonMaterial(trimParams('trimValance')),
       // ★ R3-U4 招牌显示屏。**defines 与 panelArt 一字不差**（同 detailKind、
       // 同挂 map + emissiveMap）⇒ 复用同一个 program，只多一个 draw call。
       //
@@ -939,7 +955,7 @@ function cabinetMaterials(): {
  */
 export function buildCabinetShell(): THREE.Group {
   const shell = new THREE.Group();
-  const { panel, panelArt, rail, trim, screen } = cabinetMaterials();
+  const { panel, panelArt, rail, trimRoof, trimValance, screen } = cabinetMaterials();
 
   // ── 7 件外壳 ──
   //
@@ -951,7 +967,7 @@ export function buildCabinetShell(): THREE.Group {
   //   低段与背板仍走 `panel` / `rail`。见 `cabinetMaterials()` 里 `panelArt` 的注释。
   shell.add(buildSideWall(-1, { tall: panelArt, low: rail }));
   shell.add(buildSideWall(1, { tall: panelArt, low: rail }));
-  shell.add(buildHood(trim, screen));
+  shell.add(buildHood(trimRoof, trimValance, screen));
   shell.add(buildBackPanel(panel));
 
   return shell;
@@ -1223,7 +1239,11 @@ function buildSideWall(
  * （`Game.pickCabinetMap` 本来就把它分到招牌那一支），代价是垂直压缩 ≈42%。
  * 侧墙高段的「檐板托」正好托在它下沿（`valanceBottomY`）上。
  */
-function buildHood(material: LitMaterial, screen: LitMaterial): THREE.Group {
+function buildHood(
+  roofMaterial: LitMaterial,
+  valanceMaterial: LitMaterial,
+  screen: LitMaterial,
+): THREE.Group {
   const { hood } = cabinetShape();
   const group = new THREE.Group();
 
@@ -1234,7 +1254,7 @@ function buildHood(material: LitMaterial, screen: LitMaterial): THREE.Group {
       [0, (hood.underY + hood.topY) / 2, (hood.backZ + hood.valanceInnerZ) / 2],
       'trim',
       'hoodRoof',
-      material,
+      roofMaterial,
     ),
   );
 
@@ -1246,7 +1266,7 @@ function buildHood(material: LitMaterial, screen: LitMaterial): THREE.Group {
       [0, (hood.valanceBottomY + hood.topY) / 2, (hood.valanceInnerZ + hood.valanceFrontZ) / 2],
       'trim',
       'hoodValance',
-      material,
+      valanceMaterial,
     ),
   );
 
