@@ -4236,6 +4236,23 @@ async function runModels(page) {
       entry.colliderHeight > coin.halfThickness * 2,
       `${(entry.colliderHeight * 1000).toFixed(1)} mm = 币厚的 ${entry.heightOverCoinThickness.toFixed(2)} 倍`,
     );
+    // ★ R4-4c「先量再改」：碰撞体里有多少是**看得见的空腔**。
+    //
+    // ④ 只查「模型不越出碰撞体」这一个方向；反方向（碰撞体比模型胖）从来没人量，
+    // 所以「钻石四角是空的、但币进不去」这件事一直停在推测层面。
+    // 这一条**先只做仪器自检**：两个比值必须有限且 ≥ 1。
+    // 为什么 ≥ 1 也算判据：它与 ④ 是**同一件事的两种独立算法**
+    // （④ 逐顶点比距离，这里逐三角形积分体积/投影面积），两者给出不一致的结论
+    // 就说明其中一边算错了 —— 这是交叉校验，不是新放宽。
+    check(
+      `⑦ ${tag}：碰撞体松紧度读数有效（体积 / 占地，≥ 1 且非 NaN）`,
+      Number.isFinite(entry.colliderVolumeOverModel) &&
+        Number.isFinite(entry.colliderFootprintOverModel) &&
+        entry.colliderVolumeOverModel >= 1 &&
+        entry.colliderFootprintOverModel >= 1,
+      `碰撞体 = 模型的 ${entry.colliderVolumeOverModel.toFixed(3)} 倍体积 / ` +
+        `${entry.colliderFootprintOverModel.toFixed(3)} 倍占地（形状 ${entry.collider.shape}）`,
+    );
     const written = atlas[entry.kind];
     const expected = tones.map((tone) => entry.palette[tone]);
     check(

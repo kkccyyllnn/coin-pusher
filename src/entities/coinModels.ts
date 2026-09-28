@@ -837,6 +837,24 @@ export type CoinModelAudit = {
   palette: CoinModelPalette;
   /** `KINDS[kind].lockedPalette` 原样（可能是 `null` —— 未锁定配色的币种）。 */
   lockedPalette: { base?: string; dark?: string; ink?: string } | null;
+  /**
+   * 碰撞体体积 ÷ **模型实体积**（R4-4c 的「松紧度」读数，先量再改）。
+   *
+   * 1.0 = 碰撞体与模型严丝合缝；越大 = 碰撞体里越多「看得见是空的、但币进不去」的死空间。
+   * 八角双锥钻石与切角宝箱的四角就是这种空间：`coinColliderSpec()` 从模型 AABB 推导，
+   * 于是四个角被白送进碰撞体里。
+   *
+   * ⚠️ **这条读数以前不存在**，所以「有多松」从来没人量过 —— 判据只看「模型不越界」，
+   * 而越界方向的反面（内缩）是完全不被检查的。
+   */
+  colliderVolumeOverModel: number;
+  /**
+   * 碰撞体水平投影面积 ÷ 模型水平投影面积（占地口径）。
+   *
+   * 体积比会把「高度上的余量」和「平面上的余量」混在一起；堆叠与 `layerOffsets`
+   * 真正吃的是**占地**，所以单独给一条。
+   */
+  colliderFootprintOverModel: number;
 };
 
 /**
@@ -877,6 +895,11 @@ export function coinModelAudit(): CoinModelAudit[] {
     let outside = 0;
     let worstOut = 0;
     let radial = 0;
+    // 模型实体积（有符号四面体求和）与水平投影面积（R4-4c 的松紧度分母）。
+    // 都在这**同一个三角形循环**里累加：另起一遍就是第二份遍历，
+    // 而网格是非索引的（`indexed === false`），两遍很容易走成不同的顶点集合。
+    let signedVolume = 0;
+    let projectedArea = 0;
     const uvs = new Set<string>();
 
     for (let t = 0; t < position.count; t += 3) {
@@ -884,7 +907,13 @@ export function coinModelAudit(): CoinModelAudit[] {
       a.fromBufferAttribute(position, t);
       b.fromBufferAttribute(position, t + 1);
       c.fromBufferAttribute(position, t + 2);
-      face.copy(ab.subVectors(b, a).cross(ac.subVectors(c, a)).normalize());
+      // ⚠️ `raw` 必须是**归一化之前**的叉积：它的模长就是三角形面积，
+      // 而 `face` 被 normalize() 过，模长恒为 1，拿它算体积/面积会得到常数。
+      const raw = ab.subVectors(b, a).cross(ac.subVectors(c, a));
+      signedVolume += a.dot(raw) / 6;
+      // 闭合网格朝上与朝下的面各贡献一次投影，所以总和是** footprint 的两倍**，末尾 ÷2。
+      projectedArea += Math.abs(raw.y) / 2;
+      face.copy(raw).normalize();
 
       let flat = true;
       for (let k = 0; k < 3; k += 1) {
@@ -935,6 +964,22 @@ export function coinModelAudit(): CoinModelAudit[] {
       circumscribedOverCoin: (radial * 2) / (COIN.radius * 2),
       palette: coinModelPalette(kind),
       lockedPalette: KINDS[kind].lockedPalette,
+      // 松紧度：碰撞体占的空间 ÷ 模型真的占的空间。
+      // 分母用 `Math.abs` —— 绕序（winding）只影响符号，不影响实体积。
+      colliderVolumeOverModel:
+        Math.abs(signedVolume) === 0
+          ? Number.NaN
+          : (collider.shape === 'cylinder'
+              ? Math.PI * collider.radius ** 2 * collider.halfHeight * 2
+              : collider.halfExtents[0] * collider.halfExtents[1] * collider.halfExtents[2] * 8) /
+            Math.abs(signedVolume),
+      colliderFootprintOverModel:
+        projectedArea === 0
+          ? Number.NaN
+          : (collider.shape === 'cylinder'
+              ? Math.PI * collider.radius ** 2
+              : collider.halfExtents[0] * collider.halfExtents[2] * 4) /
+            (projectedArea / 2),
     };
   });
 }
