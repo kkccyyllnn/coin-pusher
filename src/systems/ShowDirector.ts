@@ -554,6 +554,8 @@ class TowerShow extends TimedShow {
     halo.rotation.x = -Math.PI / 2;
     // 抬高 8 mm：床面本身是个网格，共面必 z-fighting（截图上表现为环忽隐忽现的闪）。
     halo.position.set(this.x, 0.008, 0.3);
+    // 初始就得是 0：mount 与第一帧 tick 之间可能先画一次，默认 scale 1 会闪一帧满环。
+    halo.scale.set(0.001, 0.001, 1);
     // 环与柱体不同高度，但**同一条生命周期**：`TimedShow.dispose()` 遍历 mount 逐个
     // dispose 几何与材质，所以挂在同一个 Group 下就不用管清理。
     const group = new THREE.Group();
