@@ -27,6 +27,8 @@ import {
   createArcaneHotZoneTexture,
   createArcaneLampHousingTexture,
   createArcaneMarqueeTexture,
+  createArcaneRoofSeamTexture,
+  createArcaneBackPanelTexture,
   createArcaneScoreLineTexture,
   type ArcanePaletteKey,
 } from '../render/cabinetTexture';
@@ -3769,8 +3771,14 @@ function round3(value: number): number {
  *
  * - `scoreLine` → `createArcaneScoreLineTexture`
  * - `hotZone` → `createArcaneHotZoneTexture`
- * - `hoodRoof` / `hoodValance` → `createArcaneMarqueeTexture`（两件共用一份
- *   `trimMaterial`，所以这里只会真的建一张 —— 见 `applyCabinetMapTextures` 的 `touched`）
+ * - `hoodValance` → `createArcaneMarqueeTexture`（招牌画布）
+ * - `hoodRoof` → `createArcaneRoofSeamTexture`（R2-T1-5：顶板自己一份构图。原先它与檐板
+ *   共用一份 `trim` 材质 ⇒ 只能共用一张贴图，后写的覆盖先写的；拆成两份实例才分开）
+ * - `backPanel` → `createArcaneBackPanelTexture`（R2-T1-5：原先**没有**贴图）
+ *
+ * ★ 我原本预计这一条会 +1 program（`panel` 建场时不带 map ⇒ 挂上后多出 `USE_MAP`
+ * 这个 define ⇒ 新 program 键）。**实测没有**：programs 25 → 25、draw call 46 → 46。
+ * 预测与预算冲突时以读数为准，别照着预测去放宽或收紧判据。
  * - `sideWall.tall.L` / `.R` → `createArcaneLampHousingTexture`（S25 / R1-M3 的内凹灯饰。
  *   两件共用 `panelArt` 那一份材质 ⇒ 也只真的建一张；**侧板高段能单独挂图**靠的就是
  *   那份从 `panel` 拆出来的独立实例，见 `TableBuilder.cabinetMaterials()`）
@@ -3798,10 +3806,11 @@ function pickCabinetMap(
   // 里再 `if (part === …)` 一次），是为了「哪件挂哪张图 / 要不要自发光」始终只有一个出处。
   if (part === 'scoreLine') return { map: createArcaneScoreLineTexture(palette), glow: false };
   if (part === 'hotZone') return { map: createArcaneHotZoneTexture(palette), glow: false };
-  // 檐板＝招牌画布（S21）；顶板与它共用 `trimMaterial`，所以实际只会建一张贴图。
-  if (part === 'hoodRoof' || part === 'hoodValance') {
-    return { map: createArcaneMarqueeTexture(palette), glow: false };
-  }
+  // 檐板＝招牌画布（S21）。顶板 R2-T1-5 起走自己那份构图。
+  if (part === 'hoodValance') return { map: createArcaneMarqueeTexture(palette), glow: false };
+  if (part === 'hoodRoof') return { map: createArcaneRoofSeamTexture(palette), glow: false };
+  // 背板：可见的只有币堆上沿那一条，构图把信息量全放在顶部拱线（见 painters 的注释）。
+  if (part === 'backPanel') return { map: createArcaneBackPanelTexture(palette), glow: false };
   // 侧板高段＝内凹灯饰（S25 / R1-M3 的贴图近似版）。两件共用 `panelArt` 一份材质，
   // 走 `touched` 去重 ⇒ 只建一张。左右两件**必须**给同一个 key：它们是同一份材质，
   // 若这里按 `side` 分叉就会变成「后建的那张覆盖前一张」的静默抖动。

@@ -79,7 +79,15 @@ export const ARCANE_PALETTES: Record<ArcanePaletteKey, readonly [string, string,
  * 背光底板合并成一个 geometry，+1 draw call）。贴图版**零 draw call、零 program**
  * （同一份 `map` 通道），先看够不够，不够再上几何。
  */
-type PaintKind = 'marquee' | 'scoreLine' | 'hotZone' | 'lampHousing';
+type PaintKind =
+  | 'marquee'
+  | 'scoreLine'
+  | 'hotZone'
+  | 'lampHousing'
+  // R2-T1-5：顶板与背板从「复用别人的构图」升级为「自己有一份」。
+  // 顶板原先与檐板共用一张（因为它共用一份 trim 材质），背板原先**根本没有贴图**。
+  | 'roofSeam'
+  | 'backPanel';
 
 function paintBase(ctx: CanvasRenderingContext2D, w: number, h: number, ink: string): void {
   /** 煤黑底——整张涂 ink（palette[4]），其它笔触在它上面覆盖。 */
@@ -541,3 +549,114 @@ export function createArcaneHotZoneTexture(paletteKey: ArcanePaletteKey): THREE.
  * `cabinet-tex` 判据据此检查「图集 5 档都落在预期槽」。
  */
 export const ARCANE_PALETTE_SLOTS = 5 as const;
+
+/**
+ * 顶板（内腔「天花板」）：横向板缝 + 铆钉 + 一道霓虹边。
+ *
+ * 为什么是这套构图：顶板是一块**几乎平行于视线**的大面（相机从斜上方往下看它，
+ * 它在屏幕上只剩一条被强烈透视压扁的带）。这种面上任何「有内容的图案」都会被压成
+ * 看不清的糊，只有**与视线垂直的高对比线**活得下来 —— 板缝正是这种东西，
+ * 而且它顺带交代「这台机器是几块板拼的」，与机柜外壳的件划分一致。
+ *
+ * 尺寸 1024×256（4:1）：顶板面 ≈ 1.6 米宽 × 0.5 米深（≈ 3.2:1），
+ * 取最接近的 2 的幂组合；比例错了会让圆头铆钉变成扁椭圆。
+ */
+function paintRoofSeamCanvas(
+  ctx: CanvasRenderingContext2D,
+  palette: readonly [string, string, string, string, string],
+  key: ArcanePaletteKey,
+): void {
+  const w = ctx.canvas.width;
+  const h = ctx.canvas.height;
+  const [light, glow, hue, deep, ink] = palette;
+  const rng = makeRng(key, 'roofSeam', 11);
+
+  paintBase(ctx, w, h, ink);
+  // 底噪只给 6 团、且用 deep（不是 hue）：顶板不该抢檐板招牌的注意力。
+  paintSprayInk(ctx, w, h, deep, rng, 6);
+
+  const seams = 3;
+  for (let i = 0; i < seams; i += 1) {
+    const y = h * (0.18 + i * 0.32);
+    const seam = new Path2D();
+    seam.moveTo(0, y);
+    seam.lineTo(w, y + h * 0.06 * (rng() - 0.5));
+    // 缝本身用 deep（暗），辉光用 glow（亮）：一条**发光的暗缝**才是「两块板拼起来」,
+    // 一条亮线会被读成「板上贴了灯带」。
+    paintNeonEdge(ctx, seam, deep, glow, 8, 26);
+    // 铆钉：贴着缝的上沿，等距 6 颗（等距是刻意的 —— 随机铆钉读起来像污渍）。
+    for (let k = 0; k < 6; k += 1) {
+      const x = ((k + 0.5) * w) / 6;
+      ctx.fillStyle = light;
+      ctx.beginPath();
+      ctx.arc(x, y - h * 0.05, h * 0.022, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  // 一道斜笔：Arcane 的街头感，压在缝下面留白的那一条。
+  const tag = new Path2D();
+  tag.moveTo(w * 0.08, h * 0.86);
+  tag.quadraticCurveTo(w * 0.5, h * 0.72, w * 0.9, h * 0.9);
+  paintThickBrush(ctx, tag, hue, deep, 3);
+}
+
+/**
+ * 背板：大面积低对比喷墨 + 顶部一道霓虹拱。
+ *
+ * 为什么必须克制：背板**下半部永远被金币堆糊满**（它是币床的背景），画得再细也看不见，
+ * 而高对比图案从币缝里露出来会变成「花」—— 那块面唯一可靠的可见区是币堆上沿以上的
+ * 那一条，所以构图把全部信息量放在顶部拱线，其余留给喷墨底纹。
+ *
+ * 尺寸与侧墙同档（512×608）：背板可见跨度 ≈ 1.6 米宽 × 1.9 米高，与侧墙内表面同比例。
+ */
+function paintBackPanelCanvas(
+  ctx: CanvasRenderingContext2D,
+  palette: readonly [string, string, string, string, string],
+  key: ArcanePaletteKey,
+): void {
+  const w = ctx.canvas.width;
+  const h = ctx.canvas.height;
+  const [light, glow, hue, deep, ink] = palette;
+  const rng = makeRng(key, 'backPanel', 13);
+
+  paintBase(ctx, w, h, ink);
+  // 20 团喷墨、用 glow 色但 alpha 由 paintSprayInk 自己压在 0.05~0.20 ⇒
+  // 整块面只是「有层次」，不会形成任何可读形状。
+  paintSprayInk(ctx, w, h, glow, rng, 20);
+
+  const arch = new Path2D();
+  arch.moveTo(w * 0.06, h * 0.62);
+  arch.quadraticCurveTo(w * 0.5, h * 0.05, w * 0.94, h * 0.62);
+  paintThickBrush(ctx, arch, hue, deep, 5);
+  paintNeonEdge(ctx, arch, light, glow, 4, 18);
+}
+
+/** 顶板贴图工厂（1024×256，采样设置与招牌同档：平滑 + mipmap）。 */
+export function createArcaneRoofSeamTexture(
+  paletteKey: ArcanePaletteKey,
+  width = 1024,
+  height = 256,
+): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('无法创建机柜顶板贴图上下文。');
+  paintRoofSeamCanvas(ctx, ARCANE_PALETTES[paletteKey], paletteKey);
+  return makeTexture(canvas, THREE.LinearFilter, THREE.LinearMipmapLinearFilter);
+}
+
+/** 背板贴图工厂（512×608）。 */
+export function createArcaneBackPanelTexture(
+  paletteKey: ArcanePaletteKey,
+  width = 512,
+  height = 608,
+): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('无法创建机柜背板贴图上下文。');
+  paintBackPanelCanvas(ctx, ARCANE_PALETTES[paletteKey], paletteKey);
+  return makeTexture(canvas, THREE.LinearFilter, THREE.LinearMipmapLinearFilter);
+}

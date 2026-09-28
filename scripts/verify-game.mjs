@@ -4537,9 +4537,11 @@ async function runCabinetTex(page) {
     `cabinetMapCount=${mapCount}`,
   );
 
-  // 贴图**落在哪一件上**（S25 / R1-M3）。上面那条总量判据答不出这件事，
-  // 而 `panelArt` 这份材质拆分的**全部意义**就是「侧板挂灯饰、背板不挂」：
-  // 哪天有人把它并回 `panel`，背板会被一起刷成灯位，而且零报错。
+  // 贴图**落在哪一件上**（S25 / R1-M3 起，R2-T1-5 扩到「每件各一张」）。
+  // 上面那条总量判据答不出这件事，而材质拆分的**全部意义**就是「这一件挂这一张」：
+  // 哪天有人把两份实例并回一份，两件会立刻共用同一张图 —— 零报错，只是画面变平。
+  // ⚠️ 这条判据原先断言的是「背板**不挂**」；T1-5 之后背板有自己的构图，
+  // 断言随之从「不挂」改成「挂的是自己那张、且与别件不同」。
   const mapsByPart = await page.evaluate(() => {
     const maps = {};
     const glows = {};
@@ -4552,6 +4554,7 @@ async function runCabinetTex(page) {
       tallR: maps['sideWall.tall.R'] ?? null,
       back: maps.backPanel ?? null,
       valance: maps.hoodValance ?? null,
+      roof: maps.hoodRoof ?? null,
       glowL: glows['sideWall.tall.L'] ?? null,
       // 只有侧墙该发光：檐板（招牌）走的是**亮**色带，`color × map` 本来就够亮，
       // 给它加 emissive 会把招牌刷成过曝白 —— 所以「glow 只在侧墙」也是判据。
@@ -4559,15 +4562,16 @@ async function runCabinetTex(page) {
     };
   });
   check(
-    '灯饰贴图只落在两侧墙高段（左右同图、背板不挂、檐板仍是招牌）',
+    '每件外壳挂自己那张构图（侧墙左右同图；顶板 / 檐板 / 背板三张互不相同）',
     mapsByPart.tallL !== null &&
-      mapsByPart.tallR === mapsByPart.tallL &&
-      mapsByPart.back === null &&
-      mapsByPart.valance !== null &&
-      mapsByPart.valance !== mapsByPart.tallL,
+      mapsByPart.tallL === mapsByPart.tallR &&
+      new Set([mapsByPart.valance, mapsByPart.roof, mapsByPart.back]).size === 3 &&
+      // 只有侧墙该发光：檐板（招牌）走的是**亮**色带，color × map 本来就够亮，
+      // 给它加 emissive 会把招牌刷成过曝白。顶板与背板同理（它们吃 trim / panel 色带）。
+      mapsByPart.glowL !== null &&
+      mapsByPart.glowValance === null,
     JSON.stringify(mapsByPart),
-  );
-  // ★ 「挂了图」≠「灯亮着」。侧墙是深色 `panel` 色带，而 toon 材质是 `color × map`：
+  );  // ★ 「挂了图」≠「灯亮着」。侧墙是深色 `panel` 色带，而 toon 材质是 `color × map`：
   //   只挂 `map` 时贴图里的近白灯管会被乘成暗斑（实测就是这样，画布上明明有灯）。
   //   亮条要靠 `emissiveMap` 走自发光的加法通道 —— 这条判据守的就是那一步有没有漏。
   check(
