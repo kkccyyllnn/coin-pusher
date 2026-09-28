@@ -23,8 +23,8 @@ import { RIM_APPLY, RIM_DECL, RIM_EMISSIVE_APPLY } from './glsl/rim.glsl';
  * 顶点变形与实例化。裸写 `ShaderMaterial` 要把 `#include <shadowmap_pars_fragment>`
  * 那一整套重新接回去，工作量大好几倍，而且每次 three 升级都要跟着修。
  *
- * 这里插**两件事**：
- * 1. 把色带的读法从标量改成 RGB（见下面的 `COLOR_RAMP_CHUNK`）—— **无条件**。
+ * 这里插**三件事**：
+ * 1. 把色带的读法从标量改成 RGB，并给它一条**背面色带**（见下面的 `COLOR_RAMP_CHUNK`）—— **无条件**。
  * 2. 边缘光 / 菲涅尔（S16，见 `RIM_DECL`）—— 也是**无条件**注入，强度由每材质
  *    uniform 控制（默认 0）。无条件是为了不新增 define ⇒ 不新增程序变体。
  *
@@ -47,6 +47,16 @@ export type ToonMaterialParams = {
   color: THREE.ColorRepresentation;
   /** 色带调色板 id（见 `artDirection.RAMP_PALETTES`）。 */
   ramp: RampId;
+  /**
+   * **背面**色带（R2-T1-3）。默认跟随 `ramp` —— 也就是「没填 = 正背面同一条」，
+   * 对既有材质是恒等变换。
+   *
+   * 只对 `side` 含 `DoubleSide` 的件有视觉效果：闭合单面网格上背面早已被剔除，
+   * `gl_FrontFacing` 恒真，两条色带永远走同一条。真正吃到它的是
+   * **半透明双面件**（落币导槽）——从外面同时看得见近壁与远壁，
+   * 同色带时两面糊成一张纸，分开后才读得出「一条槽」的厚度。
+   */
+  rampBack?: RampId;
   /**
    * 程序化表面细节的种类（见 `artDirection.DETAIL_KINDS`）。
    * 0 = 无细节（省掉整段 shader）。用 `defines` 做**编译期**选择，不进 uniform。
@@ -172,6 +182,14 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
     value: new THREE.Color(params.rimColorHigh ?? params.rimColor ?? '#000000'),
   };
   const matcapStrengthUniform = { value: params.matcapStrength ?? 0 };
+  // R2-T1-3：背面色带。**未填 = 复用正面那张 LUT**，于是 `gl_FrontFacing` 的两个分支
+  // 采到同一个采样器对象、同一个值 —— 恒等变换，且 `rampLutCount()` 不会多出一条。
+  const gradientBackUniform = {
+    value: rampLutFor(
+      params.rampBack ?? params.ramp,
+      RAMP_PALETTES[params.rampBack ?? params.ramp],
+    ),
+  };
 
   // ★ 把强度**记在材质上**，供验证判据计数（`materialReport().rim`）。
   //
@@ -188,6 +206,7 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
     shader.uniforms.uRimEmissiveFloor = rimEmissiveFloorUniform;
     shader.uniforms.uRimColorHigh = rimColorHighUniform;
     shader.uniforms.uMatcapStrength = matcapStrengthUniform;
+    shader.uniforms.uGradientBack = gradientBackUniform;
 
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>\n${SURFACE_DETAIL_VERTEX_VARYINGS}`)

@@ -12,6 +12,19 @@
  *    **这是彩色色带的核心**。stock 的标量读法下最终颜色 =
  *    `albedo × 标量 × lightColor`，阴影**只能变暗**；取 RGB 之后色带自带色相，
  *    暗部才能整体推到冷色（三渲二的标准做法）。
+ *
+ * ## 正/背面双 ramp（R2-T1-3）
+ *
+ * `uGradientBack` 是**无条件**注入的第二张色带，正对镜头的面走 `gradientMap`，
+ * 背对镜头的面走它 —— 又是「加 uniform 不加 define」那条纪律：加 define 就是加程序变体。
+ *
+ * ⚠️ **闭合单面网格上这段等于没写**：`FrontSide` 已经把背面剔掉，
+ * 画面上不存在 `gl_FrontFacing == false` 的片元。它服务的是
+ * **`DoubleSide` 的半透明件**（现在是落币导槽）：从外面看过去能同时看见近壁与远壁，
+ * 两条色带相同时两面**糊成一张纸**，不同时才读出「一条槽」的厚度。
+ *
+ * 默认值与 `gradientMap` 是**同一张纹理**（见 `ToonMaterial.ts` 的 `rampBack ?? ramp`），
+ * 所以对既有材质是恒等变换。
  */
 export const COLOR_RAMP_CHUNK = /* glsl */ `
 #ifdef USE_GRADIENTMAP
@@ -19,6 +32,8 @@ export const COLOR_RAMP_CHUNK = /* glsl */ `
 	uniform sampler2D gradientMap;
 
 #endif
+
+uniform sampler2D uGradientBack;
 
 vec3 getGradientIrradiance( vec3 normal, vec3 lightDirection ) {
 
@@ -28,7 +43,13 @@ vec3 getGradientIrradiance( vec3 normal, vec3 lightDirection ) {
 
 	#ifdef USE_GRADIENTMAP
 
-		return texture2D( gradientMap, coord ).rgb;
+		// 背面换第二条色带。写成分支而不是无条件 mix：两张 LUT 内容通常相同，
+		// 分支让驱动只在真的翻到背面时才多一次采样。
+		// ⚠️ 这段注释里**不能出现反引号** —— 整段 GLSL 是一个 JS 模板字符串，
+		//   一个反引号就会把模板提前终结，报错落在下一行且完全指不到真凶。
+		return gl_FrontFacing
+			? texture2D( gradientMap, coord ).rgb
+			: texture2D( uGradientBack, coord ).rgb;
 
 	#else
 

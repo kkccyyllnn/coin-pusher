@@ -581,6 +581,14 @@ function buildDropCorridor(): THREE.Group {
     name: 'dropCorridor',
     color: COLORS.pusherLip,
     ramp: 'accent',
+    // ★ 背面走 `metal`（底档 #2f3a52，比 accent 的 #4a4460 更暗更冷）：这两片是
+    // `DoubleSide` + 26% 透明，从外面会**同时看见近壁和透过它看见的远壁**。
+    // 正背面同一条色带时两面完全一样，导槽在截图里就是一张纸；分开之后远壁沉下去，
+    // 「一条槽」的厚度才读得出来。
+    // ⚠️ 选调色板要看**开机时已加载哪几条**，不是看语义：色带缓存按 id 建，
+    //   填一条只有演出装置才用的 `device` 会把 LUT 从 4 条抬到 5 条（实测），
+    //   而 `metal` 是护栏/顶沿开机就在的，用它 LUT 数量不变。
+    rampBack: 'metal',
     transparent: true,
     opacity: 0.26,
     side: THREE.DoubleSide,
