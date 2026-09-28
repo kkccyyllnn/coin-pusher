@@ -4249,9 +4249,14 @@ async function runModels(page) {
       Number.isFinite(entry.colliderVolumeOverModel) &&
         Number.isFinite(entry.colliderFootprintOverModel) &&
         entry.colliderVolumeOverModel >= 1 &&
-        entry.colliderFootprintOverModel >= 1,
+        entry.colliderFootprintOverModel >= 1 &&
+        Number.isFinite(entry.colliderHeightOverModel) &&
+        entry.colliderHeightOverModel >= 1,
       `碰撞体 = 模型的 ${entry.colliderVolumeOverModel.toFixed(3)} 倍体积 / ` +
-        `${entry.colliderFootprintOverModel.toFixed(3)} 倍占地（形状 ${entry.collider.shape}）`,
+        `${entry.colliderFootprintOverModel.toFixed(3)} 倍占地 / ` +
+        // ★ 三个数一起看才知道缝隙在**哪一维**：只报体积比会把它当成「四角内缩」，
+        //   而按轴拆开之后最大的是高度 —— 要收的是碰撞体厚度，不是水平形状。
+        `${entry.colliderHeightOverModel.toFixed(3)} 倍高度（形状 ${entry.collider.shape}）`,
     );
     const written = atlas[entry.kind];
     const expected = tones.map((tone) => entry.palette[tone]);

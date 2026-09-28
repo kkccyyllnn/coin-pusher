@@ -855,6 +855,30 @@ export type CoinModelAudit = {
    * 真正吃的是**占地**，所以单独给一条。
    */
   colliderFootprintOverModel: number;
+  /**
+   * 碰撞体半高 ÷ **模型实测半高**（把松紧度按轴拆开的那一条）。
+   *
+   * ★ 这条读数是为了**推翻上一条的口径**而加的。体积比 2.525 看着像「碰撞体比模型胖了一倍多」，
+   * 但它是把「形状本身是尖的」和「碰撞体留了空档」混在一起的单一数字 —— 而 R4-4c 计划
+   * 要收的只是后者。按轴拆开之后实测（同一轮 models 判据的打印）：
+   *
+   * | 币种 | 体积比 | 占地比 | 高度比 |
+   * |---|---|---|---|
+   * | 钻石（圆柱碰撞体） | 2.525 | 1.111 | **1.000** |
+   * | 宝箱（长方体碰撞体） | 1.738 | 1.009 | **1.000** |
+   *
+   * 也就是说：堆叠真正吃的两维**已经没有余量**（高度严丝合缝、平面只松 1%～11%），
+   * 那 2 倍多的体积差是**锥尖 / 弧顶本身的空腔**（八角双锥的实体只有其外接圆柱的 1/3），
+   * 属于形状固有属性，不是能靠缩小碰撞体去掉的松量。
+   *
+   * ⚠️ 顺带纠正我自己：加这条读数之前，我用「体积比 ÷ 占地比」推出「缝隙在高度那一维，
+   * 约 2.3 倍」，并据此改了计划方向 —— 除法推出来的不是证据，量出来才是。
+   * 对 4c 的含义因此反过来：能收的只剩水平那 11%，而收它会连带改 layerOffsets 与
+   * TowerShow 的层高（收益小、牵连大），所以 4c 应降级为「不做」而不是换个轴做。
+   *
+   * 模型半高取**顶点实测**（spec.height 是声明值，读它等于把断言当证据）。
+   */
+  colliderHeightOverModel: number;
 };
 
 /**
@@ -895,6 +919,7 @@ export function coinModelAudit(): CoinModelAudit[] {
     let outside = 0;
     let worstOut = 0;
     let radial = 0;
+    let modelHalfHeight = 0;
     // 模型实体积（有符号四面体求和）与水平投影面积（R4-4c 的松紧度分母）。
     // 都在这**同一个三角形循环**里累加：另起一遍就是第二份遍历，
     // 而网格是非索引的（`indexed === false`），两遍很容易走成不同的顶点集合。
@@ -929,6 +954,7 @@ export function coinModelAudit(): CoinModelAudit[] {
 
       for (const point of [a, b, c]) {
         radial = Math.max(radial, Math.hypot(point.x, point.z));
+        modelHalfHeight = Math.max(modelHalfHeight, Math.abs(point.y));
         const out =
           collider.shape === 'cylinder'
             ? Math.max(
@@ -980,6 +1006,12 @@ export function coinModelAudit(): CoinModelAudit[] {
               ? Math.PI * collider.radius ** 2
               : collider.halfExtents[0] * collider.halfExtents[2] * 4) /
             (projectedArea / 2),
+      colliderHeightOverModel:
+        modelHalfHeight === 0
+          ? Number.NaN
+          : (collider.shape === 'cylinder'
+              ? collider.halfHeight
+              : collider.halfExtents[1]) / modelHalfHeight,
     };
   });
 }
