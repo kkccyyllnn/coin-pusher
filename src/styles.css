@@ -5,8 +5,19 @@
   --panel: rgba(12, 20, 16, 0.78);
   --panel-solid: #101a15;
   --line: rgba(242, 232, 210, 0.22);
-  --brass: #e0b061;
+  /* R3-U1：黄铜只允许这一支；绿 / 蓝 / 红留给语义（返币 / 钻石 / 危险），
+     不得拿 accent 当装饰色。这些字面值原先散在按钮、数字、描边里 ——
+     那就是「第二份真源」。带 -rgb 的三元组是为了能拼透明度：
+     `rgb(var(--brass-rgb) / 0.42)`（CSS 没法给一个 hex 加 alpha）。 */
+  --brass-rgb: 224 176 97;
+  --brass: rgb(var(--brass-rgb));
+  --brass-hi: #ffd88a;
   --brass-deep: #a9762c;
+  --brass-glow: rgb(var(--brass-rgb) / 0.42);
+  --edge-hi: rgb(var(--brass-rgb) / 0.9);
+  --edge-lo: rgba(0, 0, 0, 0.55);
+  --btn-face-1: rgba(18, 28, 22, 0.9);
+  --btn-face-2: rgba(9, 16, 12, 0.94);
   --mint: #6fd3a5;
   --danger: #d0674a;
   color: var(--ink);
@@ -95,11 +106,11 @@ body {
 @keyframes climax-gold {
   0% {
     opacity: 1;
-    box-shadow: inset 0 0 70px 8px rgba(224, 176, 97, 0.45);
+    box-shadow: inset 0 0 70px 8px rgb(var(--brass-rgb) / 0.45);
   }
   100% {
     opacity: 0;
-    box-shadow: inset 0 0 150px 34px rgba(224, 176, 97, 0);
+    box-shadow: inset 0 0 150px 34px rgb(var(--brass-rgb) / 0);
   }
 }
 
@@ -239,47 +250,66 @@ body {
   }
   40% {
     transform: scale(1.22);
-    color: #ffd88a;
+    color: var(--brass-hi);
   }
   100% {
     transform: scale(1);
   }
 }
 
-#pause-button,
-#collection-button,
-#endless-button,
-#giveup-button,
-#resume-button,
-#retry-button,
-#next-button {
+/* ── 通用按钮（R3-U2 / U3）──────────────────────────────────────────────
+   风格四条（与 cabinetTexture 的 Arcane 同源）：① 用描边不用投影做层次；
+   ② 双色描边（外圈 glow、内圈实线）；③ 主色只有黄铜一支。
+   选择器用 `:is()` 收成一条链：原先每个状态都要重列 7 个 id，
+   **加一个按钮要改 4 处** —— 那就是漂移信号。现在加按钮只改一处。 */
+:is(#pause-button, #collection-button, #endless-button, #giveup-button,
+    #resume-button, #retry-button, #next-button) {
   padding: 8px 14px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--edge-hi);
   border-radius: 8px;
+  box-shadow:
+    inset 0 1px 0 rgb(var(--brass-rgb) / 0.18),
+    0 0 0 1px var(--edge-lo),
+    0 0 12px var(--brass-glow);
   color: var(--ink);
-  background: var(--panel);
+  background: linear-gradient(180deg, var(--btn-face-1), var(--btn-face-2));
   font: inherit;
   font-size: 0.8rem;
   cursor: pointer;
   pointer-events: auto;
+  /* 只用 transform / 阴影色：不碰布局属性（同 .fly-score 的纪律）。 */
+  transition:
+    transform 120ms cubic-bezier(0.2, 0.8, 0.3, 1),
+    box-shadow 160ms ease-out;
 }
 
-#pause-button:hover,
-#collection-button:hover,
-#endless-button:not(:disabled):hover,
-#resume-button:hover,
-#retry-button:hover {
-  border-color: var(--brass);
+/* hover：外圈 glow 变宽（描边亮起），边框颜色不动 —— 动的是光，不是形。 */
+:is(#pause-button, #collection-button, #endless-button, #resume-button, #retry-button):not(:disabled):hover {
+  box-shadow:
+    inset 0 1px 0 rgb(var(--brass-rgb) / 0.3),
+    0 0 0 1px var(--edge-lo),
+    0 0 18px var(--brass-glow);
+}
+
+/* 按下：位移 1 px + 内阴影，把「凸起」翻成「按下去」。 */
+:is(#pause-button, #collection-button, #endless-button, #giveup-button,
+    #resume-button, #retry-button, #next-button):active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.6);
+}
+
+/* 禁用：降饱和，不只降 opacity —— 灰掉的按钮才读作「不能按」，
+   半透明的按钮读作「还没加载完」。 */
+:is(#pause-button, #collection-button, #endless-button, #giveup-button,
+    #resume-button, #retry-button, #next-button):disabled {
+  filter: saturate(0.25) brightness(0.8);
+  opacity: 0.55;
+  cursor: default;
 }
 
 #endless-button {
   border-color: var(--brass-deep);
-  color: #ffe1a8;
-}
-
-#endless-button:disabled {
-  opacity: 0.4;
-  cursor: default;
+  color: var(--brass-hi);
 }
 
 /* ── 破产弹窗 ────────────────────────────────────────────────────────── */
@@ -313,7 +343,7 @@ body {
 
 #ruin-taunt {
   margin: 0 0 14px;
-  color: #ffd88a;
+  color: var(--brass-hi);
   font-size: 0.9rem;
   line-height: 1.6;
 }
@@ -359,7 +389,7 @@ body {
   border: 1px solid var(--brass);
   border-radius: 10px;
   color: #1a1206;
-  background: linear-gradient(180deg, #ffd88a, var(--brass));
+  background: linear-gradient(180deg, var(--brass-hi), var(--brass));
   font: inherit;
   font-size: 0.94rem;
   font-weight: 600;
@@ -455,7 +485,7 @@ body {
 
 .skin-card.selected {
   border-color: var(--brass);
-  background: rgba(224, 176, 97, 0.12);
+  background: rgb(var(--brass-rgb) / 0.12);
 }
 
 .skin-card.locked {
@@ -522,7 +552,7 @@ body {
 .fly-score {
   position: absolute;
   z-index: 15;
-  color: #ffd88a;
+  color: var(--brass-hi);
   font-size: 0.92rem;
   font-weight: 600;
   text-shadow: 0 1px 6px rgba(0, 0, 0, 0.7);
@@ -555,7 +585,7 @@ body {
   border: 1px solid var(--brass);
   border-radius: 999px;
   background: rgba(12, 20, 16, 0.92);
-  color: #ffe1a8;
+  color: var(--brass-hi);
   font-size: 0.72rem;
   white-space: nowrap;
   pointer-events: none;
@@ -567,8 +597,8 @@ body {
   margin-top: 6px;
   padding: 5px 14px;
   border-radius: 999px;
-  color: #ffe1a8;
-  background: rgba(224, 176, 97, 0.16);
+  color: var(--brass-hi);
+  background: rgb(var(--brass-rgb) / 0.16);
   font-size: 0.86rem;
   opacity: 0;
 }
@@ -731,7 +761,7 @@ body {
 #drop-button {
   min-width: 108px;
   border-color: var(--brass-deep);
-  background: linear-gradient(180deg, rgba(224, 176, 97, 0.26), rgba(169, 118, 44, 0.16));
+  background: linear-gradient(180deg, rgb(var(--brass-rgb) / 0.26), rgba(169, 118, 44, 0.16));
 }
 
 #boost-button:not(:disabled) {
@@ -849,7 +879,7 @@ body {
 
 #next-button:not(:disabled) {
   border-color: var(--brass);
-  background: rgba(224, 176, 97, 0.2);
+  background: rgb(var(--brass-rgb) / 0.2);
 }
 
 /* ── 小屏 ────────────────────────────────────────────────────────────── */
@@ -912,6 +942,18 @@ body {
 [data-motion='reduced'] #climax-flash.white,
 [data-motion='reduced'] #boost-button:not(:disabled) {
   animation: none;
+}
+
+/* R3-U3：新加的按钮 transition / press 位移必须同步进这张表。
+   不同步的后果是「降级静默失效」—— 测试不会红，只是晕的人照旧被晃。 */
+[data-motion='reduced'] :is(#pause-button, #collection-button, #endless-button, #giveup-button,
+    #resume-button, #retry-button, #next-button) {
+  transition: none;
+}
+
+[data-motion='reduced'] :is(#pause-button, #collection-button, #endless-button, #giveup-button,
+    #resume-button, #retry-button, #next-button):active:not(:disabled) {
+  transform: none;
 }
 
 [data-motion='reduced'] .mark {
