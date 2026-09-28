@@ -5,11 +5,15 @@ import {
   WALL_OUTLINE_BINDING,
   beginCabinetOverride,
   cabinetShapeDiff,
+  chamferLimitAt,
   cloneCabinetShape,
   endCabinetOverride,
+  partBevel,
+  type CabinetPartBevel,
   type CabinetShape,
   type CabinetShellPart,
   type CabinetWallSegment,
+  type WallPointId,
 } from '../game/cabinetShape';
 import { cameraRig, placeCameraRig, toDeg, toRad } from '../render/cameraRig';
 
@@ -138,6 +142,8 @@ export class ModelMode {
   private gui: GUI | null = null;
   private statusEl: HTMLDivElement | null = null;
   private edgeFolder: GUI | null = null;
+  /** 「本件倒角」：随选中件销毁重建（同 `edgeFolder`，控件**数量**会变）。 */
+  private partBevelFolder: GUI | null = null;
   private shell: THREE.Object3D | null = null;
   private selected: CabinetShellPart | null = null;
   private selectedEdge = 0;
@@ -193,13 +199,29 @@ export class ModelMode {
   // 「面板上能用、判据红」这种没法解释的差异。
 
   /** 按 `'wall.insetZ'` 这样的路径写一个数并触发重建。 */
+  /**
+   * 判据用的按路径赋值（`'wall.insetZ'`、`'bevel.perPart.hoodRoof.segments'`…）。
+   *
+   * ⚠️ S25 起有一类键**自己带点**：`bevel.wallChamfer` 的角点 id 形如
+   * `low.roofBack`，于是路径 `bevel.wallChamfer.low.roofBack` 按 `.` 切开会先撞上
+   * 那个值 `0.012`（一个数字）—— 老写法在这里会**静默返回**，判据看到的就是
+   * 「几何没动」，而真正的原因是路径没解析。所以下面走不动某一段时，再把
+   * **剩余整段当一个键**试一次；仍然找不到才算错（照旧静默，返回 void）。
+   */
   setFieldForTest(path: string, value: number): void {
     const parts = path.split('.');
     let target = this.shape as unknown as Record<string, unknown>;
     for (let i = 0; i < parts.length - 1; i += 1) {
       const next = target[parts[i]];
-      if (typeof next !== 'object' || next === null) return;
-      target = next as Record<string, unknown>;
+      if (typeof next === 'object' && next !== null) {
+        target = next as Record<string, unknown>;
+        continue;
+      }
+      const tail = parts.slice(i).join('.');
+      if (!(tail in target)) return;
+      target[tail] = value;
+      this.onShapeChanged();
+      return;
     }
     target[parts[parts.length - 1]] = value;
     this.onShapeChanged();
@@ -229,6 +251,20 @@ export class ModelMode {
    */
   outlineCount(): number {
     return (this.outline ? 1 : 0) + (this.edgeLine ? 1 : 0);
+  }
+
+  /**
+   * 本模式手里那具外壳**还在场景里**吗（判据用）。
+   *
+   * ★ 为什么单独问这一句：`hooks.rebuild()` 的语义是「换掉场景里那具，并把新的交回来」，
+   * 调用方必须 `attach()` 返回值。多调一次 `rebuild()` 而没人接住结果，表现是
+   * `this.shell` 指向一具**已被 `removeFromParent()` + `geometry.dispose()`** 的旧壳 ——
+   * 面板照样能读 `userData`、`outlineCount()` 照样是 2、`findMesh()` 照样返回对象，
+   * 但高亮线挂在游离节点上**一根都画不出来**。这是「钩子绿、面板红」的教科书样本
+   * （`resetShape()` 里就多调过一次，S25 加逐角斜角时才发现）。
+   */
+  shellAttached(): boolean {
+    return this.shell !== null && this.shell.parent !== null;
   }
 
   /**
@@ -282,7 +318,28 @@ export class ModelMode {
         if (typeof bevel.segments === 'number' && Number.isFinite(bevel.segments)) {
           fresh.bevel.segments = Math.round(bevel.segments);
         }
-        if (bevel.perPart) fresh.bevel.perPart = { ...bevel.perPart };
+        if (bevel.perPart) {
+          // ★ **逐键合并**，不是整份替换。
+          //
+          // S25 之前两种写法等价（默认表是空的），但 S25 把三件直角盒的按件半径写进了
+          // 默认值 ⇒ 整份替换等于让**改动之前存的那份档**把刚提交的造型抹掉。
+          // 「存档比代码旧」是常态而不是异常：用户调完不会清档，下次打开就是这个现场。
+          for (const [key, value] of Object.entries(bevel.perPart)) {
+            if (!value || typeof value !== 'object') continue;
+            const target = fresh.bevel.perPart[key as CabinetShellPart];
+            const next = {
+              radius: target?.radius ?? fresh.bevel.radius,
+              segments: target?.segments ?? fresh.bevel.segments,
+            };
+            if (typeof value.radius === 'number' && Number.isFinite(value.radius)) {
+              next.radius = value.radius;
+            }
+            if (typeof value.segments === 'number' && Number.isFinite(value.segments)) {
+              next.segments = Math.round(value.segments);
+            }
+            fresh.bevel.perPart[key as CabinetShellPart] = next;
+          }
+        }
       }
     } catch {
       // 存档坏了就用默认值。**不拦启动** —— 一个坏掉的 localStorage
@@ -337,8 +394,12 @@ export class ModelMode {
     this.edgeFolder = gui.addFolder('选中的边');
     this.rebuildEdgeFolder();
 
-    // ── 倒角（全局）──
-    const bevelFolder = gui.addFolder('倒角（直角盒件）');
+    // ── 本件倒角（随选中件重建）──
+    this.partBevelFolder = gui.addFolder('本件倒角');
+    this.rebuildPartBevelFolder();
+
+    // ── 倒角（全局兜底：没单独点名的件用它）──
+    const bevelFolder = gui.addFolder('倒角（全局兜底）');
     bevelFolder
       .add(this.shape.bevel, 'radius', 0, 0.06, 0.001)
       .name('圆角半径（米）')
@@ -450,6 +511,142 @@ export class ModelMode {
     this.highlightEdge();
   }
 
+  /**
+   * 重建「本件倒角」文件夹。
+   *
+   * 与 `rebuildEdgeFolder()` 同一个理由：控件的**数量**随状态变（未选中 / 侧墙逐角 /
+   * 继承全局 / 已单独覆盖 各给不同的一组），lil-gui 没有「改数量」的接口，只能销毁重建。
+   *
+   * ## ★ 为什么「给哪一组控件」是问网格、不是问名单
+   *
+   * 判据是 `mesh.userData.bevelable` —— 它由 `TableBuilder.cabinetBoxMesh()` 亲手挂上，
+   * 而那个函数就是全仓库唯一应用 `bevel.perPart` 的地方。所以「这件吃不吃按件倒角」
+   * 与「几何会不会理你」**必然是同一个事实**。若在面板里另写一份直角盒名单，某天把某件
+   * 从盒子改成剖面挤出（或反过来），面板与几何就会分叉，表现是「滑块拖了但顶板纹丝不动」——
+   * 零报错，而且找不到原因（本仓库的老坑）。
+   *
+   * 返回 `false` 不等于「没得调」：侧墙吃的是另一套机制（斜角画在剖面折线上），
+   * 由 `wallSegmentOf()` 认出来，走 `addWallChamferControllers()`。
+   */
+  private rebuildPartBevelFolder(): void {
+    const folder = this.partBevelFolder;
+    if (!folder) return;
+    for (const child of [...folder.controllers, ...folder.folders]) child.destroy();
+
+    const part = this.selected;
+    if (!part) {
+      folder.add({ hint: '(点一下机柜件)' }, 'hint').disable();
+      return;
+    }
+    if (this.findMesh(part)?.userData.bevelable !== true) {
+      const segment = wallSegmentOf(part);
+      if (segment) {
+        this.addWallChamferControllers(folder, segment);
+        folder.open();
+        return;
+      }
+      folder.add({ hint: `${part}：不吃倒角` }, 'hint').disable();
+      return;
+    }
+
+    // 同上：字面量 getter 的 `this` 不是类实例，必须显式接一份。
+    const self = this;
+    const readout = {
+      get effective(): string {
+        const bevel = partBevel(part);
+        const source = self.overrideOf(part) ? '本件单独' : '继承全局';
+        return `${bevel.radius.toFixed(3)} 米 / ${bevel.segments} 段（${source}）`;
+      },
+    };
+    folder.add(readout, 'effective').name('生效值（只读）').disable().listen();
+
+    const override = self.overrideOf(part);
+    if (!override) {
+      // 继承中：先「点名」才谈得上调 —— 直接给滑块会造出一个
+      // 「看起来在改全局值、实际只想改这一件」的假象。
+      folder.add({ give: () => self.grantOverride(part) }, 'give').name('单独设置本件');
+      return;
+    }
+    folder
+      .add(override, 'radius', 0, 0.06, 0.001)
+      .name('半径（米，大件 0.02~0.03）')
+      .onChange(() => this.onShapeChanged());
+    folder
+      .add(override, 'segments', 1, 8, 1)
+      .name('分段（1=45° 斜角）')
+      .onChange(() => this.onShapeChanged());
+    folder.add({ inherit: () => this.revokeOverride(part) }, 'inherit').name('恢复继承全局');
+    folder.open();
+  }
+
+  private overrideOf(part: CabinetShellPart): CabinetPartBevel | undefined {
+    return this.shape.bevel.perPart[part];
+  }
+
+  /**
+   * 侧墙的**逐角**斜角滑块（S25）—— 与 `bevel.perPart` 那组控件互斥。
+   *
+   * 一行一个角点，名字直接取 `WALL_OUTLINE_BINDING` 的 `label`：面板与真源共用
+   * 那张表 ⇒ 不会出现「面板上的名字在几何里找不到」。绑的键是 `point.id`，
+   * 而 `bevel.wallChamfer` 的类型是 `Record<WallPointId, number>` ⇒ 漏一个角
+   * 编译就不过（不是运行时才发现）。
+   *
+   * ## ★ 顶部那条「生效（只读）」是必要的，不是装饰
+   *
+   * `chamferPolyline()` 会把半径**夹到 `0.49 × 较短那条邻边**`（上限公式来自
+   * `chamferLimitAt()`，与几何同一个函数）。高段的斜接面只有 13°、约 0.34 米长，
+   * 上限约 3 厘米；低段斜顶后端更短。没有这行读数，用户拖过头之后看到的就是
+   * 「滑块动了、几何没动」—— 本仓库最恨的那类静默失效。
+   */
+  private addWallChamferControllers(folder: GUI, segment: CabinetWallSegment): void {
+    const self = this;
+    const binding = WALL_OUTLINE_BINDING[segment];
+    /** 尖角状态下的角点坐标（夹取上限按**原始邻边**算，与几何一致）。 */
+    const sharpPoints = () =>
+      binding.map((point) => [self.shape.wall[point.z], self.shape.wall[point.y]] as const);
+    const readout = {
+      get limits(): string {
+        const points = sharpPoints();
+        const clamped = binding
+          .map((point, index) => ({
+            label: point.label,
+            limit: chamferLimitAt(points, index),
+            want: self.shape.bevel.wallChamfer[point.id],
+          }))
+          .filter((corner) => corner.want > corner.limit + 1e-6);
+        if (clamped.length === 0) return '全部生效';
+        return `被邻边夹住：${clamped
+          .map((corner) => `${corner.label} ≤ ${corner.limit.toFixed(3)}`)
+          .join('、')}`;
+      },
+    };
+    folder.add(readout, 'limits').name('生效（只读）').disable().listen();
+
+    for (const point of binding) {
+      folder
+        .add(self.shape.bevel.wallChamfer, point.id, 0, 0.06, 0.001)
+        .name(`斜角·${point.label}`)
+        .onChange(() => this.onShapeChanged());
+    }
+  }
+
+  /** 点名这一件：初值取**当前全局值**，所以按下去画面一点不动，之后才是纯增量。 */
+  private grantOverride(part: CabinetShellPart): void {
+    this.shape.bevel.perPart[part] = {
+      radius: this.shape.bevel.radius,
+      segments: this.shape.bevel.segments,
+    };
+    this.onShapeChanged();
+    this.rebuildPartBevelFolder();
+  }
+
+  /** 取消点名：删掉这一键 ⇒ 回落全局。与 `grantOverride` 成对，都要重建文件夹。 */
+  private revokeOverride(part: CabinetShellPart): void {
+    delete this.shape.bevel.perPart[part];
+    this.onShapeChanged();
+    this.rebuildPartBevelFolder();
+  }
+
   private refreshStatus(): void {
     if (!this.statusEl) return;
     const count = cabinetShapeDiff(this.shape).length;
@@ -495,16 +692,28 @@ export class ModelMode {
     }
     this.shape.bevel.radius = fresh.bevel.radius;
     this.shape.bevel.segments = fresh.bevel.segments;
-    // ★ 逐件倒角也要一起清：不清的话「重置」之后仍留着上一轮的逐件覆盖，
-    // 而全局滑块显示的是默认值 —— 两个数对不上，且没有任何提示。
+    // ★ 两张「按件」表都按**默认表整份替换**，不是清空。
+    //
+    // 这两件事在 S25 之前等价（默认表本来就是空的），但 S25 把三件直角盒的按件半径
+    // 和侧墙十个角的斜角都写进了默认值 ⇒ 「清空」会把刚提交进来的造型重置成
+    // **全局兜底值**，而全局滑块显示的仍是默认值 —— 正是这条注释原本要避免的
+    // 「两个数对不上，且没有任何提示」。
+    // 先删干净再从 fresh 拷，顺带修掉原缺陷（上一轮的逐件覆盖赖着不走）：多退少补。
     for (const key of Object.keys(this.shape.bevel.perPart)) {
       delete this.shape.bevel.perPart[key as CabinetShellPart];
+    }
+    Object.assign(this.shape.bevel.perPart, fresh.bevel.perPart);
+    // 侧墙那十个角不需要「先删」：`wallChamfer` 的键集是 `WallPointId` 这个闭集，
+    // 而 `loadShape()` 只会往 fresh 已有的键上写 ⇒ 工作副本的键集恒等于默认表，
+    // 逐个赋值就是整份替换。（`perPart` 不同：它的键是「点过名的件」，会长。）
+    for (const key of Object.keys(fresh.bevel.wallChamfer) as WallPointId[]) {
+      this.shape.bevel.wallChamfer[key] = fresh.bevel.wallChamfer[key];
     }
     this.saveShape();
     this.attach(this.hooks.rebuild());
     this.rebuildEdgeFolder();
+    this.rebuildPartBevelFolder();
     this.refreshDisplays();
-    this.hooks.rebuild();
   }
 
   /**
@@ -648,6 +857,7 @@ export class ModelMode {
     this.selectedEdge = 0;
     this.highlightPart(part);
     this.rebuildEdgeFolder();
+    this.rebuildPartBevelFolder();
     // 自动展开驱动这一件的那一组参数 —— 「选中 → 看到该改哪个数」。
     for (const folder of this.folders.values()) folder.close();
     this.folders.get('pick')?.open();
@@ -660,6 +870,7 @@ export class ModelMode {
     this.selected = null;
     this.clearOutline();
     this.rebuildEdgeFolder();
+    this.rebuildPartBevelFolder();
     this.refreshDisplays();
   }
 

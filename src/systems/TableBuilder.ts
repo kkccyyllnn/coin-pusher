@@ -5,9 +5,11 @@ import { COLORS, DRAIN, TABLE } from '../game/constants';
 import type { CabinetSkin } from '../game/cosmetics';
 import {
   cabinetShape,
+  chamferPolyline,
   partBevel,
   type CabinetPart,
   type CabinetShellPart,
+  type WallPointId,
 } from '../game/cabinetShape';
 import { DETAIL_SURFACE, ROLE_DETAIL, ROLE_RAMP } from '../game/artDirection';
 import { isLitMaterial, makeToonMaterial, type LitMaterial } from '../render/ToonMaterial';
@@ -944,6 +946,14 @@ function cabinetBoxMesh(
   mesh.receiveShadow = true;
   mesh.userData.role = role;
   mesh.userData.part = part;
+  // ★ 「这件吃不吃倒角」由**这个函数**声明，不在别处另列一份名单。
+  //
+  // 这里是全仓库唯一调用 `partBevel()` 的地方 ⇒ 它是唯一真正应用倒角的建法；
+  // 剖面挤出件（`cabinetProfileMesh`）走另一条路，天生不吃。于是 `?model` 面板读
+  // `userData.bevelable` 就知道该不该给那一组滑块，**不需要**再维护一份
+  // 「哪些件是直角盒」的表 —— 那种表会在某件从盒子改成挤出（或反过来）时静默漂移，
+  // 表现是「面板上能拖、几何不理」（本仓库最忌讳的零报错失效）。
+  mesh.userData.bevelable = true;
   return mesh;
 }
 
@@ -1019,27 +1029,51 @@ function cabinetPrismMesh(
  * `cabinetShape.ts` 的 `cabinetWallOutline()` **逐点一致**（`cabinet` 判据逐顶点比对）。
  *
  * ★ 几何由 `CABINET.wall` 的字段直接拼出来，**不调 `cabinetPartBox()`**，
- * 也**不调 `cabinetWallOutline()`**。这样「建网格」与「算盒 / 算折线」是同一份数据的
- * **两条独立推导**，`cabinet` 判据比对两者才有意义；若两边都调同一个函数，
- * 比对恒真，等于没查。
+ * 也**不调 `cabinetWallOutline()`**，也**不读 `WALL_OUTLINE_BINDING`**。
+ * 这样「建网格」与「算盒 / 算折线」是同一份数据的**两条独立推导**，`cabinet` 判据
+ * 比对两者才有意义；若两边都调同一个函数，比对恒真，等于没查。
+ *
+ * ## S25：逐角斜角
+ *
+ * 侧墙沿 x 挤出，倒角不能靠 `RoundedBoxGeometry`（那只会把挤出截面整个换掉），
+ * 必须**画进剖面折线**里。所以下面每个角点自带一个 `id`，半径从
+ * `CABINET.bevel.wallChamfer` 按 `id` 取，再交给 `chamferPolyline()` 展开 ——
+ * 这是全仓库第二份「角点 ↔ 字段」列表，它与真源那张表**内容相同、来源独立**。
+ *
+ * ⚠️ 为什么点与 `id` 绑在同一个对象里，而不是两份平行数组：平行数组靠下标对齐，
+ * 调一次顺序就把斜角挪到别的角上，几何照样闭合、**零报错**。绑成一条记录之后，
+ * 漏标或错标的角在 `Record<WallPointId, number>` 上直接编译不过。
  */
+type WallCorner = {
+  id: WallPointId;
+  z: number;
+  y: number;
+};
+
 function buildSideWall(
   side: -1 | 1,
   materials: { panel: LitMaterial; rail: LitMaterial },
 ): THREE.Group {
-  const { wall } = cabinetShape();
+  const { wall, bevel } = cabinetShape();
   const group = new THREE.Group();
   const suffix = side < 0 ? '.L' : '.R';
+
+  /** 尖角点列表 → 斜角展开后的剖面环（半径按 `id` 取，与点的顺序无关）。 */
+  const outline = (corners: readonly WallCorner[]) =>
+    chamferPolyline(
+      corners.map((c) => [c.z, c.y] as const),
+      corners.map((c) => bevel.wallChamfer[c.id]),
+    );
 
   // 低段：z ∈ [insetZ, lowFrontZ]、y ∈ [bottomY, 斜顶]。前缘与地板剪影前缘齐。
   group.add(
     cabinetPrismMesh(
-      [
-        [wall.insetZ, wall.bottomY],
-        [wall.lowFrontZ, wall.bottomY],
-        [wall.lowFrontZ, wall.lowRoofFrontY],
-        [wall.insetZ, wall.lowRoofBackY],
-      ],
+      outline([
+        { id: 'low.backBottom', z: wall.insetZ, y: wall.bottomY },
+        { id: 'low.frontBottom', z: wall.lowFrontZ, y: wall.bottomY },
+        { id: 'low.roofFront', z: wall.lowFrontZ, y: wall.lowRoofFrontY },
+        { id: 'low.roofBack', z: wall.insetZ, y: wall.lowRoofBackY },
+      ]),
       'rail',
       `sideWall.low${suffix}` as CabinetPart,
       materials.rail,
@@ -1052,14 +1086,14 @@ function buildSideWall(
   // 上沿与机柜顶面齐平（tallTopY）。
   group.add(
     cabinetPrismMesh(
-      [
-        [wall.backZ, wall.bottomY],
-        [wall.insetZ, wall.bottomY],
-        [wall.insetZ, wall.insetTopY],
-        [wall.hoodFrontZ, wall.miterFrontY],
-        [wall.hoodFrontZ, wall.tallTopY],
-        [wall.backZ, wall.tallTopY],
-      ],
+      outline([
+        { id: 'tall.backBottom', z: wall.backZ, y: wall.bottomY },
+        { id: 'tall.insetBottom', z: wall.insetZ, y: wall.bottomY },
+        { id: 'tall.insetTop', z: wall.insetZ, y: wall.insetTopY },
+        { id: 'tall.hoodBottomFront', z: wall.hoodFrontZ, y: wall.miterFrontY },
+        { id: 'tall.hoodTopFront', z: wall.hoodFrontZ, y: wall.tallTopY },
+        { id: 'tall.backTop', z: wall.backZ, y: wall.tallTopY },
+      ]),
       'panel',
       `sideWall.tall${suffix}` as CabinetPart,
       materials.panel,

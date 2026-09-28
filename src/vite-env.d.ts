@@ -195,9 +195,9 @@ interface ThreeGameDiagnostics {
   performance: {
     fps: number;
     tier: string;
-    /** 像素化目标内部高度（V1）。调低 = 像素更粗。 */
+    /** 内部分辨率的目标高度上限。调低 = 倍率更大 = 更省。 */
     pixelTargetHeight: number;
-    /** 像素化开关（`?pixel=off` 可关）。 */
+    /** 最近邻开关（`?pixel=N` 开、`off` 关；默认关 = 平滑）。 */
     pixelated: boolean;
     /** 整数放大倍率：backing store 与 CSS 尺寸之比。1 = 原生。 */
     upscale: number;
@@ -216,7 +216,8 @@ interface ThreeGameDiagnostics {
    * 背板老虎机（P10）：4 个滚筒窗的读数。
    *
    * `iconBackPixels` 是「图标在画布上占几个后备像素」——像素画 1:1 的判据，
-   * 设计目标 32（0.34 m 窗 × 191 CSS px/m ÷ upscale 2）。
+   * 目标 32（0.34 m 窗 × 191 CSS px/m ÷ upscale 2）；默认档 upscale 1 → 66.7，
+   * 即图标被平滑放大到两倍多，判据写的是「≥ 24」而不是「=== 32」。
    */
   reel: {
     count: number;
@@ -360,8 +361,8 @@ interface ThreeGameTestHooks {
   /** 推币机扩展：强制画质档位（high / medium / low），并冻结自动分档。 */
   setQuality?(tier: string): { tier: string; pixelTargetHeight: number; shadows: boolean };
   /**
-   * 推币机扩展：像素分辨率开关（V1）。`pixelated: false` 回到原生分辨率，
-   * 用来断言「关掉像素化后画面仍非空白」；`upscale` 是显式倍率（`null` 取消）。
+   * 推币机扩展：像素分辨率（V1，V2 解耦）。`pixelated` 只切最近邻/平滑采样，
+   * `upscale` 是显式内部分辨率倍率（`null` 取消、回到 `targetHeight` 推导）——两者正交。
    */
   setPixelScale?(patch: { targetHeight?: number; upscale?: number | null; pixelated?: boolean }): {
     upscale: number;
@@ -648,6 +649,15 @@ interface ThreeGameTestHooks {
    * 指示线永远是 1 像素，在截图上看不看得出来取决于构图，不能当判据。
    */
   modelModeOutlineCount?(): number;
+  /**
+   * 模型模式手里那具外壳**还在场景里**（`parent !== null`）。
+   *
+   * ★ 与 `modelModeOutlineCount()` 成对：那条只说「挂了几条线」，这一条说
+   * 「那些线的宿主在不在渲染树里」。重建时多调一次 `rebuild()` 而没人 `attach()`
+   * 返回值，宿主就变成游离节点 —— 计数照旧、画面全黑，只有这一条抓得住。
+   * 非 `?model` 下为 `null`。
+   */
+  modelModeShellAttached?(): boolean | null;
   /**
    * 推币机扩展（S24）：外壳形状的**应用实例**读数。
    *

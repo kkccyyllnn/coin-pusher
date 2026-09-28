@@ -26,9 +26,9 @@ export type GameTuning = {
   coinSolverIterations: number;
   cameraFov: number;
   exposure: number;
-  /** 像素化的目标内部高度（见 `render/PixelScale.ts`）。调低 = 像素更粗。 */
+  /** 内部分辨率的目标高度上限（见 `render/PixelScale.ts`）。调低 = 倍率更大 = 更省。 */
   pixelTargetHeight: number;
-  /** 关掉即回到原生分辨率，用来 A/B 对比像素化的收益。 */
+  /** 放大方式：true = 最近邻（块状像素），false = 平滑。**不影响内部分辨率**。 */
   pixelated: boolean;
   /** 币面贴图倍率（1x = 16/32px, 2x = 32/64px, 4x = 64/128px）。 */
   coinTexelScale: number;

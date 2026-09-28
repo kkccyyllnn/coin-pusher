@@ -2354,13 +2354,16 @@ async function runPerf(page, context) {
     `CPU ×${worst.rate} ${worst.tier} 档 ${worst.fps.toFixed(1)} FPS`,
   );
 
-  // ── V1：像素分辨率基建 ──
-  // 三条硬判据，缺一条「像素化」就只是名义上的。
+  // ── V1/V2：像素分辨率 ──
+  // 默认档现在是**原生分辨率 + 平滑采样**（`render/PixelScale.ts` 的 `PIXEL_SCALE_DEFAULTS`），
+  // 「像素风」改成显式通道（`?pixel=N` / 面板的 upscale + pixelated）。
+  // 所以下面量的是「默认没有偷偷降分辨率」「显式通道真的生效」与「两个旋钮正交」，
+  // 而不是旧版的「高档倍率 ≥ 2」——那条把默认档和像素美学绑在一起，正是被解耦掉的东西。
   const basePixel = rows.find((row) => row.rate === 1 && row.tier === 'high');
   check(
-    '像素化已生效（高档整数倍率 ≥ 2 且开关为开）',
-    (basePixel?.upscale ?? 0) >= 2 && basePixel?.pixelated === true,
-    `倍率 ×${basePixel?.upscale}，内部高 ${basePixel?.internalHeight}`,
+    '默认档 = 原生分辨率（高档倍率 1 且最近邻为关）',
+    (basePixel?.upscale ?? 0) === 1 && basePixel?.pixelated === false,
+    `倍率 ×${basePixel?.upscale}，内部高 ${basePixel?.internalHeight}，最近邻 ${basePixel?.pixelated}`,
   );
   // 倍率必须是整数：非整数放大时一个 texel 时而占 1 个 CSS 像素、时而占 2 个，
   // 画面出现粗细不均的条纹（正是要避免的「脏」）。
@@ -2384,30 +2387,44 @@ async function runPerf(page, context) {
     `CSS ${canvasInfo.clientWidth}×${canvasInfo.clientHeight} → backing ${canvasInfo.width}×${canvasInfo.height}，` +
       `实际比值 ${actualRatio.toFixed(4)}（1/${reported}）`,
   );
-  // 降档必须是「像素更粗」而不是「更糊」——与像素美学同向。
+  // 降档必须真的降内部分辨率。用 `>` 而不是旧版的 `>=`：默认档倍率是 1，
+  // 若分档失效（比如有人把 `pixelated` 重新变成倍率的总开关），低档也会是 1，
+  // `>=` 会绿得毫无意义。
   const lowPixel = rows.find((row) => row.rate === 1 && row.tier === 'low');
   check(
-    '降档 = 像素更粗（低档倍率 ≥ 高档倍率）',
-    (lowPixel?.upscale ?? 0) >= (basePixel?.upscale ?? 0),
+    '降档 = 内部分辨率真的更低（低档倍率 > 高档倍率）',
+    (lowPixel?.upscale ?? 0) > (basePixel?.upscale ?? 0),
     `高档 ×${basePixel?.upscale} → 低档 ×${lowPixel?.upscale}`,
   );
-  // 像素化必须可逆：`?pixel=off` 走的就是这条 `setPixelScale({pixelated:false})` 路径，
-  // 用来做 A/B 对照（也是 `visual.spec.ts` 断言「关掉后画面仍非空白」的前提）。
-  const offScale = await page.evaluate(() =>
+  // 显式倍率通道（`?pixel=2` 走的就是这条 `upscaleOverride`）：倍率与最近邻一起给。
+  const pixScale = await page.evaluate(() =>
+    window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ upscale: 2, pixelated: true }),
+  );
+  check(
+    '像素风通道可用（显式倍率 2 + 最近邻开，pixelRatio 1/2）',
+    pixScale?.upscale === 2 &&
+      pixScale?.pixelated === true &&
+      Math.abs((pixScale?.pixelRatio ?? 0) - 0.5) < 1e-9,
+    `倍率 ×${pixScale?.upscale}，pixelRatio ${pixScale?.pixelRatio}，内部高 ${pixScale?.internalHeight}`,
+  );
+  // 解耦后唯一不能破的不变量：**关最近邻不改内部分辨率**。
+  // 旧版 `pixelated=false` 会把倍率吞回 1，于是画质分档在默认档下静默失效。
+  const decoupled = await page.evaluate(() =>
     window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ pixelated: false }),
   );
   check(
-    '关掉像素化 → 回到原生分辨率（倍率 1、pixelRatio 1）',
-    offScale?.pixelated === false && offScale?.upscale === 1 && offScale?.pixelRatio === 1,
-    `倍率 ×${offScale?.upscale}，pixelRatio ${offScale?.pixelRatio}，内部高 ${offScale?.internalHeight}`,
+    '「倍率」与「最近邻」正交：关最近邻后倍率仍是 2',
+    decoupled?.pixelated === false && decoupled?.upscale === 2,
+    `倍率 ×${decoupled?.upscale}，内部高 ${decoupled?.internalHeight}`,
   );
-  const onScale = await page.evaluate(() =>
-    window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ pixelated: true }),
+  // 取消覆盖 → 回到 `targetHeight` 推导；默认目标高度下应当回到原生（可逆，不是一次性开关）。
+  const restored = await page.evaluate(() =>
+    window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ upscale: null }),
   );
   check(
-    '恢复像素化 → 倍率回到 ≥ 2（可逆，不是一次性开关）',
-    onScale?.pixelated === true && (onScale?.upscale ?? 0) >= 2,
-    `倍率 ×${onScale?.upscale}，内部高 ${onScale?.internalHeight}`,
+    '取消显式倍率 → 回到目标高度推导（默认档回到原生 ×1）',
+    restored?.upscale === 1 && restored?.pixelRatio === 1,
+    `倍率 ×${restored?.upscale}，pixelRatio ${restored?.pixelRatio}，内部高 ${restored?.internalHeight}`,
   );
 
   // ── V2：三渲二材质族 ──
@@ -4475,6 +4492,13 @@ async function runCabinet(page, context) {
         tall: cs.cabinetWallOutline('tall').map(([z, y]) => [z, y]),
         low: cs.cabinetWallOutline('low').map(([z, y]) => [z, y]),
       },
+      // ★ S25：斜角是「两张表配对」的（角点 ↔ `bevel.wallChamfer` 的键）。
+      // 只读**集合**，脚本里不写任何半径公式或角点名。
+      wallPointIds: [
+        ...cs.WALL_OUTLINE_BINDING.tall.map((point) => point.id),
+        ...cs.WALL_OUTLINE_BINDING.low.map((point) => point.id),
+      ],
+      wallChamferKeys: Object.keys(cs.CABINET.bevel.wallChamfer),
     };
   });
 
@@ -4720,8 +4744,26 @@ async function runCabinet(page, context) {
     '侧墙轮廓与 cabinetWallOutline() 逐顶点一致（斜接面 / 斜顶都在包围盒内部 ⇒ 解析盒看不见它们）',
     outlineDiffs.length === 0,
     outlineDiffs.length === 0
-      ? '4 段侧墙（高段 6 顶点 / 低段 4 顶点）与真源折线完全一致'
+      ? `4 段侧墙与真源折线完全一致（高段 ${truth.outlines.tall.length} 点 / 低段 ${truth.outlines.low.length} 点，S25 起含斜角切点）`
       : outlineDiffs.join(' | '),
+  );
+
+  // ⑤c 逐角斜角的「表 ↔ 数据」配对（S25）
+  //
+  // `bevel.wallChamfer` 的键必须与 `WALL_OUTLINE_BINDING` 的角点**一一对应**。
+  // TypeScript 已经保证「漏一个角编译不过」，但保证不了**多余**：存档 / 手改
+  // 留下的失效 id 会让那一格的斜角静默失效，表现是「面板上拖了、几何不动」。
+  // 这条查的是对称差，两侧都报。
+  const chamferGap = [
+    ...truth.wallPointIds.filter((id) => !truth.wallChamferKeys.includes(id)),
+    ...truth.wallChamferKeys.filter((key) => !truth.wallPointIds.includes(key)),
+  ];
+  check(
+    'bevel.wallChamfer 的键 ↔ WALL_OUTLINE_BINDING 的角点一一对应（无孤儿、无漏角）',
+    truth.wallPointIds.length > 0 && chamferGap.length === 0,
+    chamferGap.length === 0
+      ? `${truth.wallPointIds.length} 个角点各有斜角名额`
+      : `对不上：${chamferGap.join(', ')}`,
   );
 
   // ⑥ 檐板正面朝向：任何**计数型**判据都拦不住的那一类缺陷
@@ -5332,10 +5374,18 @@ async function runModel(page, context) {
     () => window.__THREE_GAME_TEST_HOOKS__?.modelModeDiffCount?.() ?? -1,
   );
   const restored = await readRoofUnderY();
+  // ★ 顺带问一句「模型模式手里那具壳还在不在场景里」。
+  // `resetShape()` 里曾经多调了一次 `hooks.rebuild()` 而没人 `attach()` 返回值：
+  // 结果 `ModelMode.shell` 指向一具被 `removeFromParent()` + `geometry.dispose()` 的
+  // 旧壳 ⇒ 计数型判据（差异、件数、高亮线条数）**全绿**，但选中高亮一根都画不出来。
+  // 这是「钩子绿 ≠ 面板绿」那一类，只有宿主在不在渲染树里这一句抓得住。
+  const shellAttached = await modelPage.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.modelModeShellAttached?.() ?? null,
+  );
   check(
-    '重置之后差异回到 0，且几何回到编译期默认值',
-    diff2 === 0 && Math.abs(restored - defaultUnderY) <= 2e-5,
-    `diff=${diff2} hoodRoof.min.y=${restored}（默认 ${defaultUnderY}）`,
+    '重置之后差异回到 0、几何回到编译期默认值，且模型模式持有的外壳仍在场景里',
+    diff2 === 0 && shellAttached === true && Math.abs(restored - defaultUnderY) <= 2e-5,
+    `diff=${diff2} 外壳在场景里=${shellAttached} hoodRoof.min.y=${restored}（默认 ${defaultUnderY}）`,
   );
 
   // ⑨ 选中一块侧墙 —— 高亮 / 边文件夹重建 / 参数分组自动展开都挂在同一条 `select()`
@@ -5386,6 +5436,178 @@ async function runModel(page, context) {
     outlines2 === 1,
     `高亮线=${outlines2}`,
   );
+
+  // ⑫ 倒角的**归属**：只有直角盒件吃倒角
+  //
+  // 这条守的是 S25 的设计核心。`bevelable` 不是判据这边抄的一份名单，而是
+  // `TableBuilder.cabinetBoxMesh()`（全仓库唯一调用 `partBevel()` 的地方）亲手挂进
+  // `userData` 的 —— 于是「面板给不给滑块」与「几何理不理这件事」**必然是同一个事实**。
+  // 若改成在别处列一份「哪些件是直角盒」，某天某件从盒子改成剖面挤出（或反过来）
+  // 就会分叉，表现是「滑块拖了但顶板纹丝不动」，零报错、查不到原因。
+  const bevelFlags = await modelPage.evaluate(() =>
+    (window.__THREE_GAME_TEST_HOOKS__?.cabinetReport?.() ?? [])
+      .filter((e) => e.part.startsWith('hood') || e.part.startsWith('sideWall') || e.part === 'backPanel')
+      .map((e) => `${e.part}:${e.bevelable ? 'Y' : 'N'}`)
+      .sort(),
+  );
+  const expectBevelFlags = [
+    'hoodRoof:Y',
+    'hoodValance:Y',
+    'backPanel:Y',
+    'sideWall.tall.L:N',
+    'sideWall.tall.R:N',
+    'sideWall.low.L:N',
+    'sideWall.low.R:N',
+  ].sort();
+  check(
+    '倒角归属：3 件直角盒 bevelable=true（吃 bevel.perPart 滑块），4 段侧墙=false（改吃逐角斜角）',
+    bevelFlags.join(',') === expectBevelFlags.join(','),
+    bevelFlags.join(' '),
+  );
+
+  // ⑬ 逐件倒角真的驱动几何，而且**只**驱动这一件
+  //
+  // ⚠️ 为什么动 `segments` 而不是 `radius`：**半径没有任何数值观测通道** ——
+  // `RoundedBoxGeometry` 始终把外尺寸做满，包围盒一格不变（`cabinet` 那 21 条
+  // 「解析盒 = 实测盒」正是靠这一点才不会被倒角搞红）。分段数一变顶点数必变，
+  // 所以它是这条链路唯一抓得住的一面；半径对不对只能靠 `?model` 截图人眼核。
+  // 顺带一条：`diffCount` 必须 +1 —— 「导出改动」是这个模式的**产出物**，
+  // 逐件倒角若进不了 diff，用户拖完半天拿到的清单是空的，整个模式就白做了。
+  const verticesOfParts = () =>
+    modelPage.evaluate(() =>
+      Object.fromEntries(
+        (window.__THREE_GAME_TEST_HOOKS__?.cabinetReport?.() ?? []).map((e) => [e.part, e.vertices]),
+      ),
+    );
+  const vBefore = await verticesOfParts();
+  const diffBefore = await modelPage.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.modelModeDiffCount?.() ?? -1,
+  );
+  await modelPage.evaluate(() =>
+    window.__THREE_GAME_TEST_HOOKS__?.modelModeSet?.('bevel.perPart.hoodRoof.segments', 5),
+  );
+  const vAfter = await verticesOfParts();
+  const diffAfter = await modelPage.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.modelModeDiffCount?.() ?? -1,
+  );
+  const roofGrew = (vAfter.hoodRoof ?? 0) > (vBefore.hoodRoof ?? 0);
+  const othersStill = ['hoodValance', 'backPanel', 'sideWall.tall.L', 'sideWall.tall.R', 'sideWall.low.L', 'sideWall.low.R'].every(
+    (part) => vAfter[part] === vBefore[part],
+  );
+  check(
+    '逐件倒角驱动几何：hoodRoof 分段 1→5 顶点变多、其余 6 件一格不变，且差异计数 +1',
+    roofGrew && othersStill && diffBefore === 0 && diffAfter === 1,
+    `hoodRoof ${vBefore.hoodRoof}→${vAfter.hoodRoof}，其余 6 件未变=${othersStill}，diff ${diffBefore}→${diffAfter}`,
+  );
+
+  // ⑬ 留了一个「单独点名 hoodRoof」的覆盖在档上 —— 先清掉，⑮ 的 `diff 0→1` 才是它自己的。
+  await modelPage.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.modelModeReset?.());
+  await modelPage.waitForTimeout(120);
+
+  // ⑮ 侧墙的**逐角**斜角真的驱动几何，而且**只**驱动那一段（S25）
+  //
+  // 与 ⑬ 的分工：两套机制、两条链路 —— ⑬ 验直角盒（`bevel.perPart`），这条验剖面挤出
+  // 件（`bevel.wallChamfer`）。只验一条会放过另一条。
+  // ★ 与 ⑬ 相反，这里动的就是**半径本身**，而且它**有**数值观测通道：
+  // `low.roofBack` 是低段**唯一的**最高点（斜顶往前端是下降的），把这个角切掉，
+  // 实测包围盒的 `max[1]` 就跟着降 —— 直角盒那边「外尺寸永远做满 ⇒ 半径不可见」
+  // 的死角，在挤出件上不存在。所以「斜角到底落没落到几何上」是一等的数值判据。
+  // 顺带钉住两件容易静默的事：
+  //   · 路径 `bevel.wallChamfer.low.roofBack` 里那个**带点的键**能被解析（解析不了的
+  //     老写法会 no-op，把「几何没动」当成这条判据通过）；
+  //   · 改动**不外溢**：另三段侧墙与五件直角盒的读数必须一格不变。
+  const boxesOfParts = () =>
+    modelPage.evaluate(() =>
+      Object.fromEntries(
+        (window.__THREE_GAME_TEST_HOOKS__?.cabinetReport?.() ?? []).map((e) => [
+          e.part,
+          { min: e.min, max: e.max, vertices: e.vertices },
+        ]),
+      ),
+    );
+  const sameBox = (a, b) =>
+    a && b && a.min.every((v, i) => Math.abs(v - b.min[i]) < 1e-6) &&
+    a.max.every((v, i) => Math.abs(v - b.max[i]) < 1e-6) &&
+    a.vertices === b.vertices;
+  const wallBefore = await boxesOfParts();
+  const wallDiffBefore = await modelPage.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.modelModeDiffCount?.() ?? -1,
+  );
+  await modelPage.evaluate(() =>
+    window.__THREE_GAME_TEST_HOOKS__?.modelModeSet?.('bevel.wallChamfer.low.roofBack', 0),
+  );
+  const wallAfter = await boxesOfParts();
+  const wallDiffAfter = await modelPage.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.modelModeDiffCount?.() ?? -1,
+  );
+  const lowTopRose = ['sideWall.low.L', 'sideWall.low.R'].every(
+    (part) => wallAfter[part].max[1] > wallBefore[part].max[1],
+  );
+  const lowOtherFacesStill = ['sideWall.low.L', 'sideWall.low.R'].every(
+    (part) =>
+      wallBefore[part].min.every(
+        (v, axis) => Math.abs(v - wallAfter[part].min[axis]) < 1e-6,
+      ) &&
+      [0, 2].every(
+        (axis) => Math.abs(wallBefore[part].max[axis] - wallAfter[part].max[axis]) < 1e-6,
+      ),
+  );
+  const nothingElseMoved = [
+    'sideWall.tall.L',
+    'sideWall.tall.R',
+    'hoodRoof',
+    'hoodValance',
+    'backPanel',
+  ].every((part) => sameBox(wallBefore[part], wallAfter[part]));
+  check(
+    '侧墙逐角斜角驱动几何：low.roofBack 0.012→0 ⇒ 低段实测上沿回升、其余五个面与另 5 件一格不变，且差异计数 +1',
+    lowTopRose && lowOtherFacesStill && nothingElseMoved && wallDiffBefore === 0 && wallDiffAfter === 1,
+    `低段上沿 ${wallBefore['sideWall.low.L'].max[1].toFixed(5)}→${wallAfter['sideWall.low.L'].max[1].toFixed(5)}，未外溢=${nothingElseMoved}，diff ${wallDiffBefore}→${wallDiffAfter}`,
+  );
+
+  // 收尾：回到编译期默认值，别把改动留给后面的检查或截图。
+  await modelPage.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.modelModeReset?.());
+
+  // ⑭ 倒角外观（机柜外 3/4 俯视）—— **半径**唯一的验收通道
+  //
+  // 为什么必须单独一张图：游玩视角的画面上沿只到 y ≈ 1.94 米、而且相机在机柜**内部**
+  // （见 `cabinet` 模式 ⑨ 的注释），顶板那 9 厘米的板根本不在画面里；
+  // 竖屏全景同样看不见顶面。于是「2.5 厘米的斜角读不读得出来」这件事
+  // **一张图都没有** —— 而半径又没有任何数值通道
+  // （`RoundedBoxGeometry` 始终把外尺寸做满 ⇒ 包围盒一格不变，见 ⑬ 的注释）。
+  // 两者一叠加，改半径就等于闭眼调。所以这里用**模型模式自己的轨道相机**拉远 + 抬高俯角：
+  // 走真实指针事件（`mouse.down/move/up` + `wheel`），而不是改 `cameraRig` 的数 ——
+  // 裸 `import('/src/render/cameraRig.ts')` 拿到的是**另一个模块实例**（HMR 查询串），
+  // 改了应用不认，那条坑在 `cabinetShapeReport` 的注释里记着。
+  const canvasCenter = await modelPage.evaluate(() => {
+    const rect = document.querySelector('canvas')?.getBoundingClientRect();
+    return rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null;
+  });
+  await modelPage.setViewportSize({ width: 1280, height: 720 });
+  await modelPage.waitForTimeout(600);
+  if (canvasCenter) {
+    // 拉远到 `MAX_DISTANCE`（9 米）：deltaY 为正 ⇒ `distance × exp(+)` ⇒ 更远。
+    await modelPage.mouse.move(canvasCenter.x, canvasCenter.y);
+    await modelPage.mouse.wheel(0, 900);
+    // 拖出 3/4 俯视：`pitch += dy × 0.006`（向下拖 = 抬高俯角），`yaw -= dx × 0.008`。
+    // 位移刻意**以竖直为主**：第一版拖的是 (-150, +120)，结果绕到机柜**背面**去了
+    // —— 顶板斜角看得见，但檐板（招牌画布）那一条看不见，而它恰恰是 R1 最要核对的一件
+    //（斜角会不会啃到画布）。现在只偏 18° 左右，仍留在玩家这一侧。
+    await modelPage.mouse.down();
+    await modelPage.mouse.move(canvasCenter.x + 40, canvasCenter.y + 100, { steps: 12 });
+    await modelPage.mouse.up();
+    await modelPage.waitForTimeout(500);
+  }
+  const bevelShot = `${shotDir}/s25-cabinet-bevel.png`;
+  const bevelPng = await modelPage.screenshot({ path: bevelShot });
+  check(
+    '倒角外观截图已落盘（1280×720 机柜外 3/4 俯视，人工核对：三件直角盒的斜角是否读得出来 / 檐板斜角有没有啃到招牌画布 / 侧墙剪影的斜角与 `tall.hoodTopFront`×`hoodRoof` 那条 V 形槽是否可接受）',
+    bevelPng.length > 20_000,
+    `${bevelShot} — ${bevelPng.length} 字节`,
+  );
+  // 取景还原：`0` 键走的是面板同一条 `onKeyDown`（别留一个歪相机给下一次跑）。
+  await modelPage.keyboard.press('0');
+  await modelPage.waitForTimeout(200);
 
   check(
     '运行期无控制台/页面错误',

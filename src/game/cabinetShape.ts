@@ -226,6 +226,15 @@ export type CabinetShape = {
     segments: number;
     /** 逐件覆盖，键 = `CabinetShellPart`。空 = 全部走上面的全局值。 */
     perPart: Partial<Record<CabinetShellPart, CabinetPartBevel>>;
+    /**
+     * 侧墙剖面折线的**逐角斜角**（米）。键 = `WallPointId`，全表必须与
+     * `WALL_OUTLINE_BINDING` 的角点一一对应（`cabinet` 判据断言两侧键集合相等）。
+     *
+     * ★ 这一份与 `perPart` 是**两套机制**，不是一份数据的两个视图：
+     * `perPart` 交给 `RoundedBoxGeometry` 自动倒角（只能作用于直角盒件），
+     * 而侧墙是沿 x 挤出的剖面，斜角必须**画进剖面折线**里（见 `chamferPolyline`）。
+     */
+    wallChamfer: Record<WallPointId, number>;
   };
 };
 
@@ -383,20 +392,81 @@ export const CABINET = {
   },
 
   /**
-   * 倒角（S24）。逐件可覆盖，空表 = 全部走全局值。
+   * 倒角（S24 挪进真源，S25 按构件尺寸定档）。逐件可覆盖，缺省回落到全局值。
    *
-   * 取值沿用 S19~S23 的 `CORNER_RADIUS = 0.015` / `CORNER_SEGMENTS = 2`，
-   * 所以默认行为与之前**逐位一致** —— 这一档只是把常量挪进真源，不是改造型。
+   * ## 全局值为什么留在那儿
    *
-   * ⚠️ 1.5 厘米在 1.6 米宽的机柜上是 1%：480p 下不到一个像素，
-   * 所以画面上读不到任何高光带。要「像压铸件」，这个数得按**构件尺寸**给
-   * （大件 2~3 厘米），而不是按「薄板别穿帮」给。薄板有 `RoundedBoxGeometry`
-   * 的自动夹取兜着（半径被夹到 `min(w,h,d)/2`），调大了不会穿。
+   * `radius 0.015 / segments 2` 沿用 S19~S23 的 `CORNER_RADIUS` / `CORNER_SEGMENTS`。
+   * 现在**三件直角盒全都单独点了名**，所以这一档只剩兜底作用：将来再加一件直角盒而
+   * 忘了给它覆盖时，它仍然有倒角，而不是静默变成尖边。
+   *
+   * ## ★ 逐件值按**构件尺寸**给（S25，用户批注「加倒角」）
+   *
+   * 1.5 厘米在 1.6 米宽的机柜上是 1%：480p 下不到一个像素，画面上读不到任何高光带。
+   * 所以大件要给到 2~3 厘米这个量级才读得出「这是个铸件」——**但半径的上界是这件的
+   * 最薄那一轴的一半**（`RoundedBoxGeometry` 自动夹取），于是每件能给的量各不相同：
+   *
+   * | 件 | 尺寸（x·y·z，米） | 最薄轴 | 夹取上界 | 取值 |
+   * |---|---|---|---|---|
+   * | `hoodRoof` | 1.600 · **0.090** · 1.605 | y 0.090 | 0.045 | 0.025 |
+   * | `hoodValance` | 1.600 · 0.349 · **0.090** | z 0.090 | 0.045 | 0.018 |
+   * | `backPanel` | 1.720 · 1.903 · **0.060** | z 0.060 | 0.030 | 0.012 |
+   *
+   * `hoodRoof` 给到 0.025 是因为它只有 9 厘米厚、而顶面是**相机最容易看到的一整片**：
+   * 倒角吃掉上下各 2.5 厘米之后还剩 4 厘米平，读作「一条压出来的钣金梁」而不是「一块纸」。
+   * `hoodValance` 是招牌画布那一件，倒角沿它的正面边界走一圈 ⇒ 画布看起来**嵌进**檐板里；
+   * 再大就会把 1.6 × 0.349 的画布正面啃掉一圈，贴图边缘出现斜切（不划算）。
+   * `backPanel` 大多时候在机柜背面、看不见，它只需要机柜外角那条轮廓不再锐利。
+   *
+   * `segments: 1` 一律取 1 段 = **45° 斜角**（不是圆角）。两条理由：
+   *   - 用户原话是「做了斜角」，斜角就是平面倒角，2 段读起来是「圆」；
+   *   - 1 段的面数比 2 段少 ⇒ 三角形预算只降不升（`perf` 打印的读数为准）。
+   *
+   * ⚠️ 侧墙两段**不在这张表里，也不该在**：它们是沿 x 挤出的剖面件，`RoundedBoxGeometry`
+   * 那套「半径 + 分段」对它们没有意义 —— 倒角必须**画进剖面折线**（下一节
+   * `wallChamfer`）。两套机制、两份数据，别把它们混成一组滑块：`?model` 面板按
+   * **网格自己报的** `userData.bevelable` 决定给哪一组（盒子给「半径 / 分段」，
+   * 剖面给「逐角半径」），所以这里不需要一份「哪些件是盒子」的名单（那会是第二份真源）。
    */
   bevel: {
     radius: 0.015,
     segments: 2,
-    perPart: {},
+    perPart: {
+      hoodRoof: { radius: 0.025, segments: 1 },
+      hoodValance: { radius: 0.018, segments: 1 },
+      backPanel: { radius: 0.012, segments: 1 },
+    },
+    /**
+     * 侧墙剖面的逐角斜角（S25）。★ **只给看得见剪影的角**。
+     *
+     * 判断标准只有一条：这个角**在不在玩家看得见的轮廓上**。
+     *   · `*.backBottom` / `tall.insetBottom` / `low.frontBottom` 全在地板以下
+     *     （`bottomY = −0.26`）或埋在同色件里 ⇒ **0**，切了只会露缝、不会好看；
+     *   · 高段顶部两个角是机柜最上沿的剪影 ⇒ 给到 2~2.5 厘米（与 `hoodRoof` 同量级，
+     *     它们在同一条 y=1.643 线上，差太多会读出「谁没做完」）；
+     *   · 斜接面两端（`tall.hoodBottomFront` / `tall.insetTop`）各 1.5 厘米 ——
+     *     这条斜面本来就只有 13°、约 0.34 米长，再大就被 `chamferPolyline` 的
+     *     0.49 夹取吃掉整条面（那正是它存在的理由）；
+     *   · 低段斜顶两端 1.2 厘米：它是玩家**离得最近**的一条边，但同时也是围挡的顶，
+     *     切多了围挡读不出厚度。
+     *
+     * ⚠️ `tall.hoodTopFront` 这一角与 `hoodRoof` 的 2.5 厘米斜角**在空间上重合**
+     *（墙的内表面 x=0.80 正好是顶板半宽），两边都切会在 x=0.80 那条缝上形成一个 V 形槽。
+     * 真机在那个位置本来就有一条铸件分型线，所以先按「两边都给」做，
+     * 观感不对就调这一格 —— `?model` 面板上它就是「本件倒角」里的一行滑块。
+     */
+    wallChamfer: {
+      'tall.backTop': 0.02,
+      'tall.hoodTopFront': 0.025,
+      'tall.hoodBottomFront': 0.015,
+      'tall.insetTop': 0.015,
+      'tall.insetBottom': 0,
+      'tall.backBottom': 0,
+      'low.backBottom': 0,
+      'low.frontBottom': 0,
+      'low.roofFront': 0.012,
+      'low.roofBack': 0.012,
+    },
   },
 
   /**
@@ -523,51 +593,60 @@ function boxOf(
 }
 
 /**
+ * 侧墙一段的解析包围盒：x 由「那一侧 + 板厚」给出，`(z, y)` 的四个极值
+ * **从展开斜角之后的轮廓环上取**。
+ *
+ * ## ★ 为什么这里要绕一圈折线，而不是直接写 `wall.lowRoofBackY`
+ *
+ * 侧墙是剖面挤出件，它的 AABB 就是那条环在 `(z, y)` 上的极值范围。以前直接写
+ * 字段名就够了（环是尖的，极值点正好是某个角）；S25 给斜顶后端加了 1.2 厘米
+ * 斜角之后，那个**唯一的**最高点被切掉了 —— 极值落在切点连线上的另一点，
+ * 盒的 `max[1]` 比 `lowRoofBackY` 低 1.09 毫米。硬编码在这里的表现是
+ * `cabinet` 判据 ②「解析盒 = 实测盒」红 1 毫米（实测踩过，就是这么发现的）。
+ *
+ * 从环上取极值不是「让判据跟着几何走」：环是**真源**，网格由
+ * `TableBuilder.buildSideWall()` **另一条独立推导**建出来，两边仍然在对质。
+ * 变的只是「真源如今得算两个量（环 + 由环导出的盒），而不是各抄一份字段名」。
+ */
+function wallSegmentBox(side: -1 | 1, segment: CabinetWallSegment): Box3Like {
+  const { wall } = cabinetShape();
+  const ring = cabinetWallOutline(segment);
+  const zs = ring.map(([z]) => z);
+  const ys = ring.map(([, y]) => y);
+  const minZ = Math.min(...zs);
+  const maxZ = Math.max(...zs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  return boxOf(
+    [side * (wall.innerX + wall.thickness / 2), (minY + maxY) / 2, (minZ + maxZ) / 2],
+    [wall.thickness, maxY - minY, maxZ - minZ],
+  );
+}
+
+/**
  * 外壳件的**解析包围盒**（世界坐标）。
  *
  * ★ 这是「判据不与几何分叉」的关键：判据不写第二份公式，
  * 而是把这里算出来的盒与场景里实测的盒比对。谁的公式错了都会当场失败 ——
  * 包括**几何建错了但记的是一份漂亮数字**这种最难发现的情况。
  *
- * `boxOf` 的入参全部来自 `CABINET`，与 `TableBuilder` 建网格时用的是同一份。
+ * 直角盒各件的入参全部来自 `cabinetShape()`，与 `TableBuilder` 建网格时用的是同一份；
+ * 侧墙两段走 `wallSegmentBox()` 从**轮廓环**取极值（S25 起斜角会切掉极值角点，
+ * 再抄字段名就会差出一毫米 —— 见那里的注释）。
  */
 export function cabinetPartBox(part: CabinetShellPart): Box3Like {
   // ★ 走 `cabinetShape()` 而不是 `CABINET`：模型模式重建之后，解析盒必须与
   // **建网格时读到的那份数据**一致，否则 `cabinet` 判据会在调参期间误报。
   // 非 `?model` 下两者恒等，所以这条不改变任何既有行为。
-  const { wall, hood, back } = cabinetShape();
-  const wallCenterX = wall.innerX + wall.thickness / 2;
+  const { hood, back } = cabinetShape();
 
   switch (part) {
     case 'sideWall.tall.L':
-    case 'sideWall.tall.R': {
-      const side = part.endsWith('.L') ? -1 : 1;
-      // ★ S21：高段前沿内收之后，这个盒的 max[2] **仍然是 `hoodFrontZ`**（0.195）——
-      // 因为「檐板托」把高段的最高处一直伸到檐板内表面。内收只发生在
-      // `y ∈ (insetTopY, miterFrontY)` 以下，**落在盒内部 ⇒ 解析盒看不见**。
-      // 形状对不对由 `cabinetWallOutline()` + 判据的折线比对负责。
-      return boxOf(
-        [
-          side * wallCenterX,
-          (wall.bottomY + wall.tallTopY) / 2,
-          (wall.backZ + wall.hoodFrontZ) / 2,
-        ],
-        [wall.thickness, wall.tallTopY - wall.bottomY, wall.hoodFrontZ - wall.backZ],
-      );
-    }
+    case 'sideWall.tall.R':
+      return wallSegmentBox(part.endsWith('.L') ? -1 : 1, 'tall');
     case 'sideWall.low.L':
-    case 'sideWall.low.R': {
-      const side = part.endsWith('.L') ? -1 : 1;
-      // max[1] 取斜顶的**后端**（= 最高点）；斜顶本身同样落在盒内部。
-      return boxOf(
-        [
-          side * wallCenterX,
-          (wall.bottomY + wall.lowRoofBackY) / 2,
-          (wall.insetZ + wall.lowFrontZ) / 2,
-        ],
-        [wall.thickness, wall.lowRoofBackY - wall.bottomY, wall.lowFrontZ - wall.insetZ],
-      );
-    }
+    case 'sideWall.low.R':
+      return wallSegmentBox(part.endsWith('.L') ? -1 : 1, 'low');
     case 'hoodRoof':
       return boxOf(
         [0, (hood.underY + hood.topY) / 2, (hood.backZ + hood.valanceInnerZ) / 2],
@@ -623,7 +702,35 @@ export type WallPointBinding = {
   y: keyof CabinetShape['wall'];
   /** 模型模式面板上显示的中文名。 */
   label: string;
+  /**
+   * 稳定身份 —— ★ `bevel.wallChamfer` 的键。
+   *
+   * 为什么不用**下标**当键：加一个角点会让后面全部平移，而平移的表现是
+   * 「斜角长在别的角上」——几何照样成立、零报错，只有画面错了。
+   * 键里带段名（`tall.` / `low.`）是因为两段各有一个「后下角」，
+   * 它们是**不同的点**（高段的在 `backZ`、低段的在 `insetZ`）。
+   */
+  id: WallPointId;
 };
+
+/**
+ * 侧墙折线**全部角点**的身份（两段合一张表，所以键全局唯一）。
+ *
+ * ⚠️ 这里刻意**不**用 `tall` / `low` 再套一层：套了之后 `wallChamfer[p.id]`
+ * 就取不到值（`p.id` 的类型是两段键的并集，而 `wallChamfer[segment]` 只有一半的键），
+ * 只能靠断言绕过 —— 一个需要断言才能索引的表，等于没有类型检查。
+ */
+export type WallPointId =
+  | 'tall.backTop'
+  | 'tall.hoodTopFront'
+  | 'tall.hoodBottomFront'
+  | 'tall.insetTop'
+  | 'tall.insetBottom'
+  | 'tall.backBottom'
+  | 'low.backBottom'
+  | 'low.frontBottom'
+  | 'low.roofFront'
+  | 'low.roofBack';
 
 /**
  * 侧墙折线的**点 ↔ 字段绑定表**（S24）。
@@ -649,27 +756,122 @@ export type WallPointBinding = {
 export const WALL_OUTLINE_BINDING: Record<CabinetWallSegment, readonly WallPointBinding[]> = {
   // 高段：从后上角出发，沿上沿 → 檐板托前立面 → 斜接面 → 内收面 → 底边回到起点。
   tall: [
-    { z: 'backZ', y: 'tallTopY', label: '后上角' },
-    { z: 'hoodFrontZ', y: 'tallTopY', label: '檐板托·前上角' },
-    { z: 'hoodFrontZ', y: 'miterFrontY', label: '檐板托·前下角' },
-    { z: 'insetZ', y: 'insetTopY', label: '内收面·顶' },
-    { z: 'insetZ', y: 'bottomY', label: '内收面·底' },
-    { z: 'backZ', y: 'bottomY', label: '后下角' },
+    { id: 'tall.backTop', z: 'backZ', y: 'tallTopY', label: '后上角' },
+    { id: 'tall.hoodTopFront', z: 'hoodFrontZ', y: 'tallTopY', label: '檐板托·前上角' },
+    { id: 'tall.hoodBottomFront', z: 'hoodFrontZ', y: 'miterFrontY', label: '檐板托·前下角' },
+    { id: 'tall.insetTop', z: 'insetZ', y: 'insetTopY', label: '内收面·顶' },
+    { id: 'tall.insetBottom', z: 'insetZ', y: 'bottomY', label: '内收面·底' },
+    { id: 'tall.backBottom', z: 'backZ', y: 'bottomY', label: '后下角' },
   ],
   // 低段：从 `insetZ` 的底角出发，沿底边向前 → 前立面 → 斜顶回到起点。
   low: [
-    { z: 'insetZ', y: 'bottomY', label: '后下角' },
-    { z: 'lowFrontZ', y: 'bottomY', label: '前下角' },
-    { z: 'lowFrontZ', y: 'lowRoofFrontY', label: '斜顶·前端' },
-    { z: 'insetZ', y: 'lowRoofBackY', label: '斜顶·后端' },
+    { id: 'low.backBottom', z: 'insetZ', y: 'bottomY', label: '后下角' },
+    { id: 'low.frontBottom', z: 'lowFrontZ', y: 'bottomY', label: '前下角' },
+    { id: 'low.roofFront', z: 'lowFrontZ', y: 'lowRoofFrontY', label: '斜顶·前端' },
+    { id: 'low.roofBack', z: 'insetZ', y: 'lowRoofBackY', label: '斜顶·后端' },
   ],
 };
 
+/**
+ * 把一条**闭合**尖角折线按逐角半径展开成斜角折线。
+ *
+ * 纯几何：只吃点与半径，不认识任何字段名 —— 所以「建网格」与「算折线」这两条
+ * **独立推导**可以共用它，而不违反 `cabinetWallOutline()` 上面那条纪律
+ * （纪律要防的是「两边共用同一份**坐标**」，共用一个欧氏变换不会互相掩盖错误：
+ * 坐标接错了，展开出来的环照样对不上，判据会红）。
+ *
+ * 每个角变成两个点（沿两条邻边各退 `r`）；`r = 0` 时原样保留，不产生重复点。
+ *
+ * ## ★ 半径必须按**邻边长度**夹取
+ *
+ * 高段的「檐板托·前下角 → 内收面·顶」这条斜接面只有约 0.34 米，而它本身就是 13° 的
+ * 浅角：两端各切 0.2 米就把整条斜面吃没了。所以单侧上限取 `0.49 × min(两条邻边)` ——
+ * 一条边**两端各**按这个上限切，合计 0.98 < 1 ⇒ 中间必定还剩一段（≥ 2% 边长），
+ * 不会出现「两个切点重合或越界 ⇒ 折线自交」。挤出体自交不会被 Rapier 抓到
+ * （侧墙根本没有来自这一层的碰撞），但渲染上是一片翻面的破面，而且**零报错**。
+ *
+ * ## ★ 夹取与**包围盒**：0.49 只保证「边的方向不变」，不保证盒子不变
+ *
+ * `cabinet` 判据有 8 条量纲级断言比的是**包围盒**（顶板上沿 = 侧墙高段上沿、
+ * 檐板内表面 = 侧墙台阶……）。每条边两端各切 ≤0.49 ⇒ 中间必定还剩一段**平行于原方向**
+ * 的段，所以只要某个极值原先是由**一条边**承载的（例如侧墙顶边、后立面），切完它还在，
+ * 那个盒子面一格不变。
+ *
+ * ⚠️ 但**由单个角点独载的极值会被切掉**。实测踩到过：低段斜顶的最高点只有
+ * `low.roofBack` 一个角，给它 1.2 厘米斜角 ⇒ 整段侧墙的 `max[1]` 低了 1.09 毫米，
+ * 判据 ②「解析盒 = 实测盒」当场红。这不是判据太严，是**解析盒当时写的是字段名而不是
+ * 形状** —— 修法是让侧墙的盒从环上取极值（见 `wallSegmentBox()`）。
+ * 换句话说：加斜角之前解析盒是形状的**摘要**，之后它是形状的**推论**。
+ *
+ * ★ 上限本身是导出的（`chamferLimitAt`）：`?model` 面板要显示「这个角最大能到多少」，
+ * 若它自己再写一遍 `0.49 × min(邻边)`，将来改这个系数就是两份真源。
+ */
+export function chamferPolyline(
+  points: readonly (readonly [number, number])[],
+  radii: readonly number[],
+): Array<readonly [number, number]> {
+  const n = points.length;
+  const out: Array<readonly [number, number]> = [];
+  if (n < 3) return points.map(([z, y]) => [z, y]);
+  for (let i = 0; i < n; i += 1) {
+    const current = points[i];
+    const previous = points[(i - 1 + n) % n];
+    const next = points[(i + 1) % n];
+    const radius = Math.min(Math.max(radii[i] ?? 0, 0), chamferLimitAt(points, i));
+    if (radius <= 1e-9) {
+      out.push([current[0], current[1]]);
+      continue;
+    }
+    // 先入边切点、再出边切点：与环绕方向一致，展开后的环仍然不自交。
+    for (const toward of [previous, next]) {
+      const dx = toward[0] - current[0];
+      const dy = toward[1] - current[1];
+      const length = Math.hypot(dx, dy) || 1;
+      out.push([current[0] + (dx / length) * radius, current[1] + (dy / length) * radius]);
+    }
+  }
+  return out;
+}
+
+/**
+ * 第 `index` 个角**实际能吃到**的半径上限（米）。
+ *
+ * 就是 `chamferPolyline` 用来夹取的那个数，原样导出给面板读 ——
+ * 面板据此告诉用户「这一格拖到 X 以上就不再生效」，而不是让他对着一个不动的滑块猜。
+ */
+export function chamferLimitAt(
+  points: readonly (readonly [number, number])[],
+  index: number,
+): number {
+  const n = points.length;
+  if (n < 3) return 0;
+  const at = (i: number) => points[(i + n) % n];
+  const length = (a: readonly [number, number], b: readonly [number, number]) =>
+    Math.hypot(b[0] - a[0], b[1] - a[1]);
+  return 0.49 * Math.min(length(at(index - 1), at(index)), length(at(index), at(index + 1)));
+}
+
+/** 一段侧墙折线的逐角半径（按 `WALL_OUTLINE_BINDING` 的顺序取，键 = 角点 id）。 */
+function wallChamferRadii(segment: CabinetWallSegment): number[] {
+  const { wallChamfer } = cabinetShape().bevel;
+  return WALL_OUTLINE_BINDING[segment].map((point) => wallChamfer[point.id] ?? 0);
+}
+
+/**
+ * 侧墙一段的轮廓折线 —— ★ **已展开斜角**之后的那一圈点。
+ *
+ * 也就是说：它就是「几何应该长成什么样」的真源，`cabinet` 判据拿实测顶点集合与它
+ * 逐点比对。S25 之前这里是尖的（6 / 4 个点），现在是斜角展开后的（最多 12 / 8 个）——
+ * 判据因此**变强**了而不是被绕过：斜角切错、切多了、该切的没切，都会当场红。
+ */
 export function cabinetWallOutline(
   segment: CabinetWallSegment,
 ): readonly (readonly [number, number])[] {
   const { wall } = cabinetShape();
-  return WALL_OUTLINE_BINDING[segment].map((point) => [wall[point.z], wall[point.y]]);
+  const sharp = WALL_OUTLINE_BINDING[segment].map(
+    (point) => [wall[point.z], wall[point.y]] as const,
+  );
+  return chamferPolyline(sharp, wallChamferRadii(segment));
 }
 
 // ── 运行期覆盖层（只服务 `?model` 模型模式）───────────────────────────────
@@ -727,6 +929,10 @@ export function cloneCabinetShape(): CabinetShape {
  *
  * ⚠️ 只对**直角盒件**有意义。剖面挤出件（侧墙两段）是尖边，
  * 理由见 `CabinetPartBevel` 的注释。
+ *
+ * ★ 返回的是**覆盖对象本身**（没有覆盖时才是新造的兜底值）。`?model` 面板靠这一点
+ * 把滑块直接绑在 `bevel.perPart[part]` 上；几何那一边只当场读字段，不留引用
+ * （见 `TableBuilder.cabinetBoxMesh`）。
  */
 export function partBevel(part: CabinetShellPart): CabinetPartBevel {
   const { bevel } = cabinetShape();
@@ -749,8 +955,10 @@ function flattenNumbers(value: unknown, prefix: string, out: Map<string, number>
  *
  * 返回**拍平后的数值路径**，例如
  *   `{ path: 'wall.insetZ', from: -0.12, to: -0.18 }`
- *   `{ path: 'bevel.perPart.hoodValance.radius', from: NaN, to: 0.03 }`
- * `from === NaN` 表示「默认值里没有这一项」（逐件倒角是运行期新加的键）。
+ *   `{ path: 'bevel.perPart.sideWall.tall.L.radius', from: NaN, to: 0.03 }`
+ * `from === NaN` 表示「编译期默认值里没有这一项」。★ S25 起三件直角盒**都已经在默认表里**
+ * （见 `CABINET.bevel.perPart`），所以这一支只会出现在「给一件从没点名的件新加覆盖」时
+ * —— 例如上面那个侧墙的键（它在默认表里刻意缺席，理由见 `CabinetPartBevel`）。
  *
  * ★ 这是「我说不出需求」的解法：拖完滑块点一下导出，拿到的就是需求本身。
  */

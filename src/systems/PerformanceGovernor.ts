@@ -3,9 +3,10 @@ export type QualityTier = 'high' | 'medium' | 'low';
 export type QualitySettings = {
   tier: QualityTier;
   /**
-   * 像素化的目标内部高度（见 `render/PixelScale.ts`）。
+   * 内部分辨率的目标高度上限（见 `render/PixelScale.ts`）。
    *
-   * **调低 = 像素更粗 = 更省**，所以降档与像素美学同向：不是「变糊」而是「更方块」。
+   * **调低 = 倍率更大 = 更省**。默认不开最近邻，所以降档的表现是「轻微模糊」；
+   * 只有开了 `pixelated`（`?pixel=N`）才是「更方块」。
    * 取代了原来的 `maxDpr`——DPR 不再参与分辨率计算。
    */
   pixelTargetHeight: number;
@@ -17,11 +18,14 @@ export type QualitySettings = {
 /**
  * 各档的像素目标高度。**数值刻意拉开**：整数倍率有量化（`floor(视口高 / 目标高度)`），
  * 目标高度挨得太近时两档会算出同一个倍率，分档就等于没分。
- * 实测 664（iPhone 13）/ 720 / 900 三种视口下：高 2 / 中 2~3 / 低 3~4。
+ * 实测 664（iPhone 13）/ 720 / 900 三种视口下：高 1 / 中 2~3 / 低 3~4。
  * 分辨率之外还有 `shadows` / `coinShadows` 两个真正的开销旋钮，所以即使某档倍率相同也仍有意义。
+ *
+ * 高档取 720 是为了跟 `PIXEL_SCALE_DEFAULTS.targetHeight` 对齐：默认档 = 原生分辨率，
+ * 换档（含 `setQuality('high')` 回到高档）不应该把画面重新压回 360p。
  */
 const PRESETS: Record<QualityTier, QualitySettings> = {
-  high: { tier: 'high', pixelTargetHeight: 360, shadows: true, coinShadows: true },
+  high: { tier: 'high', pixelTargetHeight: 720, shadows: true, coinShadows: true },
   medium: { tier: 'medium', pixelTargetHeight: 260, shadows: true, coinShadows: false },
   low: { tier: 'low', pixelTargetHeight: 180, shadows: false, coinShadows: false },
 };

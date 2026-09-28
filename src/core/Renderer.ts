@@ -20,8 +20,8 @@ export function createRenderer(canvas: HTMLCanvasElement): THREE.WebGLRenderer {
  * 按 `PixelScale` 调整画布。
  *
  * 与旧版的区别：**DPR 不再参与分辨率计算**，改成 `setPixelRatio(1 / upscale)`。
- * 画布 backing store 变成「CSS 尺寸 ÷ 整数倍率」，再由 CSS 的
- * `image-rendering: pixelated` 最近邻放大回去——这就是像素化的全部机制。
+ * 画布 backing store 变成「CSS 尺寸 ÷ 整数倍率」。倍率 > 1 时靠 CSS 放大回 CSS 尺寸：
+ * `image-rendering: pixelated` 是最近邻（像素风），`auto` 是平滑（默认，画质分档降分辨率时用）。
  *
  * `updateStyle = false`：CSS 尺寸仍由 `#game-canvas { width:100vw; height:100vh }` 决定，
  * 所以我们只改 backing store，不动布局。

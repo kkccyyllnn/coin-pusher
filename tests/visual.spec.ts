@@ -48,6 +48,26 @@ async function diagnostics(page: Page) {
   return page.evaluate(() => window.__THREE_GAME_DIAGNOSTICS__);
 }
 
+/**
+ * **即时**读画布的真实尺寸（backing store 与 CSS 两套）。
+ *
+ * 与 `diagnostics()` 的区别只有一件事：诊断快照是**上一帧发布**的，
+ * 而 `setPixelScale` 这类 hook 只 `render()`、不发布诊断。
+ * 验证「分辨率改动是否落到画布上」必须走这里，否则比的是旧帧。
+ */
+async function canvasSize(page: Page) {
+  return page.evaluate(() => {
+    const canvas = document.querySelector<HTMLCanvasElement>('#game-canvas');
+    if (!canvas) return null;
+    return {
+      width: canvas.width,
+      height: canvas.height,
+      clientWidth: canvas.clientWidth,
+      clientHeight: canvas.clientHeight,
+    };
+  });
+}
+
 async function table(page: Page) {
   return page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.table?.() ?? null);
 }
@@ -239,60 +259,81 @@ test.describe('币塔街机机台', () => {
     expect(state?.boostCharges).toBe(0);
   });
 
-  test('像素分辨率：整数倍率生效，且关掉后画面仍非空白（可逆）', async ({ page }) => {
+  test('像素分辨率：默认原生，「倍率」与「最近邻」是两个正交旋钮（可逆）', async ({ page }) => {
     await page.goto('/');
     await waitFrames(page, 5);
 
-    // ① 默认像素化：倍率是**整数**且 ≥ 2。
-    //    非整数放大时一个 texel 时而占 1 个 CSS 像素、时而占 2 个，
-    //    画面会出现粗细不均的条纹——这是这套方案唯一不能破的不变量。
-    //
-    //    每个断言都带上现场读数：这条曾经在 iPhone 13（视口 390×**664**）上红过——
-    //    `floor(664/360) = 1`，倍率 1 等于不降分辨率，「像素化」变成名义开关。
-    //    没有现场读数就得靠猜是哪个视口、哪个数字不对。
+    // 每个断言都带上现场读数：这套判据曾在 iPhone 13（视口 390×**664**）上红过，
+    // 没有现场读数就得靠猜是哪个视口、哪个数字不对。
     const on = await diagnostics(page);
     const site =
       `upscale=${on?.performance.upscale} pixelated=${on?.performance.pixelated} ` +
       `backing=${on?.canvas.width}x${on?.canvas.height} css=${on?.canvas.clientWidth}x${on?.canvas.clientHeight} ` +
       `internalH=${on?.performance.internalHeight}`;
-    expect(on?.performance.pixelated, site).toBe(true);
+
+    // ① 默认档 = **原生分辨率 + 平滑采样**（`pixelated` 默认关、`targetHeight` 720）。
+    //    这条钉住「默认不再是块状像素」这个决定本身：若有人把默认档改回 ×2，
+    //    或让 `pixelated` 重新去管倍率，这里会红。
+    expect(on?.performance.pixelated, site).toBe(false);
     expect(Number.isInteger(on?.performance.upscale), site).toBe(true);
-    expect(on?.performance.upscale ?? 0, site).toBeGreaterThanOrEqual(2);
+    expect(on?.performance.upscale, site).toBe(1);
+    expect(Math.abs((on?.canvas.width ?? 0) - (on?.canvas.clientWidth ?? 0)), site).toBeLessThanOrEqual(1);
 
-    // ② 倍率真的落到了画布上：backing store = CSS 尺寸 ÷ 倍率。
+    // ② 显式倍率 + 最近邻 → 像素风真的落地：backing = CSS ÷ 2，且画面非空白。
     //    `upscale` 是引擎算的，`canvas.width` 是画布实际被设成的值——两者必须一致。
-    const expectedBacking = Math.floor(
-      (on?.canvas.clientWidth ?? 0) / (on?.performance.upscale ?? 1),
+    const pix = await page.evaluate(() =>
+      window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ upscale: 2, pixelated: true }),
     );
-    expect(Math.abs((on?.canvas.width ?? 0) - expectedBacking), site).toBeLessThanOrEqual(1);
-    // 内部高度必须真的低于 CSS 高度，否则「像素化」只是名义上的。
-    expect(on?.performance.internalHeight ?? 0, site).toBeLessThan(on?.canvas.clientHeight ?? 0);
+    expect(pix?.pixelated, JSON.stringify(pix)).toBe(true);
+    expect(pix?.upscale, JSON.stringify(pix)).toBe(2);
+    expect(pix?.pixelRatio, JSON.stringify(pix)).toBeCloseTo(0.5, 10);
+    // 引擎算的内部宽（`setPixelScale` 的即时返回）与画布**实际**被设成的宽高是两个来源，
+    // 对得上才叫「倍率真的落到了画布上」。
+    // ★ 这里**不能**读 `diagnostics(page)`：诊断快照是上一帧发布的，而 `setPixelScale`
+    //   只 `render()`、不发布诊断 ⇒ 读回来的是改动之前的旧值（本条曾因此假红）。
+    const pixCanvas = await canvasSize(page);
+    expect(
+      Math.abs((pixCanvas?.width ?? 0) - (pix?.internalWidth ?? 0)),
+      `×2 时 引擎侧 ${JSON.stringify(pix)} / 画布侧 ${JSON.stringify(pixCanvas)}`,
+    ).toBeLessThanOrEqual(1);
+    await waitFrames(page, 3);
+    expect((await sampleCanvas(page)).ok).toBe(true);
 
-    // ③ 关掉 → 回到原生分辨率，且**画面仍非空白**（不是渲染坏掉）。
-    //    这条同时覆盖 `?pixel=off` 走的同一条路径。
-    const off = await page.evaluate(() =>
+    // ③ **解耦不变量**：只关最近邻，倍率必须保持 ×2。
+    //    这是本次改动唯一不能破的语义——旧版 `pixelated=false` 会把倍率吞回 1，
+    //    于是「画质分档降分辨率」在默认档下静默失效（名义开关）。
+    const smooth = await page.evaluate(() =>
       window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ pixelated: false }),
     );
-    expect(off?.upscale).toBe(1);
-    expect(off?.pixelRatio).toBe(1);
-    await waitFrames(page, 3);
-    const offSample = await sampleCanvas(page);
-    expect(offSample.ok).toBe(true);
+    expect(smooth?.pixelated, JSON.stringify(smooth)).toBe(false);
+    expect(smooth?.upscale, JSON.stringify(smooth)).toBe(2);
 
-    // ④ 再打开 → 倍率回来。可逆，不是一次性开关。
+    // ④ 取消显式倍率 → 回到 `targetHeight` 推导；默认档（目标高 720 / 视口 720）给回原生。
     const back = await page.evaluate(() =>
-      window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ pixelated: true }),
+      window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ upscale: null }),
     );
-    expect(back?.pixelated, site).toBe(true);
-    expect(back?.upscale ?? 0, site).toBeGreaterThanOrEqual(2);
+    expect(back?.upscale, JSON.stringify(back)).toBe(1);
+    expect(back?.pixelRatio, JSON.stringify(back)).toBe(1);
+    const backCanvas = await canvasSize(page);
+    expect(
+      Math.abs((backCanvas?.height ?? 0) - (backCanvas?.clientHeight ?? 0)),
+      `取消覆盖后 引擎侧 ${JSON.stringify(back)} / 画布侧 ${JSON.stringify(backCanvas)}`,
+    ).toBeLessThanOrEqual(1);
+    await waitFrames(page, 3);
+    expect((await sampleCanvas(page)).ok).toBe(true);
 
-    // ⑤ 倍率下限：把目标高度设得比视口还高时，`floor(视口高 / 目标高度)` 会算出 1，
-    //    此时**必须**被 `minUpscale` 兜住。这条专门钉住 iPhone 13 上踩过的那个坑：
-    //    矮视口下像素化静默失效，画面与改造前一模一样，而开关还显示「开」。
-    const floored = await page.evaluate(() =>
-      window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ targetHeight: 10000 }),
+    // ⑤ 倍率上下界：`maxUpscale` 兜住荒谬的显式倍率（防超大视口压成马赛克），
+    //    而 `minUpscale` 现在默认是 **1**——把目标高度设得比视口还高时倍率就是 1，
+    //    这是「原生分辨率」的期望行为，不再是旧版要兜住的静默失效。
+    const capped = await page.evaluate(() =>
+      window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ upscale: 99 }),
     );
-    expect(floored?.upscale ?? 0, `targetHeight=10000 时 ${JSON.stringify(floored)}`).toBeGreaterThanOrEqual(2);
+    expect(capped?.upscale, `upscale=99 时 ${JSON.stringify(capped)}`).toBeLessThanOrEqual(4);
+    expect(capped?.upscale, `upscale=99 时 ${JSON.stringify(capped)}`).toBeGreaterThanOrEqual(1);
+    const floored = await page.evaluate(() =>
+      window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ targetHeight: 10000, upscale: null }),
+    );
+    expect(floored?.upscale, `targetHeight=10000 时 ${JSON.stringify(floored)}`).toBe(1);
   });
 
   test('换肤真的改变画面（toon 材质下不会静默失效）', async ({ page }) => {

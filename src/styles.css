@@ -49,17 +49,18 @@ body {
   outline: none;
   touch-action: none;
   /*
-   * 像素化（V1）：画布按「CSS 尺寸 ÷ 整数倍率」渲染（见 `render/PixelScale.ts`），
-   * 这里用最近邻把它放大回 CSS 尺寸。倍率是整数，所以每个 texel 占的像素块等大——
+   * 像素化的**放大方式**（见 `render/PixelScale.ts`）：开了最近邻就把
+   * 「CSS 尺寸 ÷ 整数倍率」的画布按整数块放大回 CSS 尺寸，每个 texel 占的像素块等大——
    * 非整数放大会出现粗细不均的条纹，正是要避免的「脏」。
    *
-   * 由 `applyPixelated()` 写 `:root[data-pixel]` 控制开关（`?pixel=off` 可关）。
+   * 默认**不开**（原生分辨率 + 浏览器默认平滑采样），由 `applyPixelated()` 写
+   * `:root[data-pixel]` 控制；`?pixel=2` 这类显式倍率会把它一并打开。
    */
-  image-rendering: pixelated;
+  image-rendering: auto;
 }
 
-:root[data-pixel='off'] #game-canvas {
-  image-rendering: auto;
+:root[data-pixel='on'] #game-canvas {
+  image-rendering: pixelated;
 }
 
 /* 高潮反馈：只在边缘闪一下，不遮挡盘面，避免「用特效盖住因果」。 */

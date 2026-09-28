@@ -104,7 +104,7 @@ src/
     RampLut.ts           色带 LUT（按调色板去重）
     cabinetTexture.ts    机柜 Arcane 风 CanvasTexture（招牌 / 得分线 / 热区）
     iconTexture.ts       XIXI 图标图集
-    PixelScale.ts        像素化整数倍率解算
+    PixelScale.ts        内部分辨率倍率 + 最近邻开关（两个正交旋钮，默认原生）
     cameraRig.ts         **机位唯一真源**（取景框 + 球坐标反解，自动取景与调试面板共用）
   systems/             系统层
     PhysicsWorld.ts      Rapier 世界与每帧步进
@@ -141,6 +141,23 @@ shots/                 各状态截图（README 与视觉回归引用）
 
 ★ 拖动任意一个手动控件都会把「自动取景」关掉（= 交出机位所有权）——
 不这样的话，之后改 FOV 或改窗口尺寸会被 `fitCamera()` 弹回默认视角。
+
+### 画面分辨率与像素风（`?pixel`）
+
+默认档是**原生分辨率 + 平滑采样**（`src/render/PixelScale.ts` 的 `PIXEL_SCALE_DEFAULTS`）。
+块状像素风改成显式通道，两个旋钮**正交**：
+
+| 旋钮 | 管什么 | 关掉会怎样 |
+| --- | --- | --- |
+| `targetHeight` / `upscale`（面板「像素目标高度」/ `?pixel=N`） | 内部分辨率 = CSS 尺寸 ÷ 整数倍率 | 回到按视口推导 |
+| `pixelated`（面板「像素化」） | 放大方式：最近邻 or 平滑 | 只是不再块状，**倍率不变** |
+
+- `?pixel=2/3/4` = 显式倍率 **并**打开最近邻（写数字的意图是「看像素风」，只降分辨率不换采样是半条路径）。
+- `?pixel=off` = 原生 + 平滑，等价于默认档，留着纯粹为了 A/B 对照时一眼可见。
+- 画质分档（`PerformanceGovernor`）只动 `targetHeight`，所以低配机上的表现是**轻微模糊**而不是方块；
+  想让降档变「更方块」就同时把 `pixelated` 打开。
+- 倍率曾和 `pixelated` 绑在一起：关掉像素化会把倍率吞回 1，于是默认档下降档**静默不省任何东西**。
+  这条被 `verify-game.mjs perf` 的「关最近邻后倍率仍是 2」钉住，别再合回去。
 
 ### 独立验证脚本
 

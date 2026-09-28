@@ -516,6 +516,7 @@ export class Game {
 
     // `?pixel=off` / `?pixel=2` 覆盖默认像素档（A/B 对比观感、真机调试用）。
     // 数字是**显式倍率**（1 = 原生、2 = 半像素），不是目标高度——目标高度会被整数化吞掉。
+    // 数字档还会顺带打开最近邻：写 `?pixel=2` 的意图是「看像素风」，只降分辨率不换采样是半条路径。
     // 注意：它只改**初始值**——画质分档真的换档时仍由 `applyQuality` 接管
     // （换档要连续 2 个低帧窗口或 6 个高帧窗口，正常一局里不会发生）。
     const pixelOverride = readPixelOverride(window.location.search);
@@ -853,8 +854,8 @@ export class Game {
 
   private applyQuality(): void {
     const settings = this.governor.current;
-    // 降档 = 像素更粗（targetHeight 更小 → 整数倍率更大），与像素美学同向：
-    // 不是「变糊」而是「更方块」。原来的 maxDpr 语义被它取代。
+    // 降档 = 内部分辨率更低（targetHeight 更小 → 整数倍率更大）→ 更省。
+    // 原来的 maxDpr 语义被它取代。默认不开最近邻，所以降档表现为轻微模糊而非方块。
     this.tuning.pixelTargetHeight = settings.pixelTargetHeight;
     this.renderer.shadowMap.enabled = settings.shadows;
     this.renderer.shadowMap.needsUpdate = true;
@@ -2020,7 +2021,7 @@ export class Game {
    * 世界尺寸 → **后备缓冲像素**边长（P10 的诊断用）。
    *
    * 为什么不复用 `toScreen` 量两点差：那量的是 **CSS 像素**，而像素画的 1:1 是对着
-   * **后备缓冲**说的——`upscale` 是最近邻放大，图标纹素与后备像素一一对应才干净。
+   * **后备缓冲**说的——倍率 > 1 且开最近邻时，图标纹素与后备像素一一对应才干净。
    * 这里按透视公式直接算，再除掉 `pixelScale.upscale`，得到的就是真正决定
    * 「图标糊不糊」的那个数。判据写「≥ 24 后备像素」这种与档位无关的断言。
    *
@@ -2159,8 +2160,8 @@ export class Game {
         };
       },
       /**
-       * 像素分辨率开关（V1）：测试与 A/B 截图用。
-       * `pixelated: false` 时回到原生分辨率——用来断言「关掉像素化画面仍非空白」。
+       * 像素分辨率开关（V1，V2 解耦）：`pixelated` 只管最近邻/平滑，`upscale` 管内部分辨率。
+       * 两个旋钮独立可断言——`visual.spec.ts` 专门钉「关最近邻不改倍率」。
        */
       setPixelScale: (patch: { targetHeight?: number; upscale?: number | null; pixelated?: boolean }) => {
         if (patch.targetHeight !== undefined) this.tuning.pixelTargetHeight = patch.targetHeight;
@@ -2538,6 +2539,21 @@ export class Game {
           max: [number, number, number];
           normal: [number, number, number];
           profile: Array<[number, number]>;
+          /**
+           * 这件**吃不吃倒角**（S25）。由 `cabinetBoxMesh()` 亲手挂进 `userData`，
+           * 也就是「几何会不会理你」的同一个事实 —— 判据据此断言「剖面挤出件改了倒角
+           * 顶点数不许变」，而不是再抄一份直角盒名单。
+           */
+          bevelable: boolean;
+          /**
+           * 顶点数（S25）：倒角唯一**看得见**的观测通道。
+           *
+           * ⚠️ 半径**没有**任何观测通道 —— `RoundedBoxGeometry` 始终把外尺寸做满，
+           * 包围盒一格不变（`cabinet` 判据的「解析盒 = 实测盒」正是靠这一点才不会被
+           * 倒角搞红）。所以「面板拖了到底生没生效」只能数顶点：分段数一变顶点必变，
+           * 半径那一条要靠 `?model` 的截图人眼核。
+           */
+          vertices: number;
         }> = [];
         const vertex = new THREE.Vector3();
         this.tableGroup?.traverse((child) => {
@@ -2573,6 +2589,8 @@ export class Game {
             max: [box.max.x, box.max.y, box.max.z],
             normal: [normal.x, normal.y, normal.z],
             profile,
+            bevelable: mesh.userData.bevelable === true,
+            vertices: mesh.geometry?.getAttribute?.('position')?.count ?? 0,
           });
         });
         return out;
@@ -2617,6 +2635,9 @@ export class Game {
       modelModeReset: () => this.modelMode?.resetForTest(),
       modelModeSelect: (part: string) => this.modelMode?.selectForTest(part) ?? false,
       modelModeOutlineCount: () => this.modelMode?.outlineCount() ?? -1,
+      // 「挂了几条线」与「那些线在不在场景里」是两件事：前者查不出重建把
+      // `ModelMode.shell` 换成游离节点这件事（见 `ModelMode.shellAttached()`）。
+      modelModeShellAttached: () => this.modelMode?.shellAttached() ?? null,
       /**
        * V4：币面贴图的实际纹素与采样设置。
        * 把「贴图本身对不对」与「渲染对不对」切开——币的颜色链路有四层，
@@ -3562,6 +3583,7 @@ export class Game {
    * 「图标糊不糊」在截图上只能反推（是窗口太小？贴图被缩放？倍率档位不对？），
    * 读出来就是一组数。`iconBackPixels` 的设计目标是 **32**（32×32 图标 1:1）：
    *   0.34 m 窗 × 191 CSS px/m ÷ upscale 2 ≈ 32.5
+   * 默认档 upscale 1 时同一个数是 66.7（图标被放大两倍多，非 1:1），所以
    * 判据写「≥ 24」而不是「=== 32」——降档时 `upscale` 变大会把它压小，
    * 那是画质分档的正常行为，不是缺陷。
    *
