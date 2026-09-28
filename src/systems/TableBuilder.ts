@@ -18,6 +18,7 @@ import {
   createArcaneScoreLineTexture,
 } from '../render/cabinetTexture';
 import { marqueeScreen } from '../render/marqueeScreen';
+import { surfaceNormalMap } from '../render/normalMaps';
 
 /**
  * 机柜件的默认圆角半径（米）。
@@ -894,6 +895,12 @@ function cabinetMaterials(): {
         // V3：护栏是金属件，走各向异性拉丝。
         ...ROLE_DETAIL.rail,
         ...ROLE_RIM.rail,
+        // R2-T1 末项：拉丝金属的**法线扰动**。挑 `rail` 而不挑别的件，是因为
+        // 「拉丝」这件事以前只作用在**颜色**上（detail 乘 albedo），受光仍是整块同色，
+        // 近看还是贴片；法线扰动是唯一能让它出现真实明暗起伏的手段。
+        // ⚠️ 这一行会把程序数从 24 抬到 25（`USE_NORMALMAP_TANGENTSPACE`）——
+        //   这是 R2 里唯一被允许破例的一项，判据只看程序数，涨到 ≥ 29 就整块撤掉。
+        normalMap: surfaceNormalMap('brushed'),
       }),
       trim: makeToonMaterial({
         name: 'trim',

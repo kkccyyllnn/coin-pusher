@@ -78,6 +78,16 @@ export type ToonMaterialParams = {
    * 而且背板一旦进暗部（色带掉到最低档）图标也不会跟着黑掉。
    */
   emissiveMap?: THREE.Texture | null;
+  /**
+   * 切线空间法线图（R2-T1 最后一项）。
+   *
+   * ⚠️ **这是本工厂唯一一个会多编译一份程序的参数**：设了它就点亮
+   * `USE_NORMALMAP_TANGENTSPACE`，与其余「加 uniform 不加 define」的扩参不同。
+   * 所以它单独成一次提交，判据只看程序数（24 → 25 可接受，涨到 ≥ 29 整块撤掉）。
+   *
+   * 只对**已经挂 `map`** 的面给：切线帧要 UV，无 map 的件挂它会同时引入两个新变量。
+   */
+  normalMap?: THREE.Texture | null;
   transparent?: boolean;
   opacity?: number;
   side?: THREE.Side;
@@ -154,6 +164,7 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
       (material.map as unknown as { channel?: number }).channel ?? 0;
   }
   if (params.emissiveMap) material.emissiveMap = params.emissiveMap;
+  if (params.normalMap) material.normalMap = params.normalMap;
   if (params.emissive !== undefined) {
     material.emissive = new THREE.Color(params.emissive);
     material.emissiveIntensity = params.emissiveIntensity ?? 1;
