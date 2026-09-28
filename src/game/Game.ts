@@ -2,52 +2,109 @@ import * as THREE from 'three';
 import { InputController, type LaneInput, type LaneMode } from '../core/InputController';
 import { Loop } from '../core/Loop';
 import { createRenderer, resizeRenderer } from '../core/Renderer';
+import {
+  PIXEL_SCALE_DEFAULTS,
+  applyPixelated,
+  readPixelOverride,
+  resolvePixelScale,
+  type PixelScale,
+  type PixelScaleSettings,
+} from '../render/PixelScale';
+import { iconReport } from '../render/iconTexture';
+import {
+  applyCameraRig,
+  cameraRig,
+  cameraRigReport,
+  fitCameraRig,
+  placeCameraRig,
+  syncCameraRigAngles,
+  toRad,
+} from '../render/cameraRig';
+import { rampLutCount } from '../render/RampLut';
+import { makeToonMaterial, isLitMaterial, rimStrengthOf, type LitMaterial } from '../render/ToonMaterial';
+import {
+  createArcaneHotZoneTexture,
+  createArcaneMarqueeTexture,
+  createArcaneScoreLineTexture,
+  type ArcanePaletteKey,
+} from '../render/cabinetTexture';
 import { Coin } from '../entities/Coin';
 import { CoinPool } from '../entities/CoinPool';
 import { Pusher } from '../entities/Pusher';
-import { AudioSystem } from '../systems/AudioSystem';
+import { AudioSystem, type SelectorKey, SELECTORS } from '../systems/AudioSystem';
+import { AUDIO_EVENTS, audioEventNames, auditionEvent, findAudioEvent } from '../systems/audioCatalog';
 import { CollectionPanel } from '../systems/CollectionPanel';
+import { CoinSpray } from '../systems/CoinSpray';
 import { DebugTools, createDefaultTuning, type GameTuning } from '../systems/DebugTools';
+import { ModelMode } from '../systems/ModelMode';
 import { Hud, type MechanismSnapshot } from '../systems/Hud';
 import { Mechanisms, MECHANISM_COST } from '../systems/Mechanisms';
-import { ShowDirector, type ShowId } from '../systems/ShowDirector';
+import { BOOST_OVERFLOW_FALLBACK, ShowDirector, type ShowId } from '../systems/ShowDirector';
 import { MotionPrefs } from '../systems/MotionPrefs';
 import { PerformanceGovernor, type QualityTier } from '../systems/PerformanceGovernor';
 import { PhysicsWorld } from '../systems/PhysicsWorld';
 import { RunState } from '../systems/RunState';
 import { SaveStore } from '../systems/SaveStore';
 import { SlotMachine } from '../systems/SlotMachine';
-import { applyCabinetSkin, buildTable } from '../systems/TableBuilder';
+import {
+  applyCabinetSkin,
+  buildCabinetShell,
+  buildTable,
+  disposeCabinetShell,
+  FEEDBACK_EMISSIVE,
+} from '../systems/TableBuilder';
+import type { CabinetSkin } from './cosmetics';
 import { Telemetry } from '../systems/Telemetry';
 import { RAPIER } from '../systems/PhysicsWorld';
 import { createSeededRandom } from '../utils/random';
-import { COLORS, COIN, COIN_KIND, ENDLESS, RULES, TABLE, type CoinKind } from './constants';
+import { setCoinTexelScale } from '../utils/coinTexture';
+import {
+  COLORS,
+  COIN,
+  COIN_KIND,
+  COIN_KINDS,
+  DRAIN,
+  REFILL,
+  ENDLESS,
+  RULES,
+  TABLE,
+  baseChips,
+  kindSpec,
+  type ClimaxTone,
+  type CoinKind,
+} from './constants';
 import { cabinetSkinById, coinSkinById } from './cosmetics';
+import {
+  CABINET_SHELL_PARTS,
+  cabinetPartBox,
+  cabinetShape,
+  cabinetWallOutline,
+  isCabinetOverridden,
+  type Box3Like,
+} from './cabinetShape';
+import { COIN_SCALE } from './coinScale';
+import { coinPhysics } from './coinPhysics';
 import { BET_TIERS, betTier, crossingReturn } from './economy';
-import { endlessLevel, type EndlessConfig } from './endless';
-import { layoutValue } from './layout';
-import { xixiSlot, type SlotSymbol } from './xixi';
-
-/**
- * 镜头取景框。
- *
- * 竖直方向同时受机台高度与纵深影响——俯角越大，纵深在画面里占的高度越多。
- * `verticalExtent` 是取景框在「相机上方向」上的投影长度，已经含 12% 余量，
- * 并把中心向下偏置，免得币床和得分线被底部 HUD 压住。
- *
- * 推导（俯角 26°，机台取 y∈[-0.06,1.55]、z∈[-1.05,1.45]）：
- *   投影极值 u = y·cos - z·sin → [-0.690, 1.853]，跨度 2.543
- *   加上余量与下偏置后取 2.8，中心 u 由 0.582 下移到 0.398
- *   反解出 lookAt = (0, 0.54, 0.20)；此时落币口在画面上沿 93%、得分线在 64%、托盘在 81%，
- *   上下都留出了空间给 HUD。
- */
-const CAMERA_FIT = {
-  halfWidth: 0.95,
-  verticalExtent: 2.8,
-  centerY: 0.54,
-  centerZ: 0.2,
-  pitch: (26 * Math.PI) / 180,
-};
+import { endlessCapacity, endlessLevel, type EndlessConfig } from './endless';
+import { crossingFeedback, FEEDBACK, flyTier, type FeedbackCounts } from './feedback';
+import {
+  LAYER_STEP,
+  MAX_JITTER,
+  MIN_SPACING,
+  MIN_STEP,
+  REST_Y,
+  insideDrain,
+  isOnDeckVolume,
+  layoutSummary,
+  layoutValue,
+} from './layout';
+import {
+  reelFacesFor,
+  rollSlotOutcome,
+  xixiSlot,
+  type SlotOutcome,
+  type SlotSymbol,
+} from './xixi';
 
 /** 高于此高度视为「在途」，收尾时先等它们落到台面。 */
 const IN_FLIGHT_Y = 0.55;
@@ -60,6 +117,24 @@ const FLASH_SECONDS = 0.22;
 const FLASH_PEAK = 0.85;
 
 /**
+ * 落定判定：下坠速度低于此值才算"正在下落"（米/秒）。
+ *
+ * 取 -0.35 是为了把「真的掉下来」与「被推板/币堆横向挤动」分开——
+ * 后者 vy 接近 0，不该发落定音，否则整个币床一被推就会响成一片。
+ */
+const LANDING_FALL_VY = -0.35;
+/** 撞击速度低于此值时算"重撞"（砸进币堆深处），否则是轻触台面。 */
+const LANDING_HEAVY_VY = -1.2;
+
+/**
+ * XIXI 槽位命中时，推板前缘标牌的爆闪时长（秒）。
+ *
+ * 比 `FLASH_SECONDS` 长一倍：那个闪的是材质自发光（一眼就能看到），
+ * 这个闪的是推板立面上一块 12 厘米高的实例颜色，短了会读不出来。
+ */
+const XIXI_FLASH_SECONDS = 0.45;
+
+/**
  * 编排层：持有世界、实体与规则，按固定顺序推进。
  *
  * 更新顺序：输入意图 → 固定步长物理 → 通道/出口事件 → 得分与返币 → 胜负状态 → HUD。
@@ -70,16 +145,41 @@ export class Game {
   private readonly camera = new THREE.PerspectiveCamera(42, 1, 0.05, 40);
   private readonly hud = new Hud();
   private readonly audio = new AudioSystem();
+  /**
+   * UI 点击音。
+   *
+   * 用**事件委托**挂在 document 上，而不是给每个按钮单独绑：按钮分散在
+   * `Hud`（静态）与 `CollectionPanel`（图鉴卡片，运行时才创建）两处，
+   * 逐个绑既容易漏、又要给两个类都塞一份音频依赖。委托一行覆盖全部。
+   */
+  private readonly onDocumentClick = (event: MouseEvent): void => {
+    const target = event.target as Element | null;
+    if (!target?.closest?.('button')) return;
+    // 调试面板里的按钮不发声：那是调试操作，不是玩法输入。试听按钮本身已经够响了，
+    // 再叠一声 UI 点击只会干扰判断。
+    if (target.closest('.lil-gui')) return;
+    this.audio.uiClick();
+  };
   private readonly save = new SaveStore();
   private readonly tuning: GameTuning = createDefaultTuning();
+  /** 上一次已逐枚施加到币上的物理参数指纹，避免 `applyTuning` 每次都遍历 700 枚币。 */
+  private appliedCoinPhysics = '';
   private readonly loop: Loop;
 
   private readonly physics: PhysicsWorld;
   private readonly coins: CoinPool;
   private readonly pusher: Pusher;
-  /** 四个机关：扫板 / 抓斗 / 后装填 / 风险转轮。 */
+  /** 三个机关：扫板 / 抓斗 / 后装填（P7 起风险转轮已删除）。 */
   private readonly mechanisms: Mechanisms;
   private readonly shows: ShowDirector;
+  /**
+   * 纯视觉币通道（S16）：喷泉演出时从机柜顶部溢流口喷出去、飞到机柜外的筹码。
+   *
+   * **它不是「另一个币池」**：没有刚体、不进账本、不进 `processOutcomes`。
+   * 持有在 `Game` 而不是 `ShowDirector` 上，是因为在飞的币必须活过演出本身
+   * （`TimedShow.dispose()` 会把自己挂的 Mesh 全拆掉，装置一结束币就没了）。
+   */
+  private readonly spray: CoinSpray;
   private readonly slotMachine: SlotMachine;
   /**
    * XIXI 四槽亮灭（P5）。**不进 RunState**：它是跨局持续的收集进度
@@ -91,10 +191,28 @@ export class Game {
   private readonly input: InputController;
   private readonly debugTools: DebugTools;
   private readonly governor = new PerformanceGovernor();
+  /**
+   * 像素分辨率的求解入参（V1）。
+   *
+   * **真源是 `tuning.pixelTargetHeight` / `tuning.pixelated`**（调参面板与画质分档都写它），
+   * 这个对象只是每帧同步一次的稳定容器——避免每帧分配，也让 `resolvePixelScale` 是纯函数。
+   */
+  private readonly pixelSettings: PixelScaleSettings = { ...PIXEL_SCALE_DEFAULTS };
+  /** 由 CSS 尺寸与 `pixelSettings` 解出的当前内部渲染尺寸（诊断与截图断言要读）。 */
+  private pixelScale: PixelScale = resolvePixelScale(1, 1, PIXEL_SCALE_DEFAULTS);
   private readonly collection: CollectionPanel;
   private readonly telemetry = new Telemetry();
   private drainRecorded = false;
   private tableGroup: THREE.Group | null = null;
+  /**
+   * 机柜外壳那一具（S24）。
+   *
+   * 只有 `?model` 模型模式会碰它 —— 那是唯一允许「参数改了就整具换掉」的部件。
+   * 非 `?model` 下它只是个长期不动的引用，零成本。
+   */
+  private cabinetShell: THREE.Group | null = null;
+  /** 模型模式（`?model`）。非该模式下为 null。 */
+  private modelMode: ModelMode | null = null;
   /** 钉阵长度信息：网格长度是显示值，碰撞体长度是物理值，刻意不同。 */
   private readonly pegs = { count: 0, colliderHalfLength: 0, visualHalfLength: 0 };
   /** 选位遥测：上一帧的模式与采样计时。 */
@@ -103,9 +221,12 @@ export class Game {
   /** 最近一帧的输入意图，供诊断对象读取（选位模式、落点）。 */
   private lastIntent: LaneInput | null = null;
   /** 落币口材质：投币时闪一下。 */
-  private spitterMaterial: THREE.MeshStandardMaterial | null = null;
+  private spitterMaterial: LitMaterial | null = null;
   /** 正在衰减的自发光闪烁（材质 → 基准强度与剩余时间）。 */
-  private readonly flashes = new Map<THREE.MeshStandardMaterial, { base: number; life: number }>();
+  private readonly flashes = new Map<LitMaterial, { base: number; life: number }>();
+  /** XIXI 命中爆闪：命中的槽位与剩余时间（写的是推板标牌的 `instanceColor`）。 */
+  private xixiFlashSlot = -1;
+  private xixiFlashTimer = 0;
 
   private run: RunState;
   private readonly config: EndlessConfig;
@@ -121,6 +242,38 @@ export class Game {
   private hotZoneStrip: THREE.Mesh | null = null;
   private hotZoneX = 0;
   private hotZoneDir: 1 | -1 = 1;
+  /**
+   * 得分反馈的三个衰减量（P10 ⑨），取值 0~1，每帧按固定速率落回 0。
+   *
+   * 用**一个 0~1 的标量 + 线性衰减**而不是三条 CSS/`setTimeout` 动画：
+   * 它们要驱动的都是 3D 材质的 `emissiveIntensity`，而那个值必须**每帧连续**——
+   * 交给 DOM 动画就会出现「暂停时特效还在跑」（渲染循环停了、动画没停），
+   * 而暂停是全局约定（`paused` 冻结一切）。挂在 `update()` 上天然与它一致。
+   */
+  private scoreLinePulse = 0;
+  private hotZoneFlash = 0;
+  private drainFlashLevel = 0;
+  /** 三个反馈材质的引用（P10 ⑨）：脉冲直接改 `emissiveIntensity`。 */
+  private scoreLineMaterial: LitMaterial | null = null;
+  private hotZoneMaterial: LitMaterial | null = null;
+  /** 洞口闪光走的是**排水口格栅**自己的自发光（不另建网格，见 `TableBuild`）。 */
+  private drainGrateMaterial: LitMaterial | null = null;
+  /**
+   * 反馈计数（判据读它，**不读截图**）。
+   *
+   * 「连落 3 有没有真的脉冲」「热区命中是不是真的走了一条不同的路」这类问题
+   * 在截图上只能靠肉眼反推；分成几档、各发生了几次是可枚举的事实。
+   * 计数与视觉**同源**：两个都在 `settleCrossing` 里、由同一个
+   * `crossingFeedback()` 结果驱动，所以计数不会和画面分叉。
+   */
+  private readonly feedbackCounts: FeedbackCounts = {
+    flyNormal: 0,
+    flyBig: 0,
+    comboPulse: 0,
+    comboClimax: 0,
+    hotHit: 0,
+    drainFlash: 0,
+  };
   private rng = createSeededRandom(1);
   private seedOverride: number | null = null;
 
@@ -134,6 +287,25 @@ export class Game {
   private restTimer = 0;
   private settleWindow = 0;
   private anomalyCount = 0;
+  /**
+   * 掉进币床前侧角下水道的币数（P10 的「汇」，见 `DRAIN`）。
+   *
+   * **它和 `anomalyCount` 是两件事**：排水是设计好的合法损失，异常是缺陷。
+   * 两者都让盘面少一枚币，所以判据必须分开读——混在一起就再也分不清
+   * 「洞开得太大」和「求解器又把币甩出去了」。
+   */
+  private drainCount = 0;
+  /**
+   * 自动补币（P10 ⑦）：本局已触发的补货次数、冷却计时、盘点计时与最近一次读数。
+   *
+   * `bedCoins` 每 `REFILL.checkEvery` 秒刷一次（不是每帧），诊断直接发布它——
+   * 所以**它是「上一轮盘点」的值，不是当帧值**。判据要读它就得先等一个盘点周期，
+   * 否则会读到补币前的旧值而误判成「补币没生效」。
+   */
+  private refillCount = 0;
+  private refillCooldown = 0;
+  private refillTimer = 0;
+  private bedCoins = 0;
   /**
    * 最近几次「异常」发生时那枚币在哪。诊断用，最多留 12 条。
    *
@@ -167,15 +339,35 @@ export class Game {
   private settledCoins = 0;
   private drainPromptVisible = false;
   private readonly laneMarker = new THREE.Group();
-  /** 镜头基准位置（取景算出来的），抖动在此基础上叠加。 */
+  /**
+   * 镜头基准位置（`fitCamera()` 按取景算出来的）。
+   *
+   * ★ S16 起相机**完全静止**：这里原先叠加过两路运动（中币的镜头抖动、
+   * 推板前推时的 2 毫米台面微震），两者都已按用户要求删除。
+   * 现在 `cameraBase` 只作为 `trackCameraOffset()` 的比较基准存在。
+   */
   private readonly cameraBase = new THREE.Vector3();
-  /** 高潮反馈的镜头抖动强度，随时间衰减。 */
-  private shake = 0;
+  /**
+   * 相机偏离基准位置的**峰值**（米），本局内取最大值。
+   *
+   * 存在的理由：S16 里用户先后要求删掉相机上的两路运动（中币的镜头抖动、
+   * 推板前推时的 2 毫米台面微震），而那是一个**只能靠逐帧观测发现的静默回归** ——
+   * 有人把它加回来时，截图看不出来（抖的是运动，静止帧完全一样），
+   * 而 `camera.position` 也不在诊断快照里。
+   * 所以这里把峰值记下来，`feedbackReport()` 交出去给判据断言**恒为 0**。
+   */
+  private cameraPeakOffset = 0;
+  /** S18：单帧 draw call 峰值，cabinet-tex 模式拿来对位 perf 上限。 */
+  private rendererPeakDrawCalls = 0;
 
   private constructor(canvas: HTMLCanvasElement, physics: PhysicsWorld) {
     this.physics = physics;
     this.renderer = createRenderer(canvas);
     this.renderer.toneMappingExposure = this.tuning.exposure;
+
+    // ★ 币面分辨率倍率必须在**建币池之前**写进全局 —— `CoinPool` 构造时就按
+    // `coinTexels()` 把六种币的贴图烘出来了，晚一步设就是「第一局还是糊的」。
+    setCoinTexelScale(this.tuning.coinTexelScale);
 
     this.input = new InputController(
       canvas,
@@ -185,13 +377,15 @@ export class Game {
       this.getElement('#sweeper-button'),
       this.getElement('#grapple-button'),
       this.getElement('#reload-button'),
-      this.getElement('#wheel-button'),
       this.getElement('#bet-button'),
     );
 
     this.coins = new CoinPool(physics.world);
     this.pusher = new Pusher(physics.world);
     this.mechanisms = new Mechanisms(this.coins);
+    // 视觉币的材质与币池的铜币材质同源（`createCoinMaterial('bronze', skin)`），
+    // 所以这里用币池当前的外观初始化，之后每次换肤都要跟着换（见 `applyCoinSkin` 调用点）。
+    this.spray = new CoinSpray(this.coins.currentSkin);
     this.shows = new ShowDirector({
       coins: this.coins,
       telemetry: this.telemetry,
@@ -199,6 +393,7 @@ export class Game {
       now: () => this.elapsed,
       rng: () => this.rng(),
       reducedMotion: () => this.motion.reduced,
+      spray: this.spray,
     });
     this.slotMachine = new SlotMachine({
       shows: this.shows,
@@ -209,16 +404,80 @@ export class Game {
       reducedMotion: () => this.motion.reduced,
       grantBoost: () => this.run.grantBoost(),
       onBoostReady: () => this.audio.boostReady(),
+      // 胡萝卜四连的罚款：走 `RunState.fineChips`（内部仍走唯一的扣减入口
+      // `spendChips`，另记 `fines` 供对账）。**不新增账本项**——恒等式一字不改。
+      fineChips: (amount) => this.run.fineChips(amount),
+      onReveal: (outcome) => this.audio.slotReveal(outcome.kind),
+      // 转动的机械声要覆盖整段转动（3.4~4.0 秒），所以把时长传下去让音效排程。
+      onSpinStart: (seconds) => this.audio.slotSpin(seconds),
     });
     // XIXI 进度从存档恢复：跨局持续，破产不清零。
     this.xixi = [...this.save.snapshot.xixi];
+
+    // ── 模型模式（S24）──
+    //
+    // ★ 必须在 `buildTable()` **之前**构造：它在构造函数里调
+    // `beginCabinetOverride()`，而 `buildTable()` 建外壳时读的就是那份覆盖。
+    // 顺序反了的表现是「刷新之后造型弹回默认、得再动一次滑块才回来」——
+    // 因为第一具外壳读到的是编译期默认值。
+    this.modelMode = new ModelMode(this.camera, this.renderer.domElement, {
+      rebuild: () => this.rebuildCabinetShell(),
+      applyCamera: () => this.applyCameraRigFromPanel(),
+    });
+    if (this.modelMode.enabled) {
+      // 模型模式下机位归用户。不交出所有权的话，改窗口尺寸 / FOV 会被
+      // `fitCamera()` 弹回默认视角 —— 就是面板上「改了没用」的那个老坑。
+      this.tuning.cameraAutoFit = false;
+    }
+
     const table = buildTable(physics.world);
+    // S24：外壳单独留一份引用 —— `?model` 模型模式要能把它整具拆掉重建。
+    // 台面 / 钉子 / 推板都与碰撞体绑定，**不参与**热重建（用户明确要求不动碰撞边界）。
+    this.cabinetShell = table.cabinetShell;
+    // ★ 必须在这里把首具外壳绑给模型模式。
+    //
+    // 漏了这一步的表现是：面板一切正常、数值一切正常，**但选中件不高亮**
+    // —— 因为 `ModelMode.shell` 还是 null，`findMesh()` 直接返回 null。
+    // 这个缺陷靠截图是发现不了的（1 像素的线在构图上本来就看不清），
+    // 是 `modelModeOutlineCount()` 把它抓出来的。
+    this.modelMode.attach(table.cabinetShell);
     this.pegs.count = table.pegCount;
     this.pegs.colliderHalfLength = table.pegColliderHalfLength;
     this.pegs.visualHalfLength = table.pegVisualHalfLength;
     this.hotZoneStrip = table.hotZoneStrip;
+    this.scoreLineMaterial = table.scoreLineMaterial;
+    this.hotZoneMaterial = table.hotZoneMaterial;
+    this.drainGrateMaterial = table.drainGrateMaterial;
 
-    this.debugTools = new DebugTools(physics.world, this.tuning, () => this.applyTuning());
+    this.debugTools = new DebugTools(
+      physics.world,
+      this.tuning,
+      () => this.applyTuning(),
+      {
+        onRefillWallet: () => {
+          this.save.refillWallet(100);
+          this.publishHud();
+          this.hud.setStatus(`已充值 100 筹码，当前钱包：${this.save.wallet}`);
+        },
+        onClearSave: () => {
+          this.save.clear();
+          this.xixi = [...this.save.snapshot.xixi];
+          this.collection.refresh();
+          this.applySkins();
+          this.publishHud();
+          this.hud.setStatus('已重置本地存档');
+        },
+        onCoinTexelChange: () => {
+          this.applyCoinResolution();
+        },
+        // S22：面板动完机位 → 只摆相机，不走 `applyTuning()`（那会顺带遍历 700 枚币）。
+        onCameraChange: () => {
+          this.applyCameraRigFromPanel();
+        },
+      },
+      // 调试面板的音效试听/上传挂载需要它（只有 `?debug` 时才会用到）。
+      this.audio,
+    );
 
     this.config = endlessLevel();
     // 占位实例：**真正的买入发生在构造函数末尾的 `startRun()` 里**，那一次才扣钱包。
@@ -233,6 +492,8 @@ export class Game {
       () => this.begForChips(),
       () => this.endRun(),
     );
+    // UI 点击音（事件委托，见 `onDocumentClick` 的注释）。
+    document.addEventListener('click', this.onDocumentClick);
 
     this.collection = new CollectionPanel(
       this.save,
@@ -240,6 +501,9 @@ export class Game {
         this.coins.applyCoinSkin(coinSkin);
         if (this.tableGroup) applyCabinetSkin(this.tableGroup, cabinetSkin);
         applyCabinetSkin(this.pusher.group, cabinetSkin);
+        // S18：Arcane 风贴图走 `map` 通道，挂在得分线 / 热区 / 招牌上；
+        // 切肤时只能重生成贴图并 swap 进材质（材质 instance 仍是同一份 ⇒ 不涨程序）。
+        this.applyCabinetMapTextures(cabinetSkin);
         this.hud.setStatus(`已换装：${coinSkin.name} · ${cabinetSkin.name}`);
       },
     );
@@ -250,7 +514,16 @@ export class Game {
       () => this.render(),
     );
 
-    resizeRenderer(this.renderer, this.camera, this.tuning.maxDpr);
+    // `?pixel=off` / `?pixel=2` 覆盖默认像素档（A/B 对比观感、真机调试用）。
+    // 数字是**显式倍率**（1 = 原生、2 = 半像素），不是目标高度——目标高度会被整数化吞掉。
+    // 注意：它只改**初始值**——画质分档真的换档时仍由 `applyQuality` 接管
+    // （换档要连续 2 个低帧窗口或 6 个高帧窗口，正常一局里不会发生）。
+    const pixelOverride = readPixelOverride(window.location.search);
+    if (pixelOverride.pixelated !== undefined) this.tuning.pixelated = pixelOverride.pixelated;
+    if (pixelOverride.upscaleOverride !== undefined) {
+      this.pixelSettings.upscaleOverride = pixelOverride.upscaleOverride;
+    }
+    this.applyPixelScale();
     this.fitCamera();
     this.startRun();
     this.installTestHooks();
@@ -268,10 +541,14 @@ export class Game {
 
   dispose(): void {
     this.loop.stop();
+    document.removeEventListener('click', this.onDocumentClick);
     this.input.dispose();
     this.audio.dispose();
     this.debugTools.dispose();
     this.coins.dispose();
+    // 视觉币通道（S16）：它自带一份圆柱几何与一份材质，**不是**币池的资源，
+    // 所以要单独释放 —— 漏了这一行会在重开游戏时漏掉几何体与一张贴图。
+    this.spray.dispose();
     this.renderer.dispose();
     window.__THREE_GAME_DIAGNOSTICS__ = undefined;
     window.__THREE_GAME_TEST_HOOKS__ = undefined;
@@ -286,7 +563,7 @@ export class Game {
       return;
     }
 
-    if (resizeRenderer(this.renderer, this.camera, this.tuning.maxDpr)) this.fitCamera();
+    if (this.applyPixelScale()) this.fitCamera();
 
     if (this.paused) {
       this.publishDiagnostics();
@@ -307,13 +584,19 @@ export class Game {
     this.coins.syncAll();
     this.processOutcomes();
     this.updateRunState(delta);
+    this.updateRefill(delta);
     this.laneMarker.position.x = intent.laneX;
     this.updateHotZone(delta);
+    this.updateFeedbackVisuals(delta);
     this.updateFlashes(delta);
+    this.updateXixiFlash(delta);
     this.shows.update(delta);
+    // 视觉币自己积分（没有 Rapier 刚体）。放在演出之后：演出这一帧刚喷出来的币
+    // 当帧就动起来，不会出现「先停一帧再飞」。
+    this.spray.update(delta);
     this.slotMachine.update(delta);
     if (this.pendingXixiSpin && this.slotMachine.spin()) this.pendingXixiSpin = false;
-    this.applyCameraShake(delta);
+    this.trackCameraOffset();
     if (this.governor.sample(delta)) this.applyQuality();
     this.debugTools.update();
     this.publishHud();
@@ -326,7 +609,7 @@ export class Game {
    * 动效只放大**物理已经发生的事**：投币闪落币口、加力闪推板前缘。
    * 不伪造结果，也不改任何数值。降动效时整段跳过。
    */
-  private flash(material: THREE.MeshStandardMaterial | null, base: number): void {
+  private flash(material: LitMaterial | null, base: number): void {
     if (!material || this.motion.reduced) return;
     this.flashes.set(material, { base, life: FLASH_SECONDS });
     material.emissiveIntensity = base + FLASH_PEAK;
@@ -402,48 +685,259 @@ export class Game {
   }
 
   /**
-   * 高潮反馈：得分链或高价值币触发短促镜头抖动。
-   * 爽感来自「币真的被推下去了」这件事本身，不靠遮屏特效。
+   * 高潮反馈：HUD 全屏闪色（连落 ≥ 5 的**白闪**优先于币种自身的色调）。
+   *
+   * ## ★ S16：这里**去掉了镜头抖动**
+   *
+   * 用户原话：「现在中币整个画面就会震荡，不要这个震动的动画」。
+   *
+   * 原先这个方法里还有一句 `this.shake = Math.max(this.shake, strength)`，
+   * 由 `applyCameraShake` 换算成 `strength² × 0.055` 米的相机位移 ——
+   * 强度 1 的币种（大赏 / 钻石 / 宝箱）一越线，**整个画面就跳 5.5 厘米**。
+   * 现在「中币」的反馈只剩 HUD 闪色与三个 3D 自发光脉冲，相机一动不动。
+   *
+   * `feedback.climax.strength` 这个字段**保留**：它是分级结果的公开契约
+   * （`crossingFeedbackProbe` 的判据核它 —— 「连落白闪的强度是 1」），
+   * 只是不再驱动相机。
    */
-  private triggerClimax(strength: number, kind: 'gold' | 'green'): void {
+  private triggerClimax(tone: ClimaxTone): void {
     if (this.motion.reduced) return;
-    this.shake = Math.max(this.shake, strength);
-    this.hud.flashClimax(kind);
+    this.hud.flashClimax(tone);
   }
 
-  private applyCameraShake(delta: number): void {
-    // 推板前推时台面微震：振幅 2 毫米，跟行程同相。刻意做得很小——
-    // 它是「机器在动」的触觉提示，不是特效，幅度大了会晕。
-    const rumble =
-      !this.motion.reduced && this.pusher.running && this.pusher.currentPhase === 'extend'
-        ? Math.sin(this.elapsed * 92) * 0.002
-        : 0;
+  /**
+   * 三个 3D 反馈的衰减（P10 ⑨）：得分线脉冲 / 热区爆闪 / 洞口闪光。
+   *
+   * ## 为什么挂在 `update()` 而不是各自起一个动画
+   *
+   * 它们改的都是材质的 `emissiveIntensity`，那个值必须**每帧连续**。
+   * 挂在渲染循环上有两个直接好处：
+   * ① 暂停（`paused`）时特效跟着停 —— 暂停是全局约定，DOM 动画不会遵守它；
+   * ② 峰值/基线全部读 `FEEDBACK_EMISSIVE`（`TableBuilder` 的同一份常量），
+   *    所以「脉冲回到基线」是精确的，不会因为浮点残留让得分线一直偏亮。
+   *
+   * 衰减速率取 `delta * 4.5`：约 0.22 秒落回，比一次飞字（0.42 秒）短——
+   * 反馈要**跟着因果**走，比币本身还慢的话就变成了背景噪声。
+   */
+  private updateFeedbackVisuals(delta: number): void {
+    const decay = delta * 4.5;
 
-    if (this.shake <= 0 && rumble === 0) {
-      this.camera.position.copy(this.cameraBase);
-      return;
+    if (this.scoreLinePulse > 0) {
+      this.scoreLinePulse = Math.max(0, this.scoreLinePulse - decay);
+      if (this.scoreLineMaterial) {
+        this.scoreLineMaterial.emissiveIntensity =
+          FEEDBACK_EMISSIVE.scoreLineBase +
+          (FEEDBACK_EMISSIVE.scoreLinePeak - FEEDBACK_EMISSIVE.scoreLineBase) * this.scoreLinePulse;
+      }
     }
-    this.shake = Math.max(0, this.shake - delta * 3.4);
-    const amplitude = this.shake * this.shake * 0.055;
-    const t = this.elapsed * 46;
-    this.camera.position.set(
-      this.cameraBase.x + Math.sin(t) * amplitude,
-      this.cameraBase.y + Math.sin(t * 1.7 + 1.3) * amplitude + rumble,
-      this.cameraBase.z,
+    if (this.hotZoneFlash > 0) {
+      this.hotZoneFlash = Math.max(0, this.hotZoneFlash - decay);
+      if (this.hotZoneMaterial) {
+        this.hotZoneMaterial.emissiveIntensity =
+          FEEDBACK_EMISSIVE.hotZoneBase +
+          (FEEDBACK_EMISSIVE.hotZonePeak - FEEDBACK_EMISSIVE.hotZoneBase) * this.hotZoneFlash;
+      }
+    }
+    if (this.drainFlashLevel > 0) {
+      // 洞口闪得比另外两个慢一档：它要表达的是「掉了」，需要多停一会儿才读得到。
+      // 基线与峰值同取 `FEEDBACK_EMISSIVE`：格栅平时是 0（不发光的黑铁），
+      // 所以这里是纯乘，回落到 0 就是真的回到不发光的常态。
+      this.drainFlashLevel = Math.max(0, this.drainFlashLevel - delta * 2.6);
+      if (this.drainGrateMaterial) {
+        this.drainGrateMaterial.emissiveIntensity =
+          FEEDBACK_EMISSIVE.drainPeak * this.drainFlashLevel;
+      }
+    }
+  }
+
+  /** 反馈计数 + 三个材质的**实时**自发光（判据读它：计数与画面必须同源）。 */
+  private feedbackReport(): {
+    counts: FeedbackCounts;
+    emissive: { scoreLine: number; hotZone: number; drainFlash: number };
+    /** 本局相机偏离基准位置的峰值（米）。相机已完全静止（S16），它应当恒为 0。 */
+    cameraPeakOffset: number;
+  } {
+    return {
+      counts: { ...this.feedbackCounts },
+      emissive: {
+        scoreLine: round3(this.scoreLineMaterial?.emissiveIntensity ?? 0),
+        hotZone: round3(this.hotZoneMaterial?.emissiveIntensity ?? 0),
+        drainFlash: round3(this.drainGrateMaterial?.emissiveIntensity ?? 0),
+      },
+      cameraPeakOffset: round3(this.cameraPeakOffset),
+    };
+  }
+
+  /**
+   * 相机偏移记账（每帧，**不移动相机**）。
+   *
+   * ## ★ 相机现在一动不动
+   *
+   * S16 里这里先后删掉了**两路**相机运动，都是用户要求的：
+   * 1. 中币的镜头抖动（`shake² × 0.055` 米，强度 1 时整个画面跳 5.5 厘米）——
+   *    「现在中币整个画面就会震荡，不要这个震动的动画」；
+   * 2. 推板前推时的 2 毫米台面微震（`sin(elapsed × 92) × 0.002`）—— 「微震也去掉」。
+   *
+   * 现在 `fitCamera()` 把位置同时写进 `camera.position` 与 `cameraBase` 之后，
+   * **再没有任何代码改过相机位置**。这个方法是那两路删除之后剩下的空壳。
+   *
+   * ## 为什么空壳也要留着
+   *
+   * 它只做一件事：把「相机偏离基准位置」的**峰值**记进 `cameraPeakOffset`，
+   * 由 `feedbackReport()` 交给判据断言恒为 0。
+   *
+   * 相机运动是**只能靠逐帧观测发现的静默回归** —— 抖的是运动，
+   * 静止截图完全看不出来（`shots` 模式与 `npx playwright test` 的截图断言都抓不到），
+   * 而 `camera.position` 也不在诊断快照里。没有这条记账，
+   * 以后有人把任何一路抖动加回来都不会被任何判据发现。
+   * 实测：改之前这条读数是 **0.055**，删完之后是 **0**。
+   */
+  private trackCameraOffset(): void {
+    this.cameraPeakOffset = Math.max(
+      this.cameraPeakOffset,
+      Math.abs(this.camera.position.x - this.cameraBase.x),
+      Math.abs(this.camera.position.y - this.cameraBase.y),
+      Math.abs(this.camera.position.z - this.cameraBase.z),
     );
+    this.rendererPeakDrawCalls = Math.max(
+      this.rendererPeakDrawCalls,
+      this.renderer.info.render.calls,
+    );
+  }
+
+  /**
+   * V2：材质族统计 + 色带数量 + 已编译程序数。
+   *
+   * 三个用途，都是**只能靠计数发现的静默缺陷**：
+   * 1. `toon` 数骤降 = 有人绕过了 `makeToonMaterial()`（裸建材质、或 `clone()` 掉了补丁）——
+   *    画面只是「差一点」，肉眼在截图里几乎看不出来。
+   * 2. `standard` 应恰好等于币的材质数（V4 之前币仍是标准材质）。
+   *    如果机柜类部件还在里面，说明有地方漏改了。
+   * 3. `programs` 是首帧编译爆炸的哨兵（风险 R4）：色带补丁的
+   *    `customProgramCacheKey` 是常量，所以 toon 材质无论多少个都只该编译 1~2 份程序。
+   */
+  private materialReport(): Record<string, number> {
+    const counts = { toon: 0, standard: 0, basic: 0, other: 0 };
+    // V3：按细节种类计数。漏传 `...ROLE_DETAIL.x` 时这里会少一种——
+    // 画面只是「少了一点纹样」，肉眼几乎看不出来，所以必须靠计数钉住。
+    const detailKinds: Record<string, number> = {};
+    // S16：带非零边缘光强度的材质数。**应当恰好 2**（钻石 + 宝箱）。
+    //
+    // 边缘光的 GLSL 是无条件注入给所有 toon 材质的（为了不新增 define ⇒ 不新增程序变体），
+    // 所以「哪几个材质真的有边缘光」这件事**完全由这个数表达**。它是 0 或 3 都说明
+    // 参数传错了，而画面上的表现只是「宝石看起来平了一点」——截图判不出来。
+    let rim = 0;
+    const seen = new Set<THREE.Material>();
+    this.scene.traverse((child) => {
+      if (!(child instanceof THREE.Mesh)) return;
+      const list = Array.isArray(child.material) ? child.material : [child.material];
+      for (const material of list) {
+        if (seen.has(material)) continue;
+        seen.add(material);
+        if (material instanceof THREE.MeshToonMaterial) {
+          counts.toon += 1;
+          const kind = String(material.defines?.SD_DETAIL_KIND ?? '?');
+          detailKinds[kind] = (detailKinds[kind] ?? 0) + 1;
+          if (rimStrengthOf(material) > 0) rim += 1;
+        } else if (material instanceof THREE.MeshStandardMaterial) counts.standard += 1;
+        else if (material instanceof THREE.MeshBasicMaterial) counts.basic += 1;
+        else counts.other += 1;
+      }
+    });
+    const flattened: Record<string, number> = { ...counts, ...detailKinds, rim };
+    flattened.total = seen.size;
+    flattened.ramps = rampLutCount();
+    flattened.programs = this.renderer.info.programs?.length ?? 0;
+    return flattened;
   }
 
   private applyQuality(): void {
     const settings = this.governor.current;
-    this.tuning.maxDpr = settings.maxDpr;
+    // 降档 = 像素更粗（targetHeight 更小 → 整数倍率更大），与像素美学同向：
+    // 不是「变糊」而是「更方块」。原来的 maxDpr 语义被它取代。
+    this.tuning.pixelTargetHeight = settings.pixelTargetHeight;
     this.renderer.shadowMap.enabled = settings.shadows;
     this.renderer.shadowMap.needsUpdate = true;
     this.coins.setCastShadow(settings.coinShadows);
+    if (this.applyPixelScale()) this.fitCamera();
     this.hud.setStatus(`画质已切到${settings.tier === 'high' ? '高' : settings.tier === 'medium' ? '中' : '低'}档`);
+  }
+
+  /**
+   * 重算并套用像素分辨率（V1）。返回画布 backing store 是否真的变了。
+   *
+   * 顺序：先从 `tuning` 同步入参（调参面板与画质分档都写 `tuning`）→
+   * 按 CSS 尺寸解出**整数倍率** → 写 `:root[data-pixel]` → `resizeRenderer`。
+   *
+   * `applyPixelated` 只改 CSS 的 `image-rendering`、不动布局，所以先调后调都安全。
+   */
+  private applyPixelScale(): boolean {
+    this.pixelSettings.targetHeight = this.tuning.pixelTargetHeight;
+    this.pixelSettings.pixelated = this.tuning.pixelated;
+    const canvas = this.renderer.domElement;
+    this.pixelScale = resolvePixelScale(canvas.clientWidth, canvas.clientHeight, this.pixelSettings);
+    applyPixelated(this.pixelScale.pixelated);
+    return resizeRenderer(this.renderer, this.camera, this.pixelScale);
   }
 
   private render(): void {
     this.renderer.render(this.scene, this.camera);
+  }
+
+  /**
+   * 这枚币此刻是否落在**推板顶面**（上层台面）上。
+   *
+   * 抽成一份判据是因为它有**两个读者**：输送本身（`fixedUpdate`）与诊断
+   * （`deckCoins`）。两边各写一遍的话，改判据时很容易只改一处，于是
+   * 「诊断说台面上没有币、输送却在送币」这种自相矛盾的读数就会一直挂着。
+   *
+   * ★ 实现走 `layout.isOnDeckVolume` —— **台面/币床的归属判据只有那一份**，
+   * `CoinPool.countBed()` 与 `assertLayoutValid` 也调它。
+   * S13 之前这里是「`y` 在 `TABLE.conveyor` 的高度带里 && z 在推板顶面区间里」，
+   * 那条高度带把币塔卡在 5 层；现在归属是**体积**问题（多了一条 z 条件，
+   * 而塔在 `z = 0.62`，不在体积里）。见 `isOnDeckVolume` 的注释。
+   *
+   * ★ 直接算、不读 `coin.onDeck`：那个标志只在 `fixedUpdate` 里更新，
+   * 而降动效会跳过 `fixedUpdate`（MEMORY 已记），于是诊断会恒读成 0。
+   */
+  private isOnDeck(coin: Coin): boolean {
+    const p = coin.position;
+    return isOnDeckVolume(p.x, p.y, p.z, this.pusher.topRange);
+  }
+
+  /** 停在推板顶面上的活跃币数（诊断用，判据见 `publishDiagnostics` 的 `deckCoins`）。 */
+  private countDeckCoins(): number {
+    let count = 0;
+    this.coins.forEachActive((coin) => {
+      if (this.isOnDeck(coin)) count += 1;
+    });
+    return count;
+  }
+
+  /**
+   * 追踪这枚币是否在下落，并在「下落 → 静止」的那一刻发落定音。
+   *
+   * 判据是 **vy 越过阈值**而不是位置高度：币可能落在币堆顶上（位置很高）、
+   * 也可能直接落在床面，位置阈值没法通用；而"正在下落"这件事两种情形一致。
+   *
+   * 用 `fallVy` 记录本次下落的**最负速度**（见 `Coin.fallVy`）：落地那一子步
+   * vy 已经归零，只有峰值能反映撞击力度。
+   */
+  private trackFall(coin: Coin): void {
+    const vy = coin.body.linvel().y;
+    if (vy < LANDING_FALL_VY) {
+      if (vy < coin.fallVy) coin.fallVy = vy;
+      return;
+    }
+    this.resolveLanding(coin);
+  }
+
+  /** 若这枚币刚结束一次下落就发落定音；没在下落则什么都不做（绝大多数币走这条）。 */
+  private resolveLanding(coin: Coin): void {
+    if (coin.fallVy >= 0) return;
+    const heavy = coin.fallVy < LANDING_HEAVY_VY;
+    coin.fallVy = 0;
+    this.audio.landing(heavy ? 'heavy' : 'light');
   }
 
   /** 物理子步：只做必须在 world.step() 之前完成的写入。 */
@@ -464,8 +958,17 @@ export class Game {
     // 于是下一子步不会带着这个速度继续积分。睡着的币不参与积分，跳过它们
     // （满盘静置时绝大多数币都在睡，这个判断把开销从 318 枚降到个位数）。
     this.coins.forEachActive((coin) => {
-      if (coin.body.isSleeping()) return;
-      const spike = coin.clampSpeed(COIN.maxSpeed, COIN.maxUpwardSpeed);
+      // ★ 落定检测必须在 isSleeping 提前返回**之前**：币停稳的那一子步往往正好
+      // 进入 sleeping，先 return 就永远看不到「下落 → 静止」的转变，落定音会整段丢失。
+      if (coin.body.isSleeping()) {
+        this.resolveLanding(coin);
+        return;
+      }
+      this.trackFall(coin);
+
+      // 读注册表而不是 `COIN.*` 常量：这两个护栏要能被调试面板实时改，
+      // 而且注册表是唯一真源（`applyCoinPhysics` 把调参值写进去）。
+      const spike = coin.clampSpeed(coinPhysics.maxSpeed, coinPhysics.maxUpwardSpeed);
       if (spike > 0) {
         this.spikeClamps += 1;
         if (spike > this.peakSpikeSpeed) this.peakSpikeSpeed = spike;
@@ -474,12 +977,18 @@ export class Game {
 
     // 台面输送：只作用于确实落在推板顶面上的币。
     // 速度以推板为参考系，所以推板回撤时币在世界里会跟着后退——和真机一致。
+    //
+    // ★ 2026-09-24 起 `conveyorSpeed = 0`（用户拍板「把输送速度改成 0.85→0、摩擦不改」）。
+    // 归零的**正确实现是不施加**，不是让 `targetSpeed` 退化成 `pusher.velocityZ`——
+    // `applyConveyor` 会把币的 z 速度直接拉成 targetSpeed，那样等于**每子步把币焊在推板上**
+    // （相对滑动恒为 0），比原来的「向前推」更不物理。所以这里对 0 短路，
+    // 台面上的币只受真实接触力（推板往复的摩擦拖曳 + 后来落下的币的碰撞）。
+    const conveyoring = this.tuning.conveyorSpeed !== 0;
     const targetSpeed = this.pusher.velocityZ + this.tuning.conveyorSpeed;
-    const { back, front } = this.pusher.topRange;
+    const { front } = this.pusher.topRange;
     this.coins.forEachActive((coin) => {
       const p = coin.position;
-      const onDeck =
-        p.y >= TABLE.conveyor.minY && p.y <= TABLE.conveyor.maxY && p.z >= back && p.z <= front;
+      const onDeck = this.isOnDeck(coin);
       const wasOnDeck = coin.onDeck;
       coin.onDeck = onDeck;
 
@@ -495,13 +1004,18 @@ export class Game {
       }
 
       if (!onDeck) return;
-      // 台面输送**只负责把玩家投下的币送到币床**。
+      if (!conveyoring) return;
+      // 台面输送**只对开局预置的上层币让路**（`Coin.preset`）。
       //
       // 预置的上层币刻意不吃这一口：它们的唯一动力是推板顶面的摩擦，
       // 于是随着推板前后滑动、停在原地——「推币台上下都有金币」的观感才留得住。
-      // 如果预置币也吃输送（0.85 m/s、离前缘只有 0.12 米），它们会在不到一秒内
-      // 被整片冲下前缘，上层瞬间空掉（P2 的「上层倾泻 < 15%」就是量这一条）。
-      if (!coin.playerDropped) return;
+      //
+      // ★ **运行期注入的币（闸门 / 喷泉 / 塔 / 大赏）一律要吃**：
+      // 它们落在推板顶面上，不吃输送就永远下不来。这条以前写成
+      // `if (!coin.playerDropped) return;`——在只有预置币的年代恰好等价，
+      // 而 P10 把 `gate` 接成自动补币之后，闸门吐的 7 枚币全被判成
+      // 「不是玩家投的」→ 原地停在顶面 → 补币一枚都没到币床（见 `Coin.preset`）。
+      if (coin.preset) return;
       coin.applyConveyor(targetSpeed);
     });
   }
@@ -520,7 +1034,6 @@ export class Game {
     if (intent.sweepPressed) this.trySweep();
     if (intent.grapplePressed) this.tryGrapple(intent.laneX);
     if (intent.reloadPressed) this.tryReload();
-    if (intent.wheelPressed) this.tryWheel();
     if (intent.betPressed) this.cycleBet();
   }
 
@@ -586,31 +1099,6 @@ export class Game {
     return true;
   }
 
-  /** 风险转轮：收尾时把剩余额度押上去，三格结果由概率决定。 */
-  private tryWheel(): boolean {
-    if (this.run.phase !== 'drainOut') return false;
-    if (this.run.chips <= 0) {
-      this.hud.setStatus('没有可押的筹码');
-      return false;
-    }
-    const wagered = this.run.chips;
-    const result = this.mechanisms.spin(wagered);
-    if (!result.ok) {
-      this.hud.setStatus(result.reason ?? '转轮不可用');
-      return false;
-    }
-    // 押上的筹码一律没收：这是赌注，不是消费。
-    this.run.spendChips(wagered);
-    const label =
-      result.outcome === 'front'
-        ? `直落前沿：${result.affected} 枚币压到了得分线前`
-        : result.outcome === 'reload'
-          ? `转成后装填：${result.affected} 枚币落到了后区`
-          : '全部沉没：这一把没了';
-    this.hud.setStatus(`转轮：押上 ${wagered} 筹码 → ${label}`);
-    return true;
-  }
-
   /** 切换加注档位。 */
   private cycleBet(): boolean {
     this.betIndex = (this.betIndex + 1) % ENDLESS.bets.length;
@@ -624,7 +1112,6 @@ export class Game {
       sweeper: this.mechanisms.usesLeft('sweeper'),
       grapple: this.mechanisms.usesLeft('grapple'),
       reload: this.mechanisms.usesLeft('reload'),
-      wheel: this.mechanisms.usesLeft('wheel'),
     };
   }
 
@@ -687,7 +1174,7 @@ export class Game {
     coin.spawn('bounty', x, TABLE.pusherTopY + 0.5, z, this.rng() * Math.PI * 2, false);
     // 只在真的注入成功时计数：预算耗尽时 `acquire` 返回 null，那次没发生。
     this.run.noteBounty();
-    this.hud.setStatus(`金色大赏币注入：越线固定 +${ENDLESS.bountyChips} 筹码`);
+    this.hud.setStatus(`金色大赏币注入：越线固定 +${baseChips('bounty')} 筹码`);
     return true;
   }
 
@@ -713,6 +1200,44 @@ export class Game {
   private processOutcomes(): void {
     this.coins.forEachActive((coin) => {
       const p = coin.position;
+
+      // ★ **排水判定必须排在 anomaly 之前**（P10，见 `DRAIN`）。
+      //
+      // `DRAIN.yKill = -0.06` 远高于 anomaly 的 `y < -0.8`：顺序对了，掉进洞的币
+      // 在变成异常**之前**就被回收；顺序反了，`anomalies` 会随游戏时长单调上涨，
+      // 把「求解器还在不在造能量」那条真判据淹掉（那是一条靠 `spikeClamps` 才勉强
+      // 分辨得出的残留缺陷，多一路假阳性就彻底查不动了）。
+      //
+      // 也**排在得分判定之前**：洞的上界刻意压到 `TABLE.scoreLineZ` 以内，
+      // 币在洞里下落时 z 还没过线；万一将来有人把洞开到线外，
+      // 这个顺序仍然能保证「掉进去的币不会被算成入账」——
+      // 「掉进洞里还给了筹码」是这条机制最荒谬的失效形态。
+      //
+      // 后果上它是一次**合法的损失**：0 筹码、不计分、不算异常。它是 P10 的「汇」。
+      if (
+        p.y < DRAIN.yKill &&
+        Math.abs(p.x) > DRAIN.xMin &&
+        p.z >= DRAIN.zMin &&
+        p.z <= DRAIN.zMax
+      ) {
+        this.drainCount += 1;
+        this.telemetry.recordDrain({
+          side: p.x > 0 ? 1 : -1,
+          kind: coin.kind,
+          x: round3(p.x),
+          z: round3(p.z),
+          y: round3(p.y),
+          offset: round3(this.pusher.offset),
+          t: this.elapsed,
+        });
+        this.audio.drain();
+        // 洞口闪光（P10 ⑨）：与那声 `drain()` 是**同一件事的两路证据**。
+        // 只有声音的话，玩家在余光里看不到声源，会以为币是被挤没了；
+        // 而「没进（还在床上）」与「掉了（永久离开）」对盘面的影响方向相反。
+        this.drainFlashLevel = 1;
+        this.feedbackCounts.drainFlash += 1;
+        return true;
+      }
 
       // 穿模/掉出机柜：开发期记录为缺陷，不当作合法损失。
       if (p.y < -0.8 || Math.abs(p.x) > 1.3 || p.z < TABLE.pusherBackZ - 0.6) {
@@ -766,6 +1291,9 @@ export class Game {
     this.save.setXixi(this.xixi);
     this.telemetry.recordXixi({ phase: 'lit', slot, t: this.elapsed });
     this.audio.mark();
+    // 3D 标牌爆闪：写的是**实例颜色**，由 `publishHud` 每帧按剩余强度重算。
+    this.xixiFlashSlot = slot;
+    this.xixiFlashTimer = XIXI_FLASH_SECONDS;
 
     if (this.xixi.every(Boolean)) {
       this.xixi = [false, false, false, false];
@@ -825,15 +1353,52 @@ export class Game {
     this.hud.flashScore(outcome.chips);
     // 飞字必须从**真的越线位置**起飞，所以这里把币的世界坐标投影到屏幕。
     const from = this.toScreen(coin.position.x, coin.position.y, coin.position.z);
-    this.hud.flyScore(from.x, from.y, outcome.chips);
+
+    // ── 反馈分级（P10 ⑨）──────────────────────────────────────────────
+    //
+    // 「什么输入产生什么反馈」抽在 `crossingFeedback()` 里（纯函数），
+    // 这里只负责**执行**它给出的结论。所以判据可以枚举边界点核对全部分支，
+    // 而这里不会偷偷多出第四条分支。
+    const feedback = crossingFeedback({
+      chips: outcome.chips,
+      combo: combo.combo,
+      hot,
+      kindClimax: kindSpec(kind).climax,
+      // 被闸门拦下的币种不许闪自己的高潮（否则金闪 + 灰字 +0 = 画面说谎）。
+      // 连落白闪不受影响：那是玩家自己连推出来的。
+      blocked: outcome.blocked,
+    });
+
+    this.hud.flyScore(from.x, from.y, outcome.chips, feedback.flyTier);
+    this.feedbackCounts[feedback.flyTier === 'big' ? 'flyBig' : 'flyNormal'] += 1;
+
+    // 热区命中：专属音效 + 亮条爆闪。热区是**玩家瞄出来的**，
+    // 与普通越线同音同色的话，那条来回扫的亮条就只是装饰。
+    if (feedback.hotFlash) {
+      this.audio.hotHit();
+      this.hotZoneFlash = 1;
+      this.feedbackCounts.hotHit += 1;
+    }
+    if (feedback.scoreLinePulse) {
+      this.scoreLinePulse = 1;
+      this.feedbackCounts.comboPulse += 1;
+    }
+
     if (outcome.chips > 0 && (kind === 'payout' || kind === 'bounty')) this.audio.payoutReturn();
     if (combo.combo >= 3) this.hud.showCombo(combo.combo, COIN_KIND[kind].label);
 
-    // 反馈分级：没中的铜币只有小声；花纹筹码、连落和返币才是高潮反馈。
-    if (kind === 'bounty') this.triggerClimax(1, 'gold');
-    else if (combo.combo >= 5) this.triggerClimax(1, 'gold');
-    else if (kind === 'pattern') this.triggerClimax(0.55, 'gold');
-    else if (kind === 'payout') this.triggerClimax(0.75, 'green');
+    // 效果型币种（宝箱）：越线返 **0 筹码**，改派一场投放演出。
+    // 0 是硬值——这里绝不能写成负数，否则三账本恒等式会立刻报。
+    // 派发目标写在 `kinds.ts` 的 `payout.show` 里，这里不再手写币种名单。
+    const payoutRule = kindSpec(kind).payout;
+    if (payoutRule.mode === 'effect') this.shows.request(payoutRule.show);
+
+    // 高潮反馈：读分级结果（连落 ≥ 5 的**白闪**优先于币种自身的高潮定义）。
+    // 只驱动 HUD 闪色 —— 镜头抖动已在 S16 按用户要求删除（见 `triggerClimax`）。
+    if (feedback.climax) {
+      if (feedback.climax.reason === 'combo') this.feedbackCounts.comboClimax += 1;
+      this.triggerClimax(feedback.climax.tone);
+    }
   }
 
   // ── 状态机推进 ──────────────────────────────────────────────────────────
@@ -877,6 +1442,11 @@ export class Game {
     // 提示不再 return——破产弹窗必须能同时弹出（加力在沉降期仍能救命）。
     this.setDrainPrompt(this.run.canUseBoost);
 
+    // 演出期间**暂停收尾计时**（P7）。演出本身要花时间，不暂停的话
+    // 「加宽后的停板窗口」会被演出吃掉——玩家刚按下机关，窗口就在演出途中走完了。
+    // 暂停的只是**计时**：物理照跑、结算照记，所以这不是「暂停游戏」。
+    if (this.shows.busy) return;
+
     this.settleWindow += delta;
     this.restTimer = this.allResting() ? this.restTimer + delta : 0;
     if (this.restTimer >= RULES.restHold || this.settleWindow >= RULES.drainWindow) {
@@ -900,6 +1470,57 @@ export class Game {
         this.showRuin();
       }
     }
+  }
+
+  /**
+   * 自动补币（P10 ⑦，用户拍板 #1）：台面见底 → 请求一场闸门落币。
+   *
+   * ## 口径
+   *
+   * 「台面」= `CoinPool.countBed()`（**不在台面体积里**、且在得分线内的活跃币），
+   * **不是 `activeCoins`**。两者的差别是这条机制的成败所在：`activeCoins` 含正在下落的、
+   * 演出排队没落的、上层台面的币，盘面已经掏空它还是三位数 → 补币永不触发，
+   * 而且**零报错**（判据只会看到「补币没发生」）。见 `CoinPool.countBed()` 的注释。
+   *
+   * ## 为什么走 `shows.request('gate')` 而不是自己 `acquire()`
+   *
+   * `gate` 是既有的「庄家补货」装置，它自带**预算协商**：余量不足时按实有降级并
+   * 在事件里如实记 `promised`，彻底没有时**明确拒绝并给出原因**。
+   * 自己写 `coins.acquire()` 循环会绕开这一层，撞上「池满时静默返回 null」的历史坑
+   * （不扣额度、不提示，玩家只看到「什么都没发生」）。
+   *
+   * ## 三个守卫，各自对应一种误触发
+   *
+   * - **`phase === 'playing'`**：沉降期补币 = 庄家替玩家续命。续命是跪求按钮的语义
+   *   （`grantBeg`，见 `RunState` 的恒等式），不能由补币悄悄代劳——否则破产永远弹不出来。
+   * - **`cooldown`**：盘面会在阈值上下抖动。没有冷却时每 0.5 秒补一次，
+   *   `gate` 演出排队到天上去，玩家看到的是「闸门一直在掉币」——
+   *   补币从「救场」退化成「背景噪声」。
+   * - **`!shows.busy`**：演出排队中不叠加请求。`gate` 自己会拒绝，
+   *   但每 0.5 秒拒绝一次会把遥测刷满，HUD 也会反复闪同一句话。
+   *
+   * ★ 失败**不重置冷却**：这次没补成（排队/余量不足），下一轮盘点接着试，
+   * 别把 8 秒白等掉。
+   */
+  private updateRefill(delta: number): void {
+    this.refillCooldown = Math.max(0, this.refillCooldown - delta);
+    this.refillTimer += delta;
+    if (this.refillTimer < REFILL.checkEvery) return;
+    this.refillTimer = 0;
+
+    this.bedCoins = this.coins.countBed(this.pusher.topRange);
+
+    if (this.run.phase !== 'playing') return;
+    if (this.bedCoins >= REFILL.bedThreshold) return;
+    if (this.refillCooldown > 0) return;
+    if (this.shows.busy) return;
+
+    const result = this.shows.request('gate', { count: REFILL.count });
+    if (!result.ok) return;
+
+    this.refillCount += 1;
+    this.refillCooldown = REFILL.cooldown;
+    this.hud.showRefill(this.bedCoins, result.promised, result.downgraded);
   }
 
   /**
@@ -970,6 +1591,8 @@ export class Game {
     this.shows.abort();
     this.slotMachine.abort();
     this.pendingXixiSpin = false;
+    // 视觉币与演出同生命周期：本局已经结清，在飞的筹码不该继续出现在收工画面上。
+    this.spray.clear();
     this.showEndlessSummary();
   }
 
@@ -1059,7 +1682,9 @@ export class Game {
     for (const placement of this.config.layout) {
       const coin = this.coins.acquire();
       if (!coin) break;
-      coin.spawn(placement.kind, placement.x, placement.y, placement.z, placement.yaw, false);
+      // `preset = true`：开局摆盘的上层币**不吃台面输送**（见 `Coin.preset`）。
+      // 漏掉这个参数会让 18 枚上层预置币在一秒内被整片冲下前缘。
+      coin.spawn(placement.kind, placement.x, placement.y, placement.z, placement.yaw, false, true);
     }
     this.coins.syncAll();
 
@@ -1069,6 +1694,8 @@ export class Game {
     this.shows.abort();
     this.slotMachine.abort();
     this.pendingXixiSpin = false;
+    // 视觉币与演出同生命周期：上一局飞出去的筹码不能飘进这一局的画面。
+    this.spray.clear();
     this.physics.freeze();
     this.telemetry.reset();
     this.drainRecorded = false;
@@ -1084,25 +1711,103 @@ export class Game {
     this.settleWindow = 0;
     this.anomalyCount = 0;
     this.anomalySamples.length = 0;
+    // 镜头偏移峰值随局清零：`feedbackReport()` 的读数必须只反映**本局**
+    // （上一局的峰值留着会让「本局没抖」这条判据永远过不了）。
+    this.cameraPeakOffset = 0;
+    this.drainCount = 0;
+    this.refillCount = 0;
+    this.rendererPeakDrawCalls = 0;
+    // 冷却**从满值开始**：开局那一下盘面本来就是满的，不需要补；
+    // 而且开局帧 `bedCoins` 还没盘过点（是 0），不设冷却的话
+    // 第一轮盘点会立刻判定「见底」并白送一场闸门落币。
+    this.refillCooldown = REFILL.cooldown;
+    this.refillTimer = 0;
+    this.bedCoins = 0;
     this.spikeClamps = 0;
     this.peakSpikeSpeed = 0;
     this.settledCoins = 0;
     this.setDrainPrompt(false);
     this.hud.resetCombo();
+    // 爆闪不跨局：上一局最后一枚币点亮的那一下不该在新开局里继续闪。
+    this.xixiFlashTimer = 0;
+    this.xixiFlashSlot = -1;
+    // 反馈计数与三个衰减量也按局清零（P10 ⑨）：
+    // 「本局出了几次大号飞字 / 几次热区命中」是可断言的量，跨局累加就说不清是谁贡献的。
+    // 衰减量归零还不够，**材质也要写回基线**——否则上一局结束时正亮着的得分线
+    // 会把那一帧的亮度带进新一局的开局画面。
+    this.scoreLinePulse = 0;
+    this.hotZoneFlash = 0;
+    this.drainFlashLevel = 0;
+    if (this.scoreLineMaterial) this.scoreLineMaterial.emissiveIntensity = FEEDBACK_EMISSIVE.scoreLineBase;
+    if (this.hotZoneMaterial) this.hotZoneMaterial.emissiveIntensity = FEEDBACK_EMISSIVE.hotZoneBase;
+    if (this.drainGrateMaterial) this.drainGrateMaterial.emissiveIntensity = 0;
+    for (const key of Object.keys(this.feedbackCounts) as Array<keyof typeof this.feedbackCounts>) {
+      this.feedbackCounts[key] = 0;
+    }
     this.hud.setStatus(
       `${this.config.focus} · 本局买入 ${this.run.buyIn} 筹码 · 选位自动左右摆，轻点机台或按空格投币`,
     );
     this.input.setEnabled(true);
     this.publishHud();
+
+    // ── 钱包见底：买入 0 筹码 ──────────────────────────────────────────────
+    //
+    // ★ 这是一个**必须显式处理**的状态，否则整局卡死。
+    //
+    // 不处理的话会发生什么：`RunState` 停在 `phase='ready'` 且 `chips=0`，
+    // 于是 ① `acceptingDrops` 为假 → 投不出币，阶段永远升不到 `playing`；
+    // ② `updateRunState` 的沉降分支要求 `phase==='playing'` → 沉降永远不触发；
+    // ③ 破产弹窗只在「沉降走完」或 `forceRuin` 时弹 → 永远不弹。
+    // 而**跪求按钮挂在破产弹窗里** → 玩家既不能投币也不能跪求，画面彻底无响应。
+    //
+    // 走既有的沉降机制而不是另开一条路，有两个好处：
+    //   1. `revive()` 只在 `phase==='drainOut'` 时生效 —— 只有真的进过沉降，
+    //      跪求才能把本局拉回 `playing`。不绕这一圈的话 `grantBeg` 的 `resumed`
+    //      会静默返回 false，阶段永远停在 `ready`。
+    //   2. 盘面如果在这段时间里回吐筹码（满盘开局很常见），沉降走完会**本局继续**
+    //      —— 钱包空但币床是满的，本来就该让玩家接着打。
+    //
+    // 注意 `pusher.reset()` 已经跑过，盘面也已摆好；这里只是把「开局即破产」
+    // 这件事交给沉降去表达，不额外动任何物理。
+    if (this.run.chips <= 0) {
+      this.run.beginPlay();
+      this.run.enterRuinSettle();
+      this.showRuin();
+      this.hud.setStatus('钱包见底（本局买入 0 筹码）。向 xixi 大王跪求赏赐，或保留尊严收工。');
+    }
   }
 
   // ── 场景 ────────────────────────────────────────────────────────────────
 
+  /**
+   * 灯光组（V2 收敛）。
+   *
+   * ★ **只能有一盏直接光。** `MeshToonMaterial` 的 `RE_Direct_Toon` 会**对每盏直接光
+   * 各调一次** `getGradientIrradiance`，所以 N 盏方向光的最终颜色是
+   * `palette(N·L₁) + palette(N·L₂) + …` —— 三盏灯就等于背光面拿到三倍阴影色、
+   * 迎光面叠出三倍亮度。这是**结构性**问题，不是调参能救的。
+   *
+   * 收敛后的分工：
+   * - `key` 是唯一采样色带、也是唯一投影的灯。**形阴影**由色带给出（暗部换冷色阶）。
+   * - `HemisphereLight` **不走** `getGradientIrradiance`（它走间接项），
+   *   所以不参与色带叠加。它负责**投射阴影**里的冷色填充 ——
+   *   于是「形阴影走色带、投射阴影走环境」互不重复，不会双重暗化。
+   * - 原来的 rim / fill 两盏方向光删掉：它们的职责（暖高光、冷轮廓）
+   *   分别由色带的顶段与底段承接。
+   */
   private buildScene(tableGroup: THREE.Group): void {
     this.scene.background = new THREE.Color(COLORS.screenDeep);
-    this.scene.add(new THREE.HemisphereLight('#dff0e4', '#16241d', 2.3));
+    // 冷天空 + 冷地面：投射阴影落进冷色，与色带的冷暗部同向。
+    //
+    // 强度 2.0 是**实测调出来的**：只留一盏直接光之后，背光的那半台面
+    // （右侧板 N·L < 0 → 色带暗段）会暗到看不清机器结构。
+    // hemisphere **不走** `getGradientIrradiance`（它是间接项），
+    // 所以抬它只抬暗部、不改色带台阶——这是给背光面补光最干净的办法。
+    this.scene.add(new THREE.HemisphereLight('#cfe4ff', '#1b2a3a', 2.0));
 
-    const key = new THREE.DirectionalLight('#fff2cd', 3.1);
+    // 唯一直接光。位置与 shadow 参数**全部保持原样**（阴影贴图的取景别动）。
+    // 颜色改成纯白：暖色现在由色带顶段给，灯再暖会双重偏色。
+    const key = new THREE.DirectionalLight('#ffffff', 3.4);
     key.position.set(-1.6, 3.2, 2.4);
     key.castShadow = true;
     key.shadow.mapSize.set(1024, 1024);
@@ -1114,19 +1819,14 @@ export class Game {
     key.shadow.camera.bottom = -1.2;
     this.scene.add(key);
 
-    const rim = new THREE.DirectionalLight('#8ee0b8', 1.15);
-    rim.position.set(1.8, 1.4, -2.2);
-    this.scene.add(rim);
-
-    const fill = new THREE.DirectionalLight('#ffe6b0', 0.7);
-    fill.position.set(0.4, 1.2, 3.0);
-    this.scene.add(fill);
-
     this.scene.add(tableGroup);
     this.tableGroup = tableGroup;
     this.scene.add(this.pusher.group);
     this.scene.add(this.coins.group);
     this.scene.add(this.shows.group);
+    // 视觉币通道（S16）。挂 `spray.group` 而不是让演出装置自己持有 ——
+    // 在飞的币必须活过演出（见 `CoinSpray` 的模块注释）。
+    this.scene.add(this.spray.group);
     this.scene.add(this.slotMachine.group);
     this.scene.add(this.debugTools.overlay);
     this.scene.add(this.buildLaneMarker());
@@ -1137,17 +1837,79 @@ export class Game {
     const coinSkin = coinSkinById(this.save.snapshot.selectedCoinSkin);
     const cabinetSkin = cabinetSkinById(this.save.snapshot.selectedCabinetSkin);
     this.coins.applyCoinSkin(coinSkin);
+    // 视觉币必须跟着换：它的材质是**另一份实例**（与币池同 defines，共享程序但不同 uniform），
+    // 不换的话飞出去的是旧外观 —— 这种「一半新一半旧」在截图里很难发现。
+    this.spray.setSkin(coinSkin);
     if (this.tableGroup) applyCabinetSkin(this.tableGroup, cabinetSkin);
     applyCabinetSkin(this.pusher.group, cabinetSkin);
+    this.applyCabinetMapTextures(cabinetSkin);
+  }
+
+  /**
+   * 切肤时把 Arcane 风贴图按 palette 重画，swap 进对应材质。
+   *
+   * 受影响的件：`scoreLine` / `hotZone` / 招牌 + 顶板 + 檐板（三者共用一份 `trimMaterial`）。
+   * `applyCabinetSkin` 已经把 trim 颜色刷过一遍；这里**只动 map**，不动 color ⇒
+   * 招牌底色保持机身色，涂鸦叠在上面。
+   *
+   * ★ 判据是 `userData.part`（S19），不是 `role`：见 `pickCabinetMap` 的长注释 ——
+   * 按 `role` 判时得分线 / 热区两条分支永远不会命中。
+   *
+   * ★ 同一份材质可能被多件共用（`trimMaterial` 被招牌 / 顶板 / 檐板共用），
+   * 所以逐件处理会对同一份材质反复 `create*` 再 `dispose` —— 白造两张 1024×512 的
+   * `CanvasTexture`。`touched` 让每份材质只处理一次。
+   *
+   * 老贴图必须 `dispose()`，否则 GC 收不掉，泄漏的是 GPU 资源——三张 CanvasTexture
+   * 全坏掉也会有「gpu memory leak」的红色（headless Chrome 会报）。
+   */
+  private applyCabinetMapTextures(cabinetSkin: CabinetSkin): void {
+    const palette = cabinetSkin.marqueePalette;
+    const table = this.tableGroup;
+    if (!table) return;
+    const touched = new Set<THREE.Material>();
+    table.traverse((child) => {
+      if (!(child as THREE.Mesh).isMesh) return;
+      const mesh = child as THREE.Mesh;
+      const part = mesh.userData.part as string | undefined;
+      if (!part) return;
+      const list = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const entry of list) {
+        if (!isLitMaterial(entry)) continue;
+        if (touched.has(entry)) continue;
+        const nextMap = pickCabinetMap(part, palette);
+        if (!nextMap) continue;
+        touched.add(entry);
+        const previous = entry.map;
+        entry.map = nextMap;
+        entry.needsUpdate = true;
+        previous?.dispose();
+      }
+    });
+  }
+
+  /**
+   * 重建币面贴图（调参面板改分辨率时调用）。
+   *
+   * 顺序不能反：**先写全局倍率、再强制重建**。`applyCoinSkin` 默认会在
+   * 「外观 id 没变」时短路返回，而改分辨率恰恰不改 id，所以要显式 `force`。
+   */
+  private applyCoinResolution(): void {
+    setCoinTexelScale(this.tuning.coinTexelScale);
+    const coinSkin = coinSkinById(this.save.snapshot.selectedCoinSkin);
+    this.coins.applyCoinSkin(coinSkin, true);
+    // 视觉币那张贴图是**另一个 `CanvasTexture` 实例**（同一个 `coinTexels` 真源），
+    // 所以倍率变了它也必须重建 —— 漏了这一行，调分辨率时飞出去的币还是旧纹素。
+    this.spray.setSkin(coinSkin);
   }
 
   private buildLaneMarker(): THREE.Group {
-    const spitterMaterial = new THREE.MeshStandardMaterial({
+    const spitterMaterial = makeToonMaterial({
+      name: 'spitter',
+
       color: COLORS.bronzeRim,
-      emissive: new THREE.Color(COLORS.bronzeRim),
+      ramp: 'metal',
+      emissive: COLORS.bronzeRim,
       emissiveIntensity: 0.42,
-      roughness: 0.34,
-      metalness: 0.62,
     });
     this.spitterMaterial = spitterMaterial;
     const spitter = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.05, 0.07), spitterMaterial);
@@ -1166,26 +1928,80 @@ export class Game {
     return this.laneMarker;
   }
 
+  /**
+   * 把机位落到相机上。
+   *
+   * ★ S22 起机位的真源是 `cameraRig`（模块单例，见 `render/cameraRig.ts`），
+   * 相机的位置与朝向都只是它的投影。两种模式：
+   *
+   * - `tuning.cameraAutoFit === true`（默认）：先按取景框解一次机位，
+   *   与 S19~S21 的算式**逐字相同** ⇒ 默认构图零变化。
+   * - `false`（调试面板动过机位之后）：**不重新取景**，直接把 `cameraRig` 落到相机上。
+   *   这条分支是「交出机位所有权」的兑现处 —— 不这样，改 FOV 或改窗口尺寸
+   *   都会把用户手动摆好的机位弹回默认视角。
+   *
+   * 收尾三行（`cameraBase` / 投影矩阵 / `updateMarksAnchor`）两条路共用，
+   * 因为「相机基准位置」是 S17 那条铁律（`cameraPeakOffset` 恒为 0）的记账基准。
+   */
   private fitCamera(): void {
-    const fovRad = (this.tuning.cameraFov * Math.PI) / 180;
-    const aspect = Math.max(0.2, this.camera.aspect);
-    const halfTan = Math.tan(fovRad / 2);
-    const sin = Math.sin(CAMERA_FIT.pitch);
-    const cos = Math.cos(CAMERA_FIT.pitch);
-
-    const distanceToFitWidth = (CAMERA_FIT.halfWidth * 2) / 2 / (halfTan * aspect);
-    const distanceToFitHeight = CAMERA_FIT.verticalExtent / 2 / halfTan;
-    const distance = Math.max(distanceToFitWidth, distanceToFitHeight);
-
     this.camera.fov = this.tuning.cameraFov;
-    this.camera.position.set(
-      0,
-      CAMERA_FIT.centerY + sin * distance,
-      CAMERA_FIT.centerZ + cos * distance,
-    );
+    if (this.tuning.cameraAutoFit) fitCameraRig(this.tuning.cameraFov, this.camera.aspect);
+    applyCameraRig(this.camera);
     this.cameraBase.copy(this.camera.position);
-    this.camera.lookAt(0, CAMERA_FIT.centerY, CAMERA_FIT.centerZ);
     this.camera.updateProjectionMatrix();
+    this.camera.updateMatrixWorld(true);
+    this.updateMarksAnchor();
+    // 自动取景会解出新的距离（改 FOV / 改窗口尺寸都会），滑块显示必须跟着刷新，
+    // 否则面板上的「距离」会一直停在上一次的值上，看起来像坏了。
+    this.debugTools.refreshCameraControllers();
+  }
+
+  /**
+   * 重建机柜外壳（S24，只服务 `?model` 模型模式）。
+   *
+   * ## 为什么只 dispose 几何
+   *
+   * 材质是 `TableBuilder.cabinetMaterials()` 的**模块单例**，重建后仍是同一份。
+   * 于是重建的代价只剩几何，而且：
+   *   - 已编译程序数不涨（每建一次新材质会让 `programs` 随拖滑块一路涨，
+   *     `perf` 判据直接红）；
+   *   - 换肤颜色与 Arcane 贴图都还在（它们刷的就是那几份单例材质）。
+   * 反过来做会得到一个**零报错的静默失效**：
+   * 「换肤之后一调模型参数，机柜就变回默认色」。
+   *
+   * ## 为什么不碰台面 / 钉子 / 推板
+   *
+   * 用户明确要求「不打算动碰撞边界」。台面、钉子、侧壁碰撞体、推板都与
+   * `ColliderDesc` 一一对应，热重建会让视觉与碰撞分叉 —— 所以只有
+   * **纯视觉的外壳**参与重建。
+   */
+  private rebuildCabinetShell(): THREE.Object3D {
+    const parent = this.tableGroup;
+    if (!parent || !this.cabinetShell) {
+      // 理论上到不了（外壳在 `buildTable()` 里就建好了）。真到了这里就现建一具
+      // 挂上去，免得模型模式整个失效 —— 这比抛异常好，因为这条路径只在开发模式。
+      const fresh = buildCabinetShell();
+      parent?.add(fresh);
+      this.cabinetShell = fresh;
+      return fresh;
+    }
+    disposeCabinetShell(this.cabinetShell);
+    const next = buildCabinetShell();
+    parent.add(next);
+    this.cabinetShell = next;
+    return next;
+  }
+
+  /**
+   * 调试面板动完机位后调这里：把 `cameraRig` 落到相机上，**不重新取景**。
+   *
+   * 刻意不复用 `fitCamera()`：那条路会走 `applyTuning()`（含 700 枚币的额外迭代遍历），
+   * 而拖一次机位滑块要跑几十次。这里只做「摆相机 + 记账 + 重算锚点」四件事，
+   * 剩下的（FOV / 物理 / 经济）本来就没被机位改动碰到。
+   */
+  applyCameraRigFromPanel(): void {
+    applyCameraRig(this.camera);
+    this.cameraBase.copy(this.camera.position);
     this.camera.updateMatrixWorld(true);
     this.updateMarksAnchor();
   }
@@ -1198,6 +2014,26 @@ export class Game {
       x: (projected.x * 0.5 + 0.5) * canvas.clientWidth,
       y: (-projected.y * 0.5 + 0.5) * canvas.clientHeight,
     };
+  }
+
+  /**
+   * 世界尺寸 → **后备缓冲像素**边长（P10 的诊断用）。
+   *
+   * 为什么不复用 `toScreen` 量两点差：那量的是 **CSS 像素**，而像素画的 1:1 是对着
+   * **后备缓冲**说的——`upscale` 是最近邻放大，图标纹素与后备像素一一对应才干净。
+   * 这里按透视公式直接算，再除掉 `pixelScale.upscale`，得到的就是真正决定
+   * 「图标糊不糊」的那个数。判据写「≥ 24 后备像素」这种与档位无关的断言。
+   *
+   * 近似口径：把该点当作**垂直于视轴**的平面上的尺寸。滚筒窗确实近似正对相机，
+   * 所以这个近似对它是准的；不要拿它去量斜面上的件。
+   */
+  private backPixelSize(worldSize: number, x: number, y: number, z: number): number {
+    const view = new THREE.Vector3(x, y, z).applyMatrix4(this.camera.matrixWorldInverse);
+    const depth = Math.max(0.001, -view.z);
+    const canvas = this.renderer.domElement;
+    const cssPerMeter =
+      (canvas.clientHeight * 0.5) / (depth * Math.tan((this.camera.fov * Math.PI) / 360));
+    return (worldSize * cssPerMeter) / Math.max(1, this.pixelScale.upscale);
   }
 
   /**
@@ -1237,6 +2073,13 @@ export class Game {
   }
 
   private publishHud(): void {
+    // XIXI 标牌跟着 HUD 一起刷新：**同一个数据源**（`this.xixi`），
+    // 所以 3D 标牌与 DOM 圆点不可能对不上。爆闪由 `updateXixiFlash` 递减。
+    this.pusher.setXixiLanes(
+      this.xixi,
+      this.xixiFlashTimer > 0 ? this.xixiFlashSlot : -1,
+      this.xixiFlashTimer > 0 ? this.xixiFlashTimer / XIXI_FLASH_SECONDS : 0,
+    );
     this.hud.update(
       this.run.snapshot(),
       this.config,
@@ -1246,6 +2089,17 @@ export class Game {
       this.save.wallet,
       this.xixi,
     );
+  }
+
+  /**
+   * XIXI 命中爆闪的衰减。
+   *
+   * 与 `updateFlashes` 分开是刻意的：那个管的是**材质自发光**（spitter / lip），
+   * 这个管的是**实例颜色**（`instanceColor`），两者的载体不是同一种东西。
+   */
+  private updateXixiFlash(delta: number): void {
+    if (this.xixiFlashTimer <= 0) return;
+    this.xixiFlashTimer = Math.max(0, this.xixiFlashTimer - delta);
   }
 
   // ── 测试钩子与诊断 ──────────────────────────────────────────────────────
@@ -1283,9 +2137,8 @@ export class Game {
         this.motion.setOverride(enabled);
         if (enabled) {
           // 截图用：停掉环境动效，让同一状态两次渲染一致。
+          // （相机不用归位 —— S16 起它本来就一动不动，见 `trackCameraOffset`。）
           this.pusher.stop();
-          this.shake = 0;
-          this.camera.position.copy(this.cameraBase);
         }
         this.render();
         this.publishDiagnostics();
@@ -1299,7 +2152,24 @@ export class Game {
         this.governor.freeze(true);
         this.applyQuality();
         this.render();
-        return { tier: settings.tier, maxDpr: settings.maxDpr, shadows: settings.shadows };
+        return {
+          tier: settings.tier,
+          pixelTargetHeight: settings.pixelTargetHeight,
+          shadows: settings.shadows,
+        };
+      },
+      /**
+       * 像素分辨率开关（V1）：测试与 A/B 截图用。
+       * `pixelated: false` 时回到原生分辨率——用来断言「关掉像素化画面仍非空白」。
+       */
+      setPixelScale: (patch: { targetHeight?: number; upscale?: number | null; pixelated?: boolean }) => {
+        if (patch.targetHeight !== undefined) this.tuning.pixelTargetHeight = patch.targetHeight;
+        if (patch.pixelated !== undefined) this.tuning.pixelated = patch.pixelated;
+        // `upscale: null` 取消显式倍率，回到 `targetHeight` 推导。
+        if (patch.upscale !== undefined) this.pixelSettings.upscaleOverride = patch.upscale;
+        this.applyPixelScale();
+        this.render();
+        return { ...this.pixelScale };
       },
       drop: (lane: number) => {
         this.input.setLane(lane);
@@ -1315,7 +2185,6 @@ export class Game {
       sweep: () => this.trySweep(),
       grapple: (laneX: number) => this.tryGrapple(laneX),
       reload: () => this.tryReload(),
-      spinWheel: () => this.tryWheel(),
       cycleBet: () => this.cycleBet(),
       mechanisms: () => this.mechanismSnapshot(),
       /** 开一局新的 / 跪求 / 收工，供自动化试玩。 */
@@ -1344,11 +2213,49 @@ export class Game {
         this.showRuin();
         return true;
       },
+      /**
+       * 把币床掏空到只剩 `keep` 枚，返回实际删掉的枚数（P10 ⑦ 补币判据的**状态构造器**）。
+       *
+       * 为什么要一个构造器：「台面见底」在真实玩法里要玩好几分钟才到得了
+       * ——盘面每局只掉几十枚，而阈值落在预置量的一半以下。用它当验收的**入口**
+       * 会让判据变成一条几分钟的慢测，而且不确定（掉多少取决于玩家怎么投）。
+       *
+       * ★ **从最靠前（z 最大）的开始删**：那是币床自然变薄时的顺序——
+       * 推板把币往前挤，前沿的先越线、先掉进下水道。所以构造出来的状态与
+       * 「真的玩到那一步」是**同一个形态**，而不是一个「随机挖空」的人造态。
+       *
+       * 只 `despawn`，不碰账本：币不是筹码，`chips = buyIn + earned + begged − spent`
+       * 不受影响。判据要的是「盘面变薄」这一个变量，别的一律不动。
+       */
+      clearBedTo: (keep = 120) => {
+        const bed: Coin[] = [];
+        const range = this.pusher.topRange;
+        this.coins.forEachActive((coin) => {
+          const p = coin.position;
+          if (p.z >= TABLE.scoreLineZ) return;
+          // 与 `CoinPool.countBed()` 同一份口径（「不在台面体积里」= 在币床上）：
+          // 币塔上的币也算币床库存，否则「把盘面掏到 120 枚」会留下一座塔没动。
+          if (isOnDeckVolume(p.x, p.y, p.z, range)) return;
+          bed.push(coin);
+        });
+        if (bed.length <= keep) return 0;
+        bed.sort((a, b) => b.position.z - a.position.z);
+        let removed = 0;
+        for (const coin of bed) {
+          if (bed.length - removed <= keep) break;
+          coin.despawn();
+          removed += 1;
+        }
+        return removed;
+      },
       run: () => ({
         begs: this.begsThisRun,
         totalBegs: this.save.begCount(),
         best: this.save.snapshot.bestEarned,
         wallet: this.save.wallet,
+        // 验证脚本会主动充值钱包（见 `refillWallet` 钩子），所以钱包守恒的
+        // 算式必须把 Σ充值 算进去，否则会报出假失败。
+        refilled: this.save.refilled,
         ruinVisible: this.hud.ruinVisible,
         summaryVisible: this.summaryVisible,
       }),
@@ -1357,6 +2264,7 @@ export class Game {
         ...this.run.ledger,
         cashOut: this.run.cashOut,
         wallet: this.save.wallet,
+        refilled: this.save.refilled,
       }),
       /** 加注档位表（含返值倍率），供验证脚本做「换档重算」。 */
       betTiers: () => BET_TIERS.map((tier) => ({ ...tier })),
@@ -1390,19 +2298,399 @@ export class Game {
        * 接触流形的 `contactDist` 是物理引擎自己算出来的穿透量，与姿态无关。
        */
       penetrationReport: (limitMillimeters: number) => this.penetrationReport(limitMillimeters),
-      setTuning: (patch: Record<string, number>) => {
+      setTuning: (patch: Record<string, number | boolean>) => {
         Object.assign(this.tuning, patch);
         this.applyTuning();
         return { ...this.tuning, physics: this.physics.tuning };
       },
-      table: () => ({
-        name: this.config.name,
-        coins: this.config.layout.length,
-        value: layoutValue(this.config.layout),
-        bronze: this.config.layout.filter((coin) => coin.kind === 'bronze').length,
-        pattern: this.config.layout.filter((coin) => coin.kind === 'pattern').length,
-        payout: this.config.layout.filter((coin) => coin.kind === 'payout').length,
+      // ── 音频调试 ──────────────────────────────────────────────────────
+      // 这组钩子与调试面板共用同一条路径（`audioCatalog` 的事件表），
+      // 所以脚本能试听到与面板完全一致的东西。
+      soundNames: () => audioEventNames(),
+      sound: (name: string) => auditionEvent(this.audio, name),
+      soundInfo: (name?: string) => {
+        const snapshot = this.audio.debug;
+        if (name === undefined) {
+          return {
+            ...snapshot,
+            events: AUDIO_EVENTS.map((event) => ({
+              name: event.name,
+              label: event.label,
+              selector: event.selector,
+              mountable: event.selector !== null,
+              mounted: event.selector !== null && this.audio.hasOverride(event.selector),
+            })),
+          };
+        }
+        const event = findAudioEvent(name);
+        if (!event) return null;
+        const info = event.selector
+          ? this.audio.selectorInfos().find((entry) => entry.key === event.selector)
+          : null;
+        return {
+          name: event.name,
+          label: event.label,
+          selector: event.selector,
+          mountable: event.selector !== null,
+          mounted: event.selector !== null && this.audio.hasOverride(event.selector),
+          gain: info?.gain ?? null,
+          throttleMs: info?.throttleMs ?? null,
+          samples: info ? [...info.samples] : [],
+        };
+      },
+      setSoundGain: (selector: string, value: number) => {
+        const key = this.requireSelectorKey(selector);
+        return { selector: key, gain: this.audio.setGain(key, value) };
+      },
+      clearSoundOverride: (selector?: string) => {
+        const key = selector === undefined ? undefined : this.requireSelectorKey(selector);
+        return { cleared: this.audio.clearOverride(key) };
+      },
+      /**
+       * 从 URL 拉一个音频文件解码后挂到槽位。
+       *
+       * 这是 GUI 之外的能力，专供脚本化验证：不用真的去操作 `<input type=file>`，
+       * 就能把「挂载 → 事件走 override 路径」这条链跑通。
+       */
+      overrideSoundFromUrl: async (selector: string, url: string) => {
+        const key = this.requireSelectorKey(selector);
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const bytes = await response.arrayBuffer();
+        const buffer = await this.audio.decodeFile(new File([bytes], url));
+        this.audio.overrideSelector(key, buffer, url);
+        return { ok: true, selector: key, name: url, duration: buffer.duration };
+      },
+      table: () => {
+        const summary = layoutSummary(this.config.layout);
+        return {
+          name: this.config.name,
+          coins: this.config.layout.length,
+          value: layoutValue(this.config.layout),
+          // 按币种计数：`byKind` 是 P6 之后的通路口径（新增币种自动出现），
+          // bronze/pattern/payout 三个旧字段保留给既有判据读。
+          byKind: { ...summary.byKind },
+          // 币种清单也一并给出：判据用「byKind 的键集 == kinds」来核对，
+          // 这样新增币种时判据自动跟上，不用在测试脚本里再抄一份名单。
+          kinds: [...COIN_KINDS],
+          bronze: this.config.layout.filter((coin) => coin.kind === 'bronze').length,
+          pattern: this.config.layout.filter((coin) => coin.kind === 'pattern').length,
+          payout: this.config.layout.filter((coin) => coin.kind === 'payout').length,
+          /**
+           * 上层台面（推板顶面）与币床的预置枚数。
+           *
+           * 补币判据要它：`bedCoins` 的口径是「币床上的币」，而 `activeCoins` 含上层台面，
+           * 所以「`bedCoins < activeCoins`」这条守卫必须能说出**差在哪里**——
+           * 差值应当 ≈ `deck` + 在途币。差得离谱就说明口径写错了（例如把上层也算进来了）。
+           */
+          deck: summary.deck,
+          bed: summary.bed,
+          /**
+           * 盘面**容量**：把稀疏铺去掉后这份配置能放多少枚。
+           *
+           * 判据用它算「填充率」。**不要**拿它当「满盘应当多少枚」——
+           * 满盘枚数随币尺寸档位下降，而填充率不随。见 `layoutCapacity()`。
+           */
+          capacity: endlessCapacity(),
+        };
+      },
+      /**
+       * 币的几何派生量（S13）：**验证脚本的唯一真源**。
+       *
+       * 存在的理由（纪律 2「判据不写第二份公式」）：脚本里原先手抄了一串
+       * `0.12`（币径）、`0.0212`（层高）、`0.005`（抖动）之类的常量，
+       * 而 `?coin=1.1/1.2` 会把这些**全部**改掉。手抄的那份不会跟着变，
+       * 于是判据在别的档位下会**假绿**——拿旧尺寸去量新币，怎么看都合格。
+       * 所以脚本一律改读这个钩子，把手抄常量删掉。
+       *
+       * `mass` 一并给出：`Mechanisms` 的定值冲量必须按质量比（`k³`）补偿，
+       * 判据要能算出「同样的冲量在别的档位下给出多少 Δv」。
+       */
+      coinGeometry: () => ({
+        scale: COIN_SCALE,
+        radius: COIN.radius,
+        halfThickness: COIN.halfThickness,
+        diameter: COIN.radius * 2,
+        /** 单层高度步距（币厚 + 余量）。 */
+        layerStep: LAYER_STEP,
+        /** 台面上币心的静置高度。 */
+        restY: REST_Y,
+        maxJitter: MAX_JITTER,
+        /** 自检的同层最小间距判据：币径 × 0.98。 */
+        minSpacing: MIN_SPACING,
+        /** 网格步距下限：`minSpacing + 2 × maxJitter`。区域列/行数由它反算。 */
+        minStep: MIN_STEP,
+        /** 单枚币的质量（千克）：πr² × 2h × ρ。定值冲量的补偿基准。 */
+        mass: Math.PI * COIN.radius ** 2 * COIN.halfThickness * 2 * coinPhysics.density,
+        // ⚠️ 以下四项一律读 `coinPhysics` 注册表，**不是** `COIN.*` 常量。
+        // 这份钩子自称「派生量唯一真源、脚本不准手抄」，那就必须反映调参后的实际值；
+        // 读常量会让脚本在调试面板改过之后拿到陈旧数据，判据**假绿**。
+        density: coinPhysics.density,
+        friction: coinPhysics.friction,
+        restitution: coinPhysics.restitution,
+        linearDamping: coinPhysics.linearDamping,
+        angularDamping: coinPhysics.angularDamping,
+        /** 台面输送带的高度上界与当前速度（`?debug` 面板可实时改）。下界见 `isOnDeckAt`。 */
+        conveyor: {
+          maxY: TABLE.conveyor.maxY,
+          speed: this.tuning.conveyorSpeed,
+        },
+        /** 推板顶面高度（上层台面的基准 y）。 */
+        pusherTopY: TABLE.pusherTopY,
+        /**
+         * 推板行程，以及推币面的 z 区间（归位 → 全伸）。
+         *
+         * 为什么把它放进这份「派生量真源」（纪律 2「判据不写第二份公式」）：
+         * `accept` ④ 要判「币离开台面的位置贴合推板前缘，且不同时机的落点确实不同」，
+         * 而**「不同」的尺度只能是推板行程本身**。那条判据原先写死 `spread > 0.3`，
+         * 是按 `conveyor = 0.85` 标定的：那时台面币被输送带在 ~1 秒内送到前唇，
+         * 落点能落在整个行程里的任意一点。`conveyor` 归零之后离台**只发生在回撤的
+         * 前半段**（见 `runTimingCheck` 的注释），实测跨度 0.145 米 = 行程的 40%，
+         * 写死的 0.3 永远够不到。改成「行程的比例」之后，改行程不会让判据失真。
+         *
+         * ⚠️ 读 `this.pusher.travel` 而不是 `TABLE.pusherTravel`：后者是**出厂常量**，
+         * 面板改过行程之后它就是陈旧的——上面这段「改行程不会让判据失真」的承诺
+         * 只有在读运行时值时才成立。
+         */
+        pusherTravel: this.pusher.travel,
+        pusherFrontZ: {
+          rest: TABLE.pusherFrontZAtRest,
+          extended: TABLE.pusherFrontZAtRest + this.pusher.travel,
+        },
+        /**
+         * 落币口。判据要用它来定位**落币走廊与钉阵**。
+         *
+         * `accept` ⓪ 的探针点原先写死 `(0, 1.16, −0.72)` —— 那个 z 就是旧的落币口。
+         * 2026-09-25 落币口后移到 `−1.20` 之后，探针会探空，读出来的是
+         * 「钉子碰撞体半长种类数 = 0」，判据**红在别的地方**，很容易被误判成钉子本身坏了。
+         * 所以口径一律从引擎读。
+         */
+        drop: { y: TABLE.drop.y, z: TABLE.drop.z, halfLane: TABLE.drop.halfLane },
+        /** 速度护栏，判据拿它当「求解器有没有造能量」的阈值。 */
+        maxSpeed: coinPhysics.maxSpeed,
+        maxUpwardSpeed: coinPhysics.maxUpwardSpeed,
       }),
+      /**
+       * 某个 (x, z) 是否落在币床前侧角的排水口里（含抖动余量）。
+       *
+       * 暴露它的理由（纪律 2「判据不写第二份公式」）：`physics` ⑤ 要判「币床的币
+       * 坐在台面上」，而**掉进排水口的币本来就该在地板高度以下**——它们正在被
+       * 这张桌子合法地回收。判据必须把这一块排除掉，而排除的口径只能来自
+       * 引擎自己的 `insideDrain`（真源是 `DRAIN_FOOTPRINT`，含 `MAX_JITTER` 退让）。
+       * 在脚本里另抄一个 `|x| > 0.66 && z ∈ [0.98, 1.15]` 就是第二份公式，
+       * 它不会跟着 `DRAIN` / `MAX_JITTER` 一起改，下一次调洞就会假红或假绿。
+       */
+      insideDrain: (x: number, z: number) => insideDrain(x, z),
+      /**
+       * 某个世界坐标是否落在**上层台面的体积**里（与 `Game.isOnDeck` 同一份判据）。
+       *
+       * 暴露它的理由与 `insideDrain` 同：验证脚本要按「台面 / 币床」分桶统计，
+       * 而**分桶口径必须来自引擎**。S13 之前脚本用 `deckY()`（一个高度中点）近似，
+       * 那在塔顶高过台面之后会把塔上的币算进台面 —— 读数看着正常，其实是假的。
+       * 现在塔能盖到 9 层（塔顶 0.216 > 高度中点 0.177），这条口径必须精确。
+       *
+       * `z` 用**当前**推板行程（`pusher.topRange`），所以前缘被推出去的币仍算台面币。
+       */
+      isOnDeckAt: (x: number, y: number, z: number) =>
+        isOnDeckVolume(x, y, z, this.pusher.topRange),
+      /**
+       * V2：材质族统计（toon / standard / basic / other）+ 色带数 + 已编译程序数。
+       * 见 `materialReport()` 的注释：这三项都是「只能靠计数发现的静默缺陷」。
+       */
+      materialReport: () => {
+        const base = this.materialReport();
+        // S18：把 `renderer.info.calls` 顺路带上，cabinet-tex 模式可以读到 draw call。
+        (base as unknown as Record<string, unknown>).renderer = {
+          calls: this.renderer.info.render.calls,
+          triangles: this.renderer.info.render.triangles,
+          max: this.rendererPeakDrawCalls,
+        };
+        return base;
+      },
+      /**
+       * 机柜外壳**实测读数**（S19）：逐件给出世界轴对齐盒 + 那件局部 +z 的世界方向。
+       *
+       * 判据（`verify-game.mjs cabinet`）拿它比对 `game/cabinetShape.ts` 里的
+       * `cabinetPartBox()`。★ 为什么必须开这个通道：S18 那次「实心砖」之所以
+       * `perf` / `drawcall` / `programs` / `cabinetTex` / `models` **全绿**通过，
+       * 就是因为没有任何办法把「场景里的几何长什么样」读出来 —— 尺寸全在
+       * `buildCabinetShell` 的函数体里，判据只能手抄第二份公式。
+       *
+       * 返回里的 `normal` 是**局部 +z** 的世界方向，也就是件的「正面法线」。
+       * 招牌靠它判朝向：S18 把倾角符号写反，招牌正面朝了地面，
+       * 而那件事**任何计数型判据都看不见**。S21 删招牌之后它改判檐板正面（法线 ≈ +z）。
+       *
+       * ## `profile`：包围盒内部那些**斜边**的唯一观测通道（S21）
+       *
+       * S21 的侧墙有两处斜边（檐板托的斜接面、低段的斜顶），它们**整个落在包围盒内部**
+       * ⇒ 解析盒比对看不到，写平了也是全绿。所以这里额外把每件几何的**顶点集合**
+       * 投影到 (y, z) 平面去重后带出来，由判据与 `cabinetWallOutline()` 的折线比对。
+       *
+       * 去掉 x 是有意的：轮廓沿 x 挤出，同一组 (y, z) 在两个端面上各出现一次，
+       * 投影后自然合并成一份；坐标先量化到 1e-4 米（float32 的舍入在 1.7e-7 量级，
+       * 差四个数量级，量化不会把两个不同的顶点并成一个）。
+       */
+      cabinetReport: () => {
+        const out: Array<{
+          part: string;
+          role: string | null;
+          min: [number, number, number];
+          max: [number, number, number];
+          normal: [number, number, number];
+          profile: Array<[number, number]>;
+        }> = [];
+        const vertex = new THREE.Vector3();
+        this.tableGroup?.traverse((child) => {
+          const mesh = child as THREE.Mesh;
+          if (mesh.isMesh !== true) return;
+          const part = mesh.userData.part as string | undefined;
+          if (!part) return;
+          mesh.updateWorldMatrix(true, false);
+          const box = new THREE.Box3().setFromObject(mesh);
+          const normal = new THREE.Vector3(0, 0, 1).transformDirection(mesh.matrixWorld).normalize();
+
+          // (y, z) 顶点集合：量化去重 + 排序，顺序无关（比对的是集合）。
+          const seen = new Set<string>();
+          const profile: Array<[number, number]> = [];
+          const position = mesh.geometry?.getAttribute?.('position');
+          if (position) {
+            for (let i = 0; i < position.count; i += 1) {
+              vertex.fromBufferAttribute(position, i).applyMatrix4(mesh.matrixWorld);
+              const y = Math.round(vertex.y * 1e4) / 1e4;
+              const z = Math.round(vertex.z * 1e4) / 1e4;
+              const key = `${y},${z}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              profile.push([y, z]);
+            }
+            profile.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+          }
+
+          out.push({
+            part,
+            role: (mesh.userData.role as string | undefined) ?? null,
+            min: [box.min.x, box.min.y, box.min.z],
+            max: [box.max.x, box.max.y, box.max.z],
+            normal: [normal.x, normal.y, normal.z],
+            profile,
+          });
+        });
+        return out;
+      },
+      /**
+       * 外壳形状的**应用实例**读数（S24）。
+       *
+       * ★ 它不能用 `page.evaluate(import('/src/game/cabinetShape.ts'))` 代替：
+       * Vite 给应用内的模块 URL 带了 HMR 查询串，裸 `import()` 拿到的是
+       * **另一个模块实例** —— 实测把 `hood.valanceInnerZ` 改成 0.3 之后，
+       * 那边读到的仍是 0.195、`isCabinetOverridden()` 仍是 false。
+       * 用它验「覆盖层生效了吗」会**恒 false**（永远绿），等于没查。
+       */
+      cabinetShapeReport: () => {
+        const boxes: Record<string, Box3Like> = {};
+        for (const part of CABINET_SHELL_PARTS) boxes[part] = cabinetPartBox(part);
+        return {
+          overridden: isCabinetOverridden(),
+          shape: cabinetShape() as unknown as Record<string, unknown>,
+          parts: [...CABINET_SHELL_PARTS],
+          boxes,
+          outlines: {
+            tall: cabinetWallOutline('tall').map(([z, y]) => [z, y]),
+            low: cabinetWallOutline('low').map(([z, y]) => [z, y]),
+          },
+        };
+      },
+      /**
+       * 模型模式（S24，`?model`）的测试钩子。
+       *
+       * 判据（`verify-game.mjs model`）只走这几个 —— 它们内部走的是
+       * **与面板同一条路**（`setFieldForTest` → `onShapeChanged` → 重建整具外壳），
+       * 而不是自己另造一具。两条路一旦分叉就会出现「面板上能用、判据红」
+       * 这种没法解释的差异。
+       *
+       * 非 `?model` 下 `modelMode` 为 null ⇒ 一律回答「未启用」。
+       */
+      modelModeEnabled: () => this.modelMode?.enabled === true,
+      modelModeDiffCount: () => this.modelMode?.diffCount() ?? -1,
+      modelModeSelected: () => this.modelMode?.selectedPart() ?? null,
+      modelModeSet: (path: string, value: number) => this.modelMode?.setFieldForTest(path, value),
+      modelModeReset: () => this.modelMode?.resetForTest(),
+      modelModeSelect: (part: string) => this.modelMode?.selectForTest(part) ?? false,
+      modelModeOutlineCount: () => this.modelMode?.outlineCount() ?? -1,
+      /**
+       * V4：币面贴图的实际纹素与采样设置。
+       * 把「贴图本身对不对」与「渲染对不对」切开——币的颜色链路有四层，
+       * 只看截图没法定位是哪一层出的问题。
+       */
+      /**
+       * S22：摄影机机位读数。
+       *
+       * 连同 `autoFit` 与 `cameraPeakOffset` 一起交出来，因为「手动动机位」最容易
+       * 踩坏的就是 S17 那条铁律：`cameraPeakOffset` 必须恒为 0
+       * （电机位之后 `cameraBase` 要跟着走，否则每一帧都在记「相机偏离了基准」）。
+       */
+      cameraReport: () => ({
+        ...cameraRigReport(),
+        autoFit: this.tuning.cameraAutoFit,
+        cameraPeakOffset: this.cameraPeakOffset,
+      }),
+      /**
+       * S22：改写机位。与调试面板的「摄影机」分组走**同一组纯函数**
+       * （`placeCameraRig` / `syncCameraRigAngles`），不另开一条脚本专用通道 ——
+       * 两条路一旦分叉就会出现「面板绿、脚本红」这类没法解释的差异。
+       *
+       * ★ 手动字段（角度 / 相机坐标 / 观察点）一旦出现就**交出所有权**
+       * （`cameraAutoFit = false`），与面板 setter 里的 `takeOwnership()` 完全同义。
+       * 不这样做的话，脚本摆完机位之后改 FOV 会被 `fitCamera()` 弹回默认视角，
+       * 而面板上不会 —— 那正是「两条路分叉」。
+       * 只给 `autoFit` 一项时不翻：否则「回到默认取景」（`{ autoFit: true }`）
+       * 会把自己刚打开的开关关掉。
+       */
+      setCameraRig: (patch) => {
+        const manual =
+          patch.yawDeg !== undefined ||
+          patch.pitchDeg !== undefined ||
+          patch.distance !== undefined ||
+          patch.camX !== undefined ||
+          patch.camY !== undefined ||
+          patch.camZ !== undefined ||
+          patch.targetX !== undefined ||
+          patch.targetY !== undefined ||
+          patch.targetZ !== undefined;
+        if (manual) this.tuning.cameraAutoFit = false;
+        else if (patch.autoFit !== undefined) this.tuning.cameraAutoFit = patch.autoFit;
+        // 先按取景框解一次（只在**要求**自动、且没有手动字段时），后面给的显式字段一律盖在它上面。
+        if (patch.autoFit === true && !manual) {
+          fitCameraRig(this.tuning.cameraFov, this.camera.aspect);
+        }
+
+        if (patch.targetX !== undefined || patch.targetY !== undefined || patch.targetZ !== undefined) {
+          if (patch.targetX !== undefined) cameraRig.target.x = patch.targetX;
+          if (patch.targetY !== undefined) cameraRig.target.y = patch.targetY;
+          if (patch.targetZ !== undefined) cameraRig.target.z = patch.targetZ;
+          // 观察点动了、相机没动 ⇒ 只有朝向变，所以是反解角度。
+          syncCameraRigAngles();
+        }
+        if (patch.camX !== undefined || patch.camY !== undefined || patch.camZ !== undefined) {
+          if (patch.camX !== undefined) cameraRig.position.x = patch.camX;
+          if (patch.camY !== undefined) cameraRig.position.y = patch.camY;
+          if (patch.camZ !== undefined) cameraRig.position.z = patch.camZ;
+          syncCameraRigAngles();
+        }
+        if (patch.yawDeg !== undefined || patch.pitchDeg !== undefined || patch.distance !== undefined) {
+          if (patch.yawDeg !== undefined) cameraRig.yaw = toRad(patch.yawDeg);
+          if (patch.pitchDeg !== undefined) cameraRig.pitch = toRad(patch.pitchDeg);
+          if (patch.distance !== undefined) cameraRig.distance = patch.distance;
+          placeCameraRig();
+        }
+
+        this.applyCameraRigFromPanel();
+        this.debugTools.refreshCameraControllers();
+        // 带上 `autoFit`：不然脚本没法在一句话里验「手动字段是否顺手交出了所有权」
+        // （面板那侧靠复选框显示，脚本没得看）。
+        return { ...cameraRigReport(), autoFit: this.tuning.cameraAutoFit };
+      },
+      coinReport: () => this.coins.coinReport(),
       collection: () => ({
         wallet: this.save.wallet,
         coinSkins: [...this.save.snapshot.coinSkins],
@@ -1417,6 +2705,33 @@ export class Game {
         this.collection.refresh();
         this.applySkins();
         return { wallet: this.save.wallet };
+      },
+      /**
+       * 往钱包里补筹码（测试/调试用）。
+       *
+       * 存在的理由：**验证脚本会在同一个会话里反复 `startRun`，而每次开局都从钱包扣 20**，
+       * 只在收工（`endRun` → `showEndlessSummary`）时才回存。脚本跑十几条用例就把钱包掏空了，
+       * 于是 `buyIn` 变 0 —— 而引擎现在会正确地以「开局即破产」响应（见 `startRun`）。
+       * 那些用例测的是玩法而不是破产，所以在 `startRun` 之前先补满。
+       *
+       * 充值额记进 `SaveStore.refilled`，钱包守恒算式把它算进去（`run()` 钩子暴露）。
+       */
+      refillWallet: (amount = 200) => {
+        this.save.refillWallet(amount);
+        this.publishHud();
+        return { wallet: this.save.wallet, refilled: this.save.refilled };
+      },
+      /**
+       * 把钱包设成指定值（验证脚本用）。
+       *
+       * 存在的理由：**「钱包见底 → 开局筹码 0」那条死锁必须能被确定性地构造出来。**
+       * 靠反复 `startRun` 把 200 扣完要跑十局、又慢又不稳；直接置零才是一步到位的
+       * 冷路径判据。差额记进 `SaveStore.refilled`，守恒式照样精确。
+       */
+      setWallet: (amount: number) => {
+        this.save.setWallet(amount);
+        this.publishHud();
+        return { wallet: this.save.wallet, refilled: this.save.refilled };
       },
       unlockSkin: (kind: string, id: string, cost: number) => {
         const unlocked = this.save.unlockSkin(kind as 'coin' | 'cabinet', id, cost);
@@ -1437,14 +2752,222 @@ export class Game {
       /** P4 投放演出：统一入口。返回值含承诺数/降级标记，事件进 telemetry.showEvents。 */
       showRequest: (id: string, opts?: { count?: number; kind?: CoinKind; x?: number }) =>
         this.shows.request(id as ShowId, opts),
+      /**
+       * 纯视觉币通道的读数 + 统计清零（S16）。
+       *
+       * 为什么需要它：这条通道**故意不进任何账本**，所以「它到底跑没跑」
+       * 在 `activeCoins` / `earned` / `drained` 上一个字都看不出来。
+       * 判据要证明的三件事都只能从这里读：
+       *   ① `launched > 0` —— 演出真的喷了视觉币；
+       *   ② `peakYOutside >= 1.6` —— 币是**从玻璃顶沿之上**飞出去的，不是穿过围板；
+       *   ③ `active === 0 && visible === false` —— 演出结束后全部回收，空闲不占 draw call。
+       */
+      sprayReport: (reset = false) => {
+        const snapshot = this.spray.report();
+        if (reset) this.spray.resetStats();
+        return snapshot;
+      },
+      /** 视觉币的材质与铜币材质是否同 defines（判据：证明 0 新增程序）。 */
+      sprayMaterial: () => {
+        const spray = this.spray.currentMaterial;
+        const bronze = this.coins.materialFor('bronze');
+        return {
+          spray: { ...(spray.defines ?? {}) },
+          bronze: { ...(bronze.defines ?? {}) },
+          /**
+           * 两张贴图的 **uuid**（不是内容）。
+           *
+           * 判据用它对两件事：① 换肤 / 改分辨率之后视觉币的贴图**真的重建了**
+           * （uuid 变了）；② 它与铜币那张是**两个实例**——
+           * 共享同一个实例会让 `CoinPool.dispose()` 把视觉币的贴图一起释放掉，
+           * 那是零报错的静默失效（币渲染成空）。
+           */
+          sprayMap: spray.map?.uuid ?? null,
+          bronzeMap: bronze.map?.uuid ?? null,
+        };
+      },
+      /**
+       * S18：数 scene 里挂 `map` 通道的机柜部件材质数。
+       *
+       * 招牌 + 得分线 + 热区三件都挂了——剩 0 表示漏挂，剩 > 3 表示别处加了。
+       */
+      cabinetMapCount: () => {
+        let count = 0;
+        const seen = new Set<THREE.Material>();
+        this.scene.traverse((child) => {
+          if (!(child as THREE.Mesh).isMesh) return;
+          const mesh = child as THREE.Mesh;
+          const list = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+          for (const entry of list) {
+            if (!isLitMaterial(entry)) continue;
+            if (seen.has(entry)) continue;
+            seen.add(entry);
+            if (entry.map) count += 1;
+          }
+        });
+        return count;
+      },
+      /**
+       * 装置规模表（枚数 / 最低交付）。
+       *
+       * 判据写「实发 = 承诺」时必须**读这张表**而不是手抄数字——
+       * S6 把塔从 1 枚改到 16 枚是配置变更，不是回归。
+       */
+      showSpecs: () => ShowDirector.showSpecs(),
+      /**
+       * 「加力已存满」的兜底配置（P10 ⑨）。
+       *
+       * 判据同样**从引擎读**：兜底用哪个装置、发几枚都是可调的平衡旋钮，
+       * 抄进脚本就成了第二份真源。
+       */
+      boostOverflowSpec: () => ({ ...BOOST_OVERFLOW_FALLBACK, cap: RULES.boostStoreCap }),
+      /**
+       * 自动补币的配置（P10 ⑦）。
+       *
+       * 判据**从引擎读阈值**，不在脚本里手抄 180 / 8 / 7：那些是可调的平衡旋钮，
+       * 抄一份到测试里，S11 标定时判据就会开始骗人（改配置却报红，或者更糟——
+       * 配置改了判据还在用旧值，于是它测的根本不是线上那套数）。
+       */
+      refillSpec: () => ({ ...REFILL, budget: COIN.budget }),
+      /**
+       * 得分反馈分级（P10 ⑨）。
+       *
+       * 判据**从引擎读阈值**（飞字大号 25 / 连落 3 脉冲 / 连落 5 白闪），
+       * 不在脚本里手抄——S11 标定时会调它们，抄一份到测试里就会开始骗人。
+       * 峰值一并给出：判据要核对「脉冲确实到了峰值」而不是只涨了一点点。
+       */
+      feedbackSpec: () => ({
+        ...FEEDBACK,
+        emissive: { ...FEEDBACK_EMISSIVE },
+      }),
+      /**
+       * 反馈分级的**纯函数**（判据枚举边界点，不重写分支）。
+       *
+       * 输入只给「筹码 / 连落 / 是否热区 / 币种」，`kindClimax` 由引擎自己
+       * 从 `kindSpec()` 取——币种的高潮定义单一真源在 `kinds.ts`，
+       * 让测试传进来等于把它抄成第二份。
+       */
+      crossingFeedbackProbe: (input: {
+        chips: number;
+        combo: number;
+        hot: boolean;
+        kind?: string;
+        blocked?: boolean;
+      }) =>
+        crossingFeedback({
+          chips: input.chips,
+          combo: input.combo,
+          hot: input.hot,
+          kindClimax: kindSpec((input.kind ?? 'bronze') as CoinKind).climax,
+          blocked: input.blocked,
+        }),
+      /**
+       * 反馈的**实时状态**：计数 + 三个材质的自发光。
+       *
+       * 计数与画面同源（都由 `crossingFeedback()` 的结果驱动），所以判据读它们
+       * 就能同时证明「分支走对了」与「视觉真的动了」——只读计数会漏掉
+       * 「计数在涨但材质没接上」这种半接线状态。
+       */
+      feedbackReport: () => this.feedbackReport(),
+      /**
+       * 直接走一次飞字（测试用）：坐标是合成的，**代码路径是真的**
+       * （`Hud.flyScore` + `flyTier` 的分档判定）。
+       *
+       * 存在的理由：`chips ≥ 25` 的入账要靠高价值币越线才出得来，
+       * 而「大号飞字有没有生效」不该等一枚钻石走到线上才能验。
+       */
+      flyScoreProbe: (chips: number) => {
+        const tier = flyTier(chips);
+        // ★ **刻意不动 `feedbackCounts`**：计数属于引擎那条路（`settleCrossing`），
+        //   这条探针只验表现层（`Hud.flyScore` 有没有按档位画）。
+        //   两者混在一起之后，「真实对局里出了几次大号飞字」就再也说不清了。
+        this.hud.flyScore(640, 360, chips, tier);
+        return {
+          tier,
+          datasetTier: document.querySelector('#hud')?.getAttribute('data-last-fly-tier') ?? null,
+        };
+      },
       /** XIXI 槽位映射（引擎纯函数）：判据枚举调用它收成集合，不在测试里手写分段。 */
       xixiSlot: (x: number) => xixiSlot(x),
+      /**
+       * 直接设定 XIXI 四槽的亮灭（测试用）。
+       *
+       * 存在的理由：四槽要**真的投中**才会亮，而「哪个落点进哪个槽」是物理决定的，
+       * 想凑出「槽 0 与槽 2 亮、槽 1 与 3 灭」这种指定组合得投很多枚。
+       * 这条路径只改渲染状态（`this.xixi` + 推板标牌），不碰存档、不碰遥测。
+       */
+      setXixi: (slots: boolean[]) => {
+        this.xixi = slots.map(Boolean).slice(0, 4);
+        while (this.xixi.length < 4) this.xixi.push(false);
+        this.publishHud();
+        return this.pusher.xixiLaneReport();
+      },
+      /** 推板前缘 XIXI 标牌的实际颜色（判据按计数比对，不看截图）。 */
+      xixiLanes: () => this.pusher.xixiLaneReport(),
       /**
        * 直接摇一次背板老虎机（可指定符号）。
        * 奖励路径必须可逐一指定验证：「力力力→加力入账且 earned 不动」、
        * 「塔塔塔→ShowDirector 登记」，不能靠权重随机去赌。
        */
-      xixiSpin: (symbol?: string) => this.slotMachine.spin(symbol as SlotSymbol | undefined),
+      xixiSpin: (forced?: string) => {
+        const result = this.slotMachine.spin(forced as SlotSymbol | 'fine' | 'miss' | undefined);
+        if (!result) return null;
+        return {
+          kind: result.outcome.kind,
+          symbol: result.outcome.kind === 'win' ? result.outcome.symbol : undefined,
+          faces: this.slotMachine.reelWindowReport().faces,
+        };
+      },
+      /** 滚筒窗读数（与诊断同一个读数，见 `reelDiagnostics`）。 */
+      reelWindowReport: () => this.reelDiagnostics(),
+      /** 像素图标图集的读数：来源、尺寸、每格调色板大小。 */
+      iconReport: () => iconReport(),
+      /**
+       * 结果表的实测分布：把 `rollSlotOutcome` 在 `[0,1)` 上均匀枚举。
+       *
+       * 判据**不写第二份权重公式**（纪律 2）：45/15/40 只存在于 `xixi.ts`，
+       * 测试读的是引擎函数枚举出来的实际分布。改权重忘了改测试 → 测试自动跟上。
+       */
+      slotOdds: (samples = 2000) => {
+        const total = Math.max(1, Math.floor(samples));
+        const counts = { win: 0, fine: 0, miss: 0 };
+        const symbols: Record<string, number> = {};
+        /**
+         * `detailRoll` 走**独立的确定性 LCG**（不引入 `Math.random`：判据要可复现）。
+         *
+         * ⚠️ 不能两个 roll 都用 `i / total`：那样「中奖摇哪个符号」与分类完全相关，
+         * 枚举一遍只会摇出同一个符号（实测：2000 次全是 boost，看起来像「符号表只有一项」）。
+         * 分类比例要精确 → `roll` 等距枚举；符号分布要真实 → `detailRoll` 伪随机。
+         */
+        let seed = 0x2545f491;
+        const nextDetail = () => {
+          seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+          return seed / 0x80000000;
+        };
+        for (let i = 0; i < total; i += 1) {
+          const outcome = rollSlotOutcome(i / total, nextDetail());
+          counts[outcome.kind] += 1;
+          if (outcome.kind === 'win') {
+            symbols[outcome.symbol] = (symbols[outcome.symbol] ?? 0) + 1;
+          }
+        }
+        return { samples: total, counts, symbols };
+      },
+      /**
+       * 停格画面的枚举：给定结果，`reelFacesFor` 沿 `detailRoll` 轴扫一遍。
+       * 判据用它核「win/fine 四连、miss 两两不同」，不在测试里重写这段规则。
+       */
+      reelFaces: (kind: string, symbol?: string) => {
+        const outcome: SlotOutcome =
+          kind === 'fine'
+            ? { kind: 'fine' }
+            : kind === 'miss'
+              ? { kind: 'miss' }
+              : { kind: 'win', symbol: (symbol ?? 'boost') as SlotSymbol };
+        const out: string[][] = [];
+        for (let i = 0; i < 25; i += 1) out.push(reelFacesFor(outcome, i / 25));
+        return out;
+      },
     };
   }
 
@@ -1513,6 +3036,7 @@ export class Game {
      */
     sleeping: boolean;
     playerDropped: boolean;
+    preset: boolean;
   }> {
     const out: Array<{
       slot: number;
@@ -1525,6 +3049,7 @@ export class Game {
       tiltDeg: number;
       sleeping: boolean;
       playerDropped: boolean;
+      preset: boolean;
     }> = [];
     this.coins.coins.forEach((coin, slot) => {
       if (!coin.active) return;
@@ -1545,9 +3070,26 @@ export class Game {
         tiltDeg: round1(tiltDeg),
         sleeping: coin.body.isSleeping(),
         playerDropped: coin.playerDropped,
+        preset: coin.preset,
       });
     });
     return out;
+  }
+
+  /**
+   * 把外部传进来的字符串窄化为 `SelectorKey`。
+   *
+   * 控制台钩子的参数是普通字符串（从 `page.evaluate` 传进来），而 `AudioSystem` 的
+   * 调试接口要的是字面量并集。这里做一次**显式校验**而不是直接 `as SelectorKey`：
+   * 强转会让拼错的槽位名悄悄写进一个不存在的键，排查起来很费劲。
+   */
+  private requireSelectorKey(value: string): SelectorKey {
+    if (!(value in SELECTORS)) {
+      throw new Error(
+        `未知的音效槽位「${value}」。可用槽位：${Object.keys(SELECTORS).join(', ')}`,
+      );
+    }
+    return value as SelectorKey;
   }
 
   /**
@@ -1558,6 +3100,15 @@ export class Game {
     this.renderer.toneMappingExposure = this.tuning.exposure;
     this.audio.setMuted(this.tuning.muted);
     this.pusher.travel = this.tuning.pusherTravel;
+    // 相位时长与加力比例是**每帧现读**的实例字段，写进去就当场生效
+    // （与 `travel` 的「按行程锁存」不同，见 `Pusher.durations` 的注释）。
+    this.pusher.durations = {
+      extend: this.tuning.pusherExtendSec,
+      holdFront: this.tuning.pusherHoldFrontSec,
+      retract: this.tuning.pusherRetractSec,
+      holdBack: this.tuning.pusherHoldBackSec,
+    };
+    this.pusher.boostTravelBonus = this.tuning.boostTravelBonus;
     this.physics.applyTuning({
       gravity: this.tuning.gravity,
       solverIterations: this.tuning.solverIterations,
@@ -1569,7 +3120,50 @@ export class Game {
     for (const coin of this.coins.coins) {
       coin.body.setAdditionalSolverIterations(extraIterations);
     }
+    this.applyCoinPhysics();
     this.fitCamera();
+  }
+
+  /**
+   * 把 `tuning` 里的硬币物理参数写进运行时注册表，并在**真的变了**的时候逐枚施加。
+   *
+   * ## 为什么写注册表而不是直接写币
+   *
+   * `coinPhysics` 是唯一真源：`Coin` 的构造与 `applyCollider` 读它、`fixedUpdate` 的
+   * 速度护栏读它、`coinGeometry()` 钩子也读它。调参表只是它的 UI 镜像。
+   * 只写币不写注册表的话，**之后新生成的币仍按旧值建**（推币机每局都在发新币，
+   * 这个漏洞必然被踩到）。
+   *
+   * ## 为什么要做变化检测
+   *
+   * 逐枚施加是 700 次 rapier setter。`applyTuning` 会被面板的每个滑块拖动触发
+   * （有时每帧一次），而其中只有一小部分与硬币物理有关。不做检测的话，
+   * 拖「曝光」滑块也会顺带遍历 700 枚币。
+   */
+  private applyCoinPhysics(): void {
+    Object.assign(coinPhysics, {
+      friction: this.tuning.coinFriction,
+      restitution: this.tuning.coinRestitution,
+      density: this.tuning.coinDensity,
+      linearDamping: this.tuning.coinLinearDamping,
+      angularDamping: this.tuning.coinAngularDamping,
+      maxSpeed: this.tuning.coinMaxSpeed,
+      maxUpwardSpeed: this.tuning.coinMaxUpwardSpeed,
+    });
+
+    // 只有「写进刚体」的那几项需要逐枚施加；maxSpeed / maxUpwardSpeed 是每子步现读的。
+    const fingerprint = [
+      this.tuning.coinFriction,
+      this.tuning.coinRestitution,
+      this.tuning.coinDensity,
+      this.tuning.coinLinearDamping,
+      this.tuning.coinAngularDamping,
+    ].join('|');
+    if (fingerprint === this.appliedCoinPhysics) return;
+    this.appliedCoinPhysics = fingerprint;
+    for (const coin of this.coins.coins) {
+      coin.applyPhysics();
+    }
   }
 
   /** 竖直向下打一条射线，报告第一个命中的碰撞体（诊断币堆穿模用）。 */
@@ -1725,7 +3319,7 @@ export class Game {
         return name;
       case 'drain':
         // 收尾场景：把筹码清零触发沉降。满盘沉降会回吐筹码 → 本局继续，
-        // 所以这个状态同时也是「停板窗口」的入口（扫板/转轮的开放条件）。
+        // 所以这个状态同时也是「停板窗口」的入口（扫板的开放条件）。
         this.startRun();
         this.run.beginPlay();
         this.run.spendChips(this.run.chips);
@@ -1769,12 +3363,49 @@ export class Game {
       bestCombo: snapshot.bestCombo,
       /** XIXI 四槽亮灭（跨局持续；点亮/集齐事件在 telemetry.xixiEvents）。 */
       xixi: [...this.xixi],
+      /**
+       * 本局被老虎机罚掉的筹码（P10 的胡萝卜四连）。
+       *
+       * 它是**独立的对账口径**：`fines` 不进恒等式（已含在 `spent` 里），
+       * 所以判据要同时看「`fines` 涨了多少」与「`spent ≥ fines`」两件事。
+       */
+      fines: this.run.fines,
       boostCharges: snapshot.boostCharges,
       settleReason: snapshot.settleReason,
-      /** 收尾阶段推板是否已停板（扫板/转轮的开放条件）。 */
+      /** 收尾阶段推板是否已停板（扫板的开放条件）。 */
       plateStopped: snapshot.plateStopped,
       activeCoins: this.coins.activeCount(),
       anomalies: this.anomalyCount,
+      /**
+       * 掉进币床前侧角下水道的币数（P10 的「汇」，见 `DRAIN`）。
+       *
+       * ★ **必须与 `anomalies` 分开读**：两者都让盘面少一枚币，但一个是设计好的
+       * 合法损失、一个是缺陷。混在一起就再也分不清「洞开得太大」和
+       * 「求解器又把币甩出机柜了」。逐枚现场在 `telemetry().drainEvents`。
+       */
+      drained: this.drainCount,
+      /**
+       * 币床上的活跃币数与自动补币的触发次数（P10 ⑦）。
+       *
+       * ★ `bedCoins` 是**上一轮盘点的值**（每 `REFILL.checkEvery` 秒刷一次），
+       * 不是当帧值。判据要先等一个盘点周期再读，否则会把补币前的旧读数当成「没生效」。
+       *
+       * ★ 它**不能**用 `activeCoins` 代替：后者含正在下落的、演出排队没落的、
+       * 上层台面的币，盘面掏空时它仍是三位数（见 `CoinPool.countBed()`）。
+       */
+      bedCoins: this.bedCoins,
+      refills: this.refillCount,
+      /**
+       * 此刻停在**推板顶面**（台面输送带）上的活跃币数。
+       *
+       * 这条读数是「补货的币到没到币床」的**现场**：闸门从背板吐币，币先落在顶面、
+       * 被输送带送过前缘才掉进币床。若输送不带它们走，这 7 枚就会**停在顶面**
+       * ——`activeCoins` 照涨 7，`bedCoins` 一动不动。只有顶面枚数能区分
+       * 「还在路上」与「卡住了」。
+       *
+       * 与输送共用 `isOnDeck` 一份判据（不写第二份），所以它不受降动效影响。
+       */
+      deckCoins: this.countDeckCoins(),
       /** 异常币飞出时的坐标与速度（`anomalies > 0` 时用它定位，最多 12 条）。 */
       anomalySamples: this.anomalySamples,
       /**
@@ -1801,8 +3432,25 @@ export class Game {
         reduced: this.motion.reduced,
         source: this.motion.source,
       },
-      // 机关：剩余次数与币预算余量（后装填/转轮会撞预算上限）。
-      mechanisms: { ...this.mechanismSnapshot(), coinsRemaining: this.coins.remaining },
+      /*
+       * 音频子系统摘要。
+       *
+       * `loadedSamples === 0` 是最有用的一个读数：它说明**全部事件都在走合成音兜底**
+       * （旧 Safari 不支持 Ogg Vorbis，或素材没取到）。没有这个字段的话，
+       * 「音效没变」和「音效加载失败」在脚本层面完全无法区分。
+       */
+      audio: this.audio.debug,
+      // 机关：剩余次数与币预算余量（后装填会撞预算上限）。
+      mechanisms: {
+        ...this.mechanismSnapshot(),
+        coinsRemaining: this.coins.remaining,
+        // P7：停板窗口的宽度与「一个推板循环」的长度。
+        // 判据要拿它们算「窗口 ≥ 2 个循环」，而不是在脚本里手抄 4.8 这个数。
+        restHold: RULES.restHold,
+        // 从推板读而不是读 `PUSHER_PERIOD` 常量：相位时长可调，常量会陈旧。
+        // `scripts/verify-game.mjs` 正是从这里推导推进率基线。
+        pusherPeriod: this.pusher.period,
+      },
       // 投放演出：两态判据读这个——registered 时币尚未动，completed 时币已到位。
       shows: { busy: this.shows.busy, queued: this.shows.queued, active: this.shows.activeId },
       // 加注档位：`mul` 是越线返值倍率（押 5 枚 = ×4，押越大单位期望越低）。
@@ -1845,12 +3493,40 @@ export class Game {
         substeps: this.physics.substeps,
         // 诊断里带上当前物理旋钮：穿模/节奏的每一条实测记录都必须能对应到一组参数上，
         // 否则「这次跑为什么不一样」永远查不出来。
-        tuning: { ...this.physics.tuning, coinSolverIterations: this.tuning.coinSolverIterations },
+        tuning: {
+          ...this.physics.tuning,
+          coinSolverIterations: this.tuning.coinSolverIterations,
+          // 下面两块一律读**实际生效值**（注册表 / 推板实例字段），不读调参表：
+          // 调参表只是 UI 的镜像，真正参与求解的是这两处。
+          coin: {
+            density: coinPhysics.density,
+            friction: coinPhysics.friction,
+            restitution: coinPhysics.restitution,
+            linearDamping: coinPhysics.linearDamping,
+            angularDamping: coinPhysics.angularDamping,
+            maxSpeed: coinPhysics.maxSpeed,
+            maxUpwardSpeed: coinPhysics.maxUpwardSpeed,
+          },
+          pusher: {
+            travel: this.pusher.travel,
+            extendSec: this.pusher.durations.extend,
+            holdFrontSec: this.pusher.durations.holdFront,
+            retractSec: this.pusher.durations.retract,
+            holdBackSec: this.pusher.durations.holdBack,
+            boostTravelBonus: this.pusher.boostTravelBonus,
+            period: this.pusher.period,
+          },
+        },
       },
       performance: {
         fps: round3(this.governor.fps),
         tier: this.governor.current.tier,
-        maxDpr: this.tuning.maxDpr,
+        // 像素分辨率（V1）：取代了旧的 maxDpr。`upscale` 是整数倍率，
+        // `internalHeight` 是实际内部渲染高度（CSS 像素）。
+        pixelTargetHeight: this.tuning.pixelTargetHeight,
+        pixelated: this.pixelScale.pixelated,
+        upscale: this.pixelScale.upscale,
+        internalHeight: this.pixelScale.internalHeight,
         shadows: this.governor.current.shadows,
       },
       collection: {
@@ -1860,6 +3536,7 @@ export class Game {
         coinSkins: this.save.snapshot.coinSkins.length,
         cabinetSkins: this.save.snapshot.cabinetSkins.length,
       },
+      reel: this.reelDiagnostics(),
       renderer: {
         calls: info.render.calls,
         triangles: info.render.triangles,
@@ -1871,8 +3548,43 @@ export class Game {
         clientHeight: canvas.clientHeight,
         width: canvas.width,
         height: canvas.height,
-        dpr: Math.min(window.devicePixelRatio || 1, this.tuning.maxDpr),
+        /** 真实 DPR（设备像素 / CSS 像素）。**只作诊断**，不再参与分辨率计算。 */
+        dpr: window.devicePixelRatio || 1,
+        /** backing store 与 CSS 尺寸的整数比（= `pixelScale.upscale`）。 */
+        upscale: this.pixelScale.upscale,
       },
+    };
+  }
+
+  /**
+   * 背板老虎机（P10）：4 个滚筒窗的读数 + **图标在画布上的后备像素边长**。
+   *
+   * 「图标糊不糊」在截图上只能反推（是窗口太小？贴图被缩放？倍率档位不对？），
+   * 读出来就是一组数。`iconBackPixels` 的设计目标是 **32**（32×32 图标 1:1）：
+   *   0.34 m 窗 × 191 CSS px/m ÷ upscale 2 ≈ 32.5
+   * 判据写「≥ 24」而不是「=== 32」——降档时 `upscale` 变大会把它压小，
+   * 那是画质分档的正常行为，不是缺陷。
+   *
+   * 抽成方法而不是写在 `publishDiagnostics` 里的 IIFE：**诊断与测试钩子必须是
+   * 同一个读数**，两份写法迟早在改参数时对不上。
+   */
+  private reelDiagnostics(): ThreeGameDiagnostics['reel'] {
+    const report = this.slotMachine.reelWindowReport();
+    const window = this.backPixelSize(report.windowSize, 0, report.windowY, report.windowZ);
+    return {
+      ...report,
+      /** 图标边长（**后备缓冲像素**，当前像素倍率下）。 */
+      iconBackPixels: round3(window),
+      /** 同上但按 **CSS 像素**：档位无关的「窗口角尺寸选得对不对」读数。 */
+      iconCssPixels: round3(window * this.pixelScale.upscale),
+      /**
+       * 四格占用的世界宽度（含缝）。用来核对它没超出机台宽度——
+       * 从报告里的 pitch 与 size 反解，不在诊断里重写一份几何公式。
+       */
+      rowWidth: round3(
+        report.windowSize * report.count +
+          (report.count - 1) * (report.windowPitch - report.windowSize),
+      ),
     };
   }
 
@@ -1880,8 +3592,7 @@ export class Game {
     const element = document.querySelector<HTMLElement>(selector);
     if (!element) throw new Error(`缺少元素: ${selector}`);
     return element;
-  }
-}
+  }  }
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -1889,6 +3600,41 @@ function clamp(value: number, min: number, max: number): number {
 
 function round3(value: number): number {
   return Math.round(value * 1000) / 1000;
+}
+
+/**
+ * 按 `userData.part` 选出对应的 Arcane 贴图工厂（S19：判据从 `role` 改成 `part`）。
+ *
+ * 返回 `null` 表示该件不需要换贴图 ⇒ 跳过（保持原 `map`）。
+ *
+ * - `scoreLine` → `createArcaneScoreLineTexture`
+ * - `hotZone` → `createArcaneHotZoneTexture`
+ * - `hoodRoof` / `hoodValance` → `createArcaneMarqueeTexture`（两件共用一份
+ *   `trimMaterial`，所以这里只会真的建一张 —— 见 `applyCabinetMapTextures` 的 `touched`）
+ *
+ * ★ S21：招牌 `marquee` 这一件被删除了，但**这条通路一个字都不用改** ——
+ * `hoodValance`（檐板）本来就在上面那一支里，删掉 `marquee` 之后它自然成为
+ * 招牌画布的唯一承载者（用户批注 ①②）。
+ *
+ * ## ★ 为什么必须从 `role` 改成 `part`（S19）
+ *
+ * S18 按 `role` 判，但**全仓库没有任何网格挂 `scoreLine` / `hotZone` 这两个 role**
+ * （得分线与热区亮条只有材质，没有 role），于是那两条分支是**死代码**：
+ * 切肤之后得分线与热区仍然挂着建场时写死的 `'viArcane'` / `'firelight'`，
+ * 永远不跟着 `marqueePalette` 走 —— 不报错、不崩溃，只是颜色不再变。
+ * 而 `role === 'trim'` 又同时命中招牌 / 顶沿 / 前立面压条三件用途不同的件。
+ *
+ * 一个字段干两件事，就必然在某个维度上少一个词。补上 `part` 之后，
+ * `role` 回到纯粹的「色带」语义。见 `game/cabinetShape.ts` 的 `CabinetPart`。
+ */
+function pickCabinetMap(part: string | undefined, palette: ArcanePaletteKey): THREE.Texture | null {
+  if (part === 'scoreLine') return createArcaneScoreLineTexture(palette);
+  if (part === 'hotZone') return createArcaneHotZoneTexture(palette);
+  // 檐板＝招牌画布（S21）；顶板与它共用 `trimMaterial`，所以实际只会建一张贴图。
+  if (part === 'hoodRoof' || part === 'hoodValance') {
+    return createArcaneMarqueeTexture(palette);
+  }
+  return null;
 }
 
 /** 角度只留一位小数：诊断里要的是「平躺 / 搭着 / 立起」三档，不是精确姿态。 */

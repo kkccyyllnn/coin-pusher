@@ -1,5 +1,7 @@
 import type { EndlessConfig } from '../game/endless';
 import type { BetTier } from '../game/economy';
+import type { ClimaxTone } from '../game/kinds';
+import type { FlyTier } from '../game/feedback';
 import { MECHANISM_COST } from './Mechanisms';
 import type { RunSnapshot } from './RunState';
 import { closingLine, tauntFor } from './Taunts';
@@ -8,7 +10,6 @@ export type MechanismSnapshot = {
   sweeper: number;
   grapple: number;
   reload: number;
-  wheel: number;
 };
 
 /** 破产弹窗 / 本局结算卡片的内容。 */
@@ -50,7 +51,13 @@ export class Hud {
   private readonly statusLine = this.el('#status-line');
   private readonly comboToast = this.el('#combo-toast');
   private readonly markNote = this.el('#mark-note');
-  private readonly marks = Array.from(document.querySelectorAll<HTMLElement>('#xixi-marks .mark'));
+  /**
+   * XIXI 集章的容器。
+   *
+   * ⚠️ **四槽的亮灭不在这里画。** 它们已经内嵌进 3D 模型（推板前缘的四段标牌，
+   * 见 `Pusher.buildXixiLanes`），HUD 只负责一行进度文字。
+   * 早先这里还有四个 DOM 圆点，与 3D 标牌叠在同一处屏幕上，两套同样的东西互相打架。
+   */
   private readonly channelMarks = this.el('#xixi-marks');
   private readonly dropButton = this.el<HTMLButtonElement>('#drop-button');
   private readonly dropState = this.el('#drop-state');
@@ -67,8 +74,6 @@ export class Hud {
   private readonly grappleState = this.el('#grapple-state');
   private readonly reloadButton = this.el<HTMLButtonElement>('#reload-button');
   private readonly reloadState = this.el('#reload-state');
-  private readonly wheelButton = this.el<HTMLButtonElement>('#wheel-button');
-  private readonly wheelState = this.el('#wheel-state');
   private readonly betButton = this.el<HTMLButtonElement>('#bet-button');
   private readonly betState = this.el('#bet-state');
   private readonly ruinPanel = this.el('#ruin-panel');
@@ -79,7 +84,6 @@ export class Hud {
   private readonly begButton = this.el<HTMLButtonElement>('#beg-button');
 
   private lastComboShown = 0;
-  private lastMarks: boolean[] = [false, false, false, false];
   private lastBoostCharges = 0;
 
   bindPauseToggle(handler: () => void): void {
@@ -166,32 +170,22 @@ export class Hud {
     return !this.ruinPanel.hidden;
   }
 
-  /** 印记点亮：弹跳放大一次。 */
-  private popMark(element: HTMLElement): void {
-    if (this.reducedMotion) return;
-    element.animate(
-      [
-        { transform: 'scale(1)' },
-        { transform: 'scale(1.3)' },
-        { transform: 'scale(1)' },
-      ],
-      { duration: 250, easing: 'ease-out' },
-    );
-  }
-
-  /** 集齐三路：三点同闪，并把一枚「充能」滑向加力按钮。 */
+  /**
+   * 集齐四槽：整条提示闪一下，并把一枚「充能」滑向加力按钮。
+   *
+   * 闪的是容器而不是四个圆点 —— 圆点已经搬进 3D 模型了（见 `channelMarks` 的说明），
+   * 这里只保留「集齐了」这个瞬时反馈。
+   */
   private playChannelComplete(): void {
     if (this.reducedMotion) return;
-    this.marks.forEach((element, index) => {
-      element.animate(
-        [
-          { boxShadow: '0 0 0 rgba(224,176,97,0)' },
-          { boxShadow: '0 0 22px rgba(224,176,97,0.95)' },
-          { boxShadow: '0 0 0 rgba(224,176,97,0)' },
-        ],
-        { duration: 520, delay: index * 60, easing: 'ease-out' },
-      );
-    });
+    this.channelMarks.animate(
+      [
+        { boxShadow: '0 0 0 rgba(224,176,97,0)' },
+        { boxShadow: '0 0 22px rgba(224,176,97,0.95)' },
+        { boxShadow: '0 0 0 rgba(224,176,97,0)' },
+      ],
+      { duration: 520, easing: 'ease-out' },
+    );
     this.flyChip(this.channelMarks, this.boostButton, '加力就绪');
   }
 
@@ -236,11 +230,19 @@ export class Hud {
   /**
    * 越线返值：从币的屏幕位置飘一个「+N」。
    * 坐标由 Game 投影世界坐标得到——飞字必须从**真的越线位置**起飞。
+   *
+   * `tier` 由 `Game` 用 `flyTier()`（`feedback.ts` 的单一真源）算好传进来，
+   * 所以「哪个数是大号」只有一份定义；这里只负责画。
+   * 同时把档位写进 `#hud[data-last-fly-tier]`：飞字 420 毫秒后就自毁了，
+   * 判据去 DOM 里抓它是**时序赌博**，读这个持久属性才是稳的。
    */
-  flyScore(x: number, y: number, value: number): void {
+  flyScore(x: number, y: number, value: number, tier: FlyTier = 'normal'): void {
+    this.hud.dataset.lastFlyTier = tier;
+    this.hud.dataset.lastFlyValue = String(value);
     if (this.reducedMotion) return;
     const chip = document.createElement('span');
-    chip.className = 'fly-score';
+    chip.className = tier === 'big' ? 'fly-score big' : 'fly-score';
+    chip.dataset.tier = tier;
     chip.textContent = `+${value}`;
     chip.style.left = `${x}px`;
     chip.style.top = `${y}px`;
@@ -251,7 +253,7 @@ export class Hud {
         { transform: 'translate(-50%, -50%) scale(1.05)', opacity: 1, offset: 0.25 },
         { transform: 'translate(-50%, -50%) scale(0.7) translateY(-48px)', opacity: 0 },
       ],
-      { duration: 420, easing: 'cubic-bezier(0.4, 0.1, 0.6, 1)' },
+      { duration: tier === 'big' ? 560 : 420, easing: 'cubic-bezier(0.4, 0.1, 0.6, 1)' },
     ).finished.then(
       () => chip.remove(),
       () => chip.remove(),
@@ -262,7 +264,7 @@ export class Hud {
     snapshot: RunSnapshot,
     config: EndlessConfig,
     best: number,
-    mechanisms: MechanismSnapshot = { sweeper: 0, grapple: 0, reload: 0, wheel: 0 },
+    mechanisms: MechanismSnapshot = { sweeper: 0, grapple: 0, reload: 0 },
     bet: BetTier = { chips: 1, mul: 1, label: '1 投 · ×1' },
     wallet = 0,
     /** XIXI 四槽亮灭（Game 持有，跨局持续；P5 起不再挂在 RunState 快照上）。 */
@@ -275,19 +277,23 @@ export class Hud {
     this.walletValue.textContent = String(wallet);
     this.creditsValue.textContent = String(snapshot.chips);
 
-    this.marks.forEach((element, index) => {
-      const lit = xixi[index] === true;
-      if (lit && this.lastMarks[index] !== true) this.popMark(element);
-      this.lastMarks[index] = lit;
-      element.classList.toggle('lit', lit);
-      element.setAttribute('aria-label', `XIXI 第 ${index + 1} 槽（${XIXI_GLYPHS[index]}）${lit ? '已点亮' : '未点亮'}`);
-    });
-    // 加力进账（老虎机「力力力」）：四点同闪并把一枚「充能」滑向加力按钮，
+    // XIXI 进度只出一行文字：四槽的亮灭**画在 3D 模型里**（推板前缘的四段标牌），
+    // 这里不再重复画一遍圆点。进度仍按 `xixi` 数，与 3D 标牌同源。
+    const litCount = xixi.filter(Boolean).length;
+    this.markNote.textContent = `XIXI 集章 ${litCount}/${xixi.length} · 投币点亮四槽，集齐摇老虎机`;
+    this.channelMarks.setAttribute(
+      'aria-label',
+      `XIXI 集章 ${litCount}/${xixi.length}（${xixi
+        .map((lit, index) => `${XIXI_GLYPHS[index]}${lit ? '已亮' : '未亮'}`)
+        .join(' ')}）`,
+    );
+    // 加力进账（老虎机「力力力」）：整条提示闪一下并把一枚「充能」滑向加力按钮，
     // 把「摇中了」直接导向下一步该按哪个键。
     if (snapshot.boostCharges > this.lastBoostCharges) this.playChannelComplete();
     this.lastBoostCharges = snapshot.boostCharges;
-    this.markNote.textContent =
-      snapshot.boostCharges > 0 ? '加力已就绪，随时可用' : '投币点亮 XIXI 四槽，集齐摇老虎机';
+    // 加力就绪时**顶掉**进度文字：此刻玩家该做的事从「继续集章」变成了「用加力」，
+    // 两句话挤在同一行只会都读不清。上面的进度已写进 `aria-label`，信息没丢。
+    if (snapshot.boostCharges > 0) this.markNote.textContent = '加力已就绪，随时可用';
 
     // 加力未充能时**隐藏**，而不是置灰——没充能时这个按钮不该占位置。
     const boostReady =
@@ -330,11 +336,6 @@ export class Hud {
 
     this.betButton.disabled = snapshot.phase === 'settled';
     this.betState.textContent = bet.label;
-
-    const canWheel = snapshot.phase === 'drainOut' && snapshot.chips > 0;
-    this.wheelButton.disabled = !canWheel || mechanisms.wheel <= 0;
-    this.wheelState.textContent =
-      mechanisms.wheel <= 0 ? '本局已用完' : `押 ${snapshot.chips} 筹码 · 收尾可用`;
   }
 
   /**
@@ -347,8 +348,32 @@ export class Hud {
     this.channelMarks.style.top = `${Math.round(topPx)}px`;
   }
 
-  setStatus(text: string): void {
+  /**
+   * 状态行。
+   *
+   * `kind` 会写到 `#status-line` 的 `data-kind` 上，**这是给判据用的**：
+   * 「自动补币有没有给玩家反馈」如果靠匹配文案来判，改一次措辞判据就假红
+   * ——那等于在测试里维护第二份文案。读 `data-kind` 问的是「这句话是谁说的」，
+   * 与措辞无关。默认 `'info'`：任何后来的状态都会把它覆盖回去，这正是期望行为。
+   */
+  setStatus(text: string, kind = 'info'): void {
     this.statusLine.textContent = text;
+    this.statusLine.dataset.kind = kind;
+  }
+
+  /**
+   * 自动补币的 HUD 反馈（P10 ⑦）。
+   *
+   * 独立成方法而不是就地拼一句 `setStatus(...)`，是为了让「补币有反馈」成为
+   * **可判据的事实**：验证脚本读 `#status-line[data-kind="refill"]`，
+   * 而不是去匹配「庄家补货」这四个字。
+   */
+  showRefill(bedCoins: number, promised: number, downgraded: boolean): void {
+    this.setStatus(
+      `台面见底（${bedCoins} 枚）：庄家补货 ${promised} 枚` +
+        (downgraded ? '（余量不足，按实有交付）' : ''),
+      'refill',
+    );
   }
 
   /** 越线入账：本局赚进那一位数字弹一下，并把这次入账记在 data 上供测试读取。 */
@@ -389,12 +414,20 @@ export class Hud {
     this.drainPrompt.hidden = !visible;
   }
 
-  /** 高潮反馈：屏幕边缘一次性闪一下，金色给高分币/连落，绿色给返币。 */
-  flashClimax(kind: 'gold' | 'green'): void {
+  /**
+   * 高潮反馈：屏幕边缘一次性闪一下，金色给高分币/连落，绿色给返币，
+   * 白色给「连落 5 次」（与币种无关的那一档）。
+   *
+   * ★ `classList.remove(...)` 的名单必须与 `ClimaxTone`（`kinds.ts`）逐项一致：
+   * 漏掉一个，上一个色调的 class 会赖在元素上——零报错的静默错
+   * （下一次闪的其实是上一个颜色，因为 CSS 里两个动画规则同时命中，
+   * 后定义的那条赢）。
+   */
+  flashClimax(tone: ClimaxTone): void {
     const element = this.climaxFlash;
-    element.classList.remove('gold', 'green');
+    element.classList.remove('gold', 'green', 'blue', 'white');
     void element.offsetWidth;
-    element.classList.add(kind);
+    element.classList.add(tone);
   }
 
   private el<T extends HTMLElement = HTMLElement>(selector: string): T {

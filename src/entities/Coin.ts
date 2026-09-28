@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import * as RAPIER from '@dimforge/rapier3d-compat';
 import { COIN, type CoinKind } from '../game/constants';
+import { coinPhysics } from '../game/coinPhysics';
+import { coinColliderKey, coinColliderSpec } from './coinModels';
 
 /**
  * 渲染挂接点。P3 起币的渲染走 CoinPool 的 4 组 InstancedMesh，
@@ -25,6 +27,20 @@ const _matrix = new THREE.Matrix4();
 export class Coin {
   readonly body: RAPIER.RigidBody;
 
+  /**
+   * 碰撞体。S15 起**形状随币种变**（见 `applyCollider`），所以这里要留引用。
+   *
+   * ⚠️ 在 `RAPIER.ColliderDesc` 上改形状是做不到的 —— `ColliderDesc` 只在创建时
+   * 被消费一次。运行期改形状只能走 `Collider.setShape()`。
+   */
+  private readonly collider: RAPIER.Collider;
+  /**
+   * 当前碰撞体形状的指纹。**用来跳过无谓的 `setShape()`**：
+   * 每一局开局要 spawn 三百多枚币，绝大多数是普通币、形状从头到尾没变过，
+   * 无脑 setShape 会让开局多三百多次 wasm 调用（而且每次都重算质量属性）。
+   */
+  private colliderKey = '';
+
   /** 渲染槽：所属组的 InstancedMesh 与组内实例下标。未激活时为 null / -1。 */
   renderMesh: THREE.InstancedMesh | null = null;
   renderIndex = -1;
@@ -33,6 +49,21 @@ export class Coin {
   active = false;
   /** 只有玩家主动投入的币才有资格点亮 XIXI 槽位。 */
   playerDropped = false;
+  /**
+   * 这枚币是**开局预置**的（`Game.startRun` 摆盘时落下），不是运行期注入的。
+   *
+   * 存在的唯一理由是给台面输送带留一个例外，见 `Game.fixedUpdate` 里那段：
+   * 预置的上层币不吃输送（它们的唯一动力是推板顶面的摩擦，于是随推板前后滑动、
+   * 停在原地——「推币台上下都有金币」的观感才留得住）；**运行期注入的币一律要吃**，
+   * 否则它们会停在推板顶面上再也下不来。
+   *
+   * ⚠️ 这个区分以前是**借用 `playerDropped` 表达的**（「不是玩家投的就不输送」），
+   * 在只有预置币的年代恰好等价。P10 把 `gate` 接成自动补币装置之后就不等价了：
+   * 闸门从背板吐出的币落在推板顶面，被判成「不是玩家投的」→ 不吃输送 →
+   * 在顶面原地停住，**一枚都到不了币床**。而 `show` 模式的判据只数「活跃币多了 7 枚」，
+   * 全绿。补币的第一条行为判据（币床枚数要回升）才把它照出来。
+   */
+  preset = false;
   /** 已经登记过 XIXI 槽位（每枚只登记首次）。 */
   xixiMarked = false;
   /** 已越过得分线，防止重复结算。 */
@@ -47,6 +78,16 @@ export class Coin {
   betMul = 1;
   /** 上一物理步是否在推板顶面上，用于识别「离开台面」这一刻。 */
   onDeck = false;
+  /**
+   * 本次下落的**峰值下坠速度**（米/秒，取最负值）。`0` 表示"当前没在下落"。
+   *
+   * 落定音靠它识别「下落 → 静止」的转变：`vy` 越过阈值不再为负时，
+   * 若 `fallVy` 仍为负，说明这一子步就是落地那一刻。
+   *
+   * ★ 记录**最负值**而不是"上一子步的 vy"：落地瞬间 vy 已经归零，
+   * 只有峰值能反映撞击力度，用来区分轻撞（单币触台）与重撞（砸进币堆）。
+   */
+  fallVy = 0;
 
   constructor(
     world: RAPIER.World,
@@ -54,8 +95,11 @@ export class Coin {
   ) {
     const desc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(0, -60, 0)
-      .setLinearDamping(COIN.linearDamping)
-      .setAngularDamping(COIN.angularDamping)
+      // 阻尼与下面 collider 的密度/摩擦/弹性一律读 `coinPhysics` 注册表，
+      // **不是** `COIN.*` 常量——调试面板要能在运行时改它们，构造期与改参期
+      // 必须读同一处，否则会出现「拖了滑块但新建的币仍按常量建」的半生效状态。
+      .setLinearDamping(coinPhysics.linearDamping)
+      .setAngularDamping(coinPhysics.angularDamping)
       // 额外迭代次数默认 0（见 `constants.COIN.additionalSolverIterations` 的注释）：
       // 设成 1 的那一版实测会把整堆币压进地板，所以这里不硬编码，由 `Game.applyTuning`
       // 从调参表统一施加，方便 A/B 对照。
@@ -63,23 +107,95 @@ export class Coin {
       .setCanSleep(true);
     this.body = world.createRigidBody(desc);
 
+    // 半径与半厚仍走 `COIN.*`：它们是「尺寸」，无法热切换（见 `coinScale.ts`）。
     const collider = RAPIER.ColliderDesc.cylinder(COIN.halfThickness, COIN.radius)
-      .setDensity(COIN.density)
-      .setFriction(COIN.friction)
-      .setRestitution(COIN.restitution);
-    world.createCollider(collider, this.body);
+      .setDensity(coinPhysics.density)
+      .setFriction(coinPhysics.friction)
+      .setRestitution(coinPhysics.restitution);
+    this.collider = world.createCollider(collider, this.body);
+    // 构造函数建的就是「普通币」那一档，指纹同步记下来，第一次 spawn 普通币时不必 setShape。
+    this.colliderKey = coinColliderKey(coinColliderSpec('bronze'));
 
     this.body.setEnabled(false);
   }
 
-  spawn(kind: CoinKind, x: number, y: number, z: number, yaw: number, playerDropped: boolean): void {
+  /**
+   * 把碰撞体调成这个币种该有的形状（S15）。
+   *
+   * ## 为什么必须跟着币种变
+   *
+   * `diamond` / `chest` 是**低多面体模型**，S16 起高 132 / 224 mm，是普通币（24 mm）
+   * 的 5.5 / 9.3 倍，外接直径 216 / 360 mm 是币径（144 mm）的 1.5 / 2.5 倍。
+   * 沿用扁平圆柱碰撞体的后果不是「轻微穿模」，而是**两枚模型币视觉上互相插进对方身体里**
+   * （碰撞体允许它们靠到币心距 144 mm，而宝箱光半宽就有 161 mm，
+   * 高度方向更是完全没有约束）。
+   *
+   * ## 顺序：必须在 `setEnabled(true)` **之前**调用
+   *
+   * `setShape()` 会按新形状重算质量属性，而币此刻还停在上一局的位姿上；
+   * 先改形状再启用，等于让币「以最终形状出生」，不会有任何一帧用错形状参与求解。
+   *
+   * ⚠️ `setShape()` 之后要补一次 `setDensity()`：Rapier 只在密度**被设置**时按
+   * 「密度 × 新体积」重算质量，光换形状不重设密度在某些版本下会留下旧质量 ——
+   * 那会表现成「模型币比看起来轻得多」，是零报错的静默错。
+   */
+  private applyCollider(kind: CoinKind): void {
+    const spec = coinColliderSpec(kind);
+    const key = coinColliderKey(spec);
+    if (key === this.colliderKey) return;
+    this.colliderKey = key;
+    this.collider.setShape(
+      spec.shape === 'cylinder'
+        ? new RAPIER.Cylinder(spec.halfHeight, spec.radius)
+        : new RAPIER.Cuboid(spec.halfExtents[0], spec.halfExtents[1], spec.halfExtents[2]),
+    );
+    // ★ 这一行必须读 `coinPhysics` 而不是 `COIN`：币种切换（模型币 ↔ 普通币）会走到
+    // 这里，而 `setShape()` 会重算质量。若写成常量，调试面板上调过的密度会在**换币种时
+    // 被悄悄回退**——表现是「模型币比看起来轻得多」，零报错的静默错。
+    this.collider.setDensity(coinPhysics.density);
+  }
+
+  /**
+   * 把 `coinPhysics` 注册表的当前值施加到这枚币上。
+   *
+   * 由 `Game.applyTuning()` 在参数真的变化时统一调用（不是每帧）。这里是**运行时可改**
+   * 的那一半物理参数的另一半通路：构造期负责「新建的币」，这个方法负责「已经存在的币」。
+   * 少了它，拖滑块只会影响之后新生成的币。
+   *
+   * 不包含 `maxSpeed` / `maxUpwardSpeed`——那两个不写进刚体，而是在
+   * `Game.fixedUpdate` 里每子步读注册表直接用作护栏阈值。
+   */
+  applyPhysics(): void {
+    this.body.setLinearDamping(coinPhysics.linearDamping);
+    this.body.setAngularDamping(coinPhysics.angularDamping);
+    this.collider.setFriction(coinPhysics.friction);
+    this.collider.setRestitution(coinPhysics.restitution);
+    // setDensity 会按「密度 × 当前体积」重算质量，所以它必须最后调。
+    this.collider.setDensity(coinPhysics.density);
+  }
+
+  spawn(
+    kind: CoinKind,
+    x: number,
+    y: number,
+    z: number,
+    yaw: number,
+    playerDropped: boolean,
+    preset = false,
+  ): void {
     this.kind = kind;
     this.playerDropped = playerDropped;
+    this.preset = preset;
     this.xixiMarked = false;
     this.settled = false;
     this.betMul = 1;
     this.onDeck = false;
+    this.fallVy = 0;
     this.active = true;
+
+    // 先定形状、再摆位姿：`setShape()` 按新形状重算质量与惯量，
+    // 摆在错位姿上再改形状会让第一步求解解出一个假的位移。
+    this.applyCollider(kind);
 
     this.body.setTranslation({ x, y, z }, true);
     const half = yaw / 2;

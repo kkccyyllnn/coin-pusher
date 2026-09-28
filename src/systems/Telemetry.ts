@@ -27,6 +27,26 @@ export type FallOffEvent = {
   phase: string;
 };
 
+/**
+ * 排水事件（P10）：一枚币掉进币床前侧角的下水道（见 `DRAIN`）。
+ *
+ * 为什么要单独记一条而不是只留一个计数：排水是**经济上的汇**，
+ * 它的强度必须能拆开看——「掉了多少枚」要能对应到「从哪一侧掉的、什么币种、
+ * 当时推板在哪」。只留计数的话，S11 标定时只能整体加减，
+ * 分不清是洞口位置不对还是宽度不对。
+ */
+export type DrainEvent = {
+  /** 洞的哪一侧（−1 左 / +1 右）。 */
+  side: -1 | 1;
+  kind: string;
+  x: number;
+  z: number;
+  y: number;
+  /** 同一时刻的推板行程（用来判断「是推板把它推进去的」还是别的原因）。 */
+  offset: number;
+  t: number;
+};
+
 export type DrainStats = {
   reason: string | null;
   startedAt: number | null;
@@ -85,11 +105,23 @@ export type XixiEvent = {
   phase: 'lit' | 'completed' | 'spin' | 'reward';
   /** lit：点亮的槽位号。 */
   slot?: number;
-  /** spin / reward：摇出的符号。 */
+  /**
+   * spin / reward：结果分类（P10 的三分类）。
+   *
+   * `win` = 四连同号（发奖）、`fine` = 四连胡萝卜（扣筹码）、`miss` = 杂牌（不奖不罚）。
+   * 判据靠它区分三种结果，而不是靠「有没有 symbol」反推——
+   * 后者在将来加第四种结果时会静默失效。
+   */
+  outcome?: 'win' | 'fine' | 'miss';
+  /** spin / reward：摇出的符号（只有 `win` 有）。 */
   symbol?: string;
+  /** spin / reward：四个滚筒停格的图标（`miss` 时四个互不相同）。 */
+  faces?: string[];
   /** reward：加力是否入账（存满拒收时为 false）；演出奖励则为承诺枚数。 */
   granted?: boolean;
   delivered?: number;
+  /** reward（`fine`）：**实扣**的本局筹码数（扣到 0 为止，所以可能小于罚款面值）。 */
+  fined?: number;
   t: number;
 };
 
@@ -119,6 +151,7 @@ export class Telemetry {
   private enabled = false;
   private readonly scoreEvents: ScoreEvent[] = [];
   private readonly fallOffEvents: FallOffEvent[] = [];
+  private readonly drainEvents: DrainEvent[] = [];
   private readonly laneSamples: LaneSample[] = [];
   private readonly laneEvents: LaneEvent[] = [];
   private readonly cycles: CycleSample[] = [];
@@ -144,6 +177,7 @@ export class Telemetry {
   reset(): void {
     this.scoreEvents.length = 0;
     this.fallOffEvents.length = 0;
+    this.drainEvents.length = 0;
     this.laneSamples.length = 0;
     this.laneEvents.length = 0;
     this.cycles.length = 0;
@@ -178,6 +212,11 @@ export class Telemetry {
   recordFallOff(event: FallOffEvent): void {
     if (!this.enabled) return;
     this.fallOffEvents.push(event);
+  }
+
+  recordDrain(event: DrainEvent): void {
+    if (!this.enabled) return;
+    this.drainEvents.push(event);
   }
 
   recordShow(event: ShowEvent): void {
@@ -217,6 +256,8 @@ export class Telemetry {
   summary(): {
     scoreEvents: ScoreEvent[];
     fallOffEvents: FallOffEvent[];
+    /** 掉进下水道的币（P10）：经济上「汇」的直接读数。 */
+    drainEvents: DrainEvent[];
     laneSamples: LaneSample[];
     laneEvents: LaneEvent[];
     cycles: CycleSample[];
@@ -227,6 +268,7 @@ export class Telemetry {
     return {
       scoreEvents: [...this.scoreEvents],
       fallOffEvents: [...this.fallOffEvents],
+      drainEvents: [...this.drainEvents],
       laneSamples: [...this.laneSamples],
       laneEvents: [...this.laneEvents],
       cycles: [...this.cycles],

@@ -1,4 +1,4 @@
-import { COIN, COIN_BASE_CHIPS, TABLE, type CoinKind } from './constants';
+import { COIN, COIN_BASE_CHIPS, COIN_KINDS, DRAIN_FOOTPRINT, TABLE, type CoinKind } from './constants';
 import { createSeededRandom } from '../utils/random';
 
 /** 一枚预置币的位置与朝向。 */
@@ -34,14 +34,128 @@ export const LAYER_STEP = COIN.halfThickness * 2 + 0.0012;
 export const REST_Y = COIN.halfThickness + 0.002;
 
 /**
- * 落点抖动上限（米）。
+ * 落点抖动上限（米）：**按币径等比缩放**，取币径的 1/24。
  *
- * 盘面自检要求**同层**币间距 ≥ 币径 × 0.98 = 0.1176 米。抖动是两个方向各一份，
- * 最坏情况下相邻两枚各朝对方偏 `jitter`，所以要求
- * `最小步距 − 2 × jitter ≥ 0.1176`。当前最密的一档步距是 0.144（11 列），
- * 余量 0.0264，取 0.005 留足安全边际。
+ * 抖动的唯一作用是打散「一眼能看出是网格」的观感，所以它该跟币的尺寸走，
+ * 而不是一个绝对米数。原尺寸（直径 0.12）下正好是 0.005 米，与 S13 之前一致。
+ *
+ * ★ S13 起这里**必须派生**：币尺寸档位（`?coin=1.1/1.2`）同时放大币径与抖动，
+ * 而网格步距的下限（下面的 `MIN_STEP`）随两者一起涨。写死 0.005 的版本在
+ * ×1.2 下会让 `MIN_STEP` 从 0.1276 涨到 0.15312，**11 列的网格当场不够用**——
+ * 表现是启动时 `assertLayoutValid` 抛「盘面重叠」。显式抛错是好事，
+ * 但它必须是「配置算错了」，不是「常量忘了改」。
  */
-export const MAX_JITTER = 0.005;
+export const MAX_JITTER = (COIN.radius * 2) / 24;
+
+/** 同层两枚预置币的最小允许间距（米）。这是 `assertLayoutValid` 的判据，只写这一份。 */
+export const MIN_SPACING = COIN.radius * 2 * 0.98;
+
+/**
+ * 网格步距的下限（米）：`MIN_SPACING` 加上「两侧各一份抖动」的最坏情况。
+ *
+ * 相邻两枚币各朝对方偏 `jitter` 时，间距被吃掉 `2 × jitter`，所以
+ * `步距 − 2 × jitter ≥ 币径 × 0.98` 是网格能成立的必要条件。
+ * `fitCells()` 用它把「区域跨度」换算成「最多能放几格」。
+ */
+export const MIN_STEP = MIN_SPACING + MAX_JITTER * 2;
+
+/**
+ * 在给定跨度里求「满足同层最小间距的最大格数」。
+ *
+ * `stepX = (xMax − xMin) / (columns − 1)`，所以格数越多步距越小，
+ * 于是 `columns ≤ span / MIN_STEP + 1`。`desired` 是**上限**（原尺寸下的设计密度），
+ * 币放大后自动往下减。
+ *
+ * ★ 存在的唯一理由：币尺寸档位会同时放大币径与抖动，**同一个区域的列/行数
+ * 在不同档位下必须不同**。写死 11 列的版本在 ×1.2 下步距 0.144 < `MIN_STEP` 0.15312
+ * → 自检抛「盘面重叠」。减列比缩抖动更划算：抖动缩到 1.4mm 就失去打散网格的作用了。
+ */
+export function fitCells(span: number, desired: number): number {
+  if (span <= 0) return 1;
+  // `+1e-9` 吃掉浮点误差：跨度恰好是 `MIN_STEP` 的整数倍时不该少给一格。
+  return Math.max(1, Math.min(desired, Math.floor(span / MIN_STEP + 1e-9) + 1));
+}
+
+/**
+ * 排水口在地板上占掉的那块方形区域：**预置盘面必须给它让位**。
+ *
+ * 从 `DRAIN_FOOTPRINT` 派生（真源只有一个），内边界各退 `MAX_JITTER`：
+ * 网格里存的是**未加抖动**的格点，而物理拿到的是加过抖动的坐标，
+ * 不退这一点点，贴着洞边的那一列会「自检过、物理掉」。
+ *
+ * 用法：`clearances: [...DRAIN_CLEARANCES]`。`clearances` 是 spec 级全局的，
+ * 所以所有区域自动让位；但 `towers` **不经过** `clearances`，
+ * 塔要是摆进洞里就只能靠 `assertLayoutValid` 兜（那里也引这份数据）。
+ */
+export const DRAIN_CLEARANCES: Array<{ x: number; z: number; halfX: number; halfZ: number }> = [
+  -1, 1,
+].map((side) => ({
+  x: (side * (DRAIN_FOOTPRINT.xInner - MAX_JITTER) + side * DRAIN_FOOTPRINT.xOuter) / 2,
+  z: (DRAIN_FOOTPRINT.zBack - MAX_JITTER + DRAIN_FOOTPRINT.zFront) / 2,
+  halfX: (DRAIN_FOOTPRINT.xOuter - DRAIN_FOOTPRINT.xInner + MAX_JITTER) / 2,
+  halfZ: (DRAIN_FOOTPRINT.zFront - DRAIN_FOOTPRINT.zBack + MAX_JITTER) / 2,
+}));
+
+/** 某个点是否落在排水口（含抖动余量）里。自检与保留区共用同一份判据。 */
+export function insideDrain(x: number, z: number): boolean {
+  return DRAIN_CLEARANCES.some(
+    (box) => Math.abs(x - box.x) <= box.halfX && Math.abs(z - box.z) <= box.halfZ,
+  );
+}
+
+/**
+ * 判定「这枚币此刻在**上层台面**（推板顶面）上」的 y 下界。
+ *
+ * 台面平面是 `TABLE.pusherTopY`，币心静置在它之上 `REST_Y`。判据取台面平面
+ * **往下让 5 毫米**，吃掉求解器穿透（币被挤压时币心会短暂低于静置高度）。
+ *
+ * ★ 为什么不再拿 `TABLE.conveyor.minY`（原 0.14）当这条判据：
+ * 那个值同时被当成「算台面还是算币床」的归属线，于是**币塔的高度上限被它卡死**
+ * ——塔顶必须 < 0.14，也就是最多 5 层。而归属是**体积**问题，不是高度带问题：
+ * 塔摆在 `z = 0.62`，根本不在推板顶面覆盖的 z 区间里，不该受任何高度带约束。
+ * 见 `isOnDeckVolume`。
+ */
+export const DECK_MIN_Y = TABLE.pusherTopY - 0.005;
+
+/** 推板**归位时**它顶面覆盖的 z 区间。预置坐标的自检用它；运行期用 `Pusher.topRange`。 */
+export const DECK_REST_RANGE = {
+  back: TABLE.pusherBackZ,
+  front: TABLE.pusherFrontZAtRest,
+} as const;
+
+/**
+ * 某个世界坐标是否落在**上层台面的体积**里。这是「算台面还是算币床」的**唯一判据**。
+ *
+ * 三个条件缺一不可：
+ *   ① `y ≥ DECK_MIN_Y` —— 在台面平面之上（含穿透余量）；
+ *   ② `y ≤ TABLE.conveyor.maxY` —— 上界仍然要有：落币走廊里的币（`drop.y = 1.45`）
+ *      在 z 上正好落在台面区间内，只看 ①③ 会把**正在下落**的币判成台面币；
+ *   ③ `z ∈ range` —— 在推板顶面覆盖的 z 区间内。**区间随推板行程移动**
+ *      （`Pusher.topRange`），所以前缘的币被推出去之后仍然算台面币。
+ *
+ * ★ ③ 是关键：币床的币塔摆在 `z = 0.62`，即使塔顶高过 `pusherTopY`，
+ * 也因为 z 不在区间内而不算台面币 —— **塔高因此不再受任何高度带约束**。
+ * 反过来说，币床区域一旦被配置到 `z < pusherFrontZAtRest`，那些币就会被判成台面币，
+ * `assertLayoutValid` 会当场拦住（这就是它那条判据现在的形态）。
+ *
+ * ★ 三处共用这一份实现：`Game.isOnDeck()`、`CoinPool.countBed()`、
+ * `assertLayoutValid`。口径一旦分叉，就会出现「诊断说台面上没币、输送却在送币」
+ * 这种自相矛盾的读数——那类缺陷零报错，只能靠「只有一份判据」来防。
+ */
+export function isOnDeckVolume(
+  x: number,
+  y: number,
+  z: number,
+  range: { back: number; front: number },
+): boolean {
+  return (
+    Math.abs(x) <= TABLE.halfWidth &&
+    y >= DECK_MIN_Y &&
+    y <= TABLE.conveyor.maxY &&
+    z >= range.back &&
+    z <= range.front
+  );
+}
 
 /**
  * 台面区域：一块用「列 × 行 × 层」描述的位置网格。
@@ -248,8 +362,12 @@ export function assertLayoutValid(layout: CoinPlacement[]): void {
   // 币床：币必须在推板归位时的推币面之前（否则开局就嵌在推板体内），且在得分线之内。
   const bedMinZ = TABLE.pusherFrontZAtRest + COIN.radius;
   const bedMaxZ = TABLE.scoreLineZ - COIN.radius * 0.2;
-  // 上层台面：币必须在推板后缘与归位时的前缘之间。
-  const deckMinZ = TABLE.pusherBackZ + COIN.radius;
+  // 上层台面：币必须在**后墙**与归位时的前缘之间。
+  // ★ S13：后界从推板后缘 `pusherBackZ` 换成后墙所在的可见背板平面 `TABLE.backZ`
+  // （见 `TableBuilder` 的后墙注释）。台面物理上仍铺到 `pusherBackZ`，但 `z < backZ`
+  // 那一段已经被后墙封住，预置在那里的币开局会被墙顶出来一片乱飞 —— 用旧值自检放行、
+  // 运行期才炸，正是这条断言要拦的东西。
+  const deckMinZ = TABLE.backZ + COIN.radius;
   const deckMaxZ = TABLE.pusherFrontZAtRest - COIN.radius;
 
   for (const coin of layout) {
@@ -262,11 +380,19 @@ export function assertLayoutValid(layout: CoinPlacement[]): void {
           `上层台面有币越界：z=${coin.z.toFixed(3)}（应在 ${deckMinZ.toFixed(3)} ~ ${deckMaxZ.toFixed(3)}）`,
         );
       }
-      // 台面币必须落在「台面输送」的高度带里，否则它不会被输送向前——上层就死住了。
-      if (coin.y < TABLE.conveyor.minY || coin.y > TABLE.conveyor.maxY) {
+      // 台面币必须落在**台面体积**里，否则它会被 `Game.isOnDeck()` 判成币床币。
+      // ⚠️ 原注释的理由（「否则它不会被输送向前——上层就死住了」）在 S13 台面输送归零后
+      // 已经不成立：现在台面上**本来就没有输送**（见 `TABLE.conveyor.speed` 的注释）。
+      // 这条现在管的是「这枚币算台面还是算币床」这个归属问题。
+      //
+      // ★ S13 改成调 `isOnDeckVolume`（与 `Game.isOnDeck()` 同一份判据），
+      // 于是它**没有上界了**：原句 `y > conveyor.maxY` 会把「台面上叠了几层」直接判死。
+      // 台面币的 z 区间上面已经查过（`deckMinZ` / `deckMaxZ`，比体积判据更紧）。
+      if (!isOnDeckVolume(coin.x, coin.y, coin.z, DECK_REST_RANGE)) {
         throw new Error(
-          `上层台面有币不在输送带里：y=${coin.y.toFixed(3)}` +
-            `（应在 ${TABLE.conveyor.minY} ~ ${TABLE.conveyor.maxY}）`,
+          `上层台面有币不在台面体积里：(${coin.x.toFixed(3)}, ${coin.y.toFixed(3)}, ${coin.z.toFixed(3)})` +
+            `（体积：y ∈ [${DECK_MIN_Y}, ${TABLE.conveyor.maxY}]、` +
+            `z ∈ [${DECK_REST_RANGE.back}, ${DECK_REST_RANGE.front}]）`,
         );
       }
       continue;
@@ -276,13 +402,37 @@ export function assertLayoutValid(layout: CoinPlacement[]): void {
         `币床有币越界：z=${coin.z.toFixed(3)}（应在 ${bedMinZ.toFixed(3)} ~ ${bedMaxZ.toFixed(3)}）`,
       );
     }
-    // 币床上的币不能落进「台面输送」的高度带：那一段是给推板顶面用的，
-    // 币床的币一旦落进去就会被持续施加向前的冲量，堆好的盘面会自己散架。
-    // 这条同时约束了币塔的高度——塔顶必须低于 conveyor.minY。
-    if (coin.y >= TABLE.conveyor.minY && coin.y <= TABLE.conveyor.maxY) {
+    // 币床上没有洞的碰撞体，币心一旦落在排水口占地里，第一帧就会掉出机柜。
+    // 这不是「观感问题」而是**枚数守恒被静默打破**：`activeCoins` 会凭空少几枚，
+    // 而币种合计、异常计数、币池预算全都还是绿的（P10 S7 实测 318 → 314）。
+    // 所以它必须是一条**自检**，而不是靠物理跑起来之后再从读数里反推。
+    if (insideDrain(coin.x, coin.z)) {
       throw new Error(
-        `币床有币落进台面输送带：y=${coin.y.toFixed(3)}` +
-          `（输送带 ${TABLE.conveyor.minY} ~ ${TABLE.conveyor.maxY}，叠太高了）`,
+        `币床有币坐在排水口上：(${coin.x.toFixed(3)}, ${coin.z.toFixed(3)})` +
+          `（洞 x ∈ ±[${DRAIN_FOOTPRINT.xInner}, ${DRAIN_FOOTPRINT.xOuter}]，` +
+          `z ∈ [${DRAIN_FOOTPRINT.zBack}, ${DRAIN_FOOTPRINT.zFront}]）` +
+          `—— 盘面区域必须加 \`...DRAIN_CLEARANCES\` 让位`,
+      );
+    }
+    // 币床上的币不能落进**台面体积**：那一段在语义上属于推板顶面，
+    // 落在里面的币会被 `Game.isOnDeck()` 判成「在台面上」，遥测与台面判定都会串味。
+    //
+    // ⚠️ **S13 起这条不再是「物理必然」**：原先的理由是「落进去就会被持续施加向前的冲量、
+    // 堆好的盘面自己散架」，而台面输送已经归零（`TABLE.conveyor.speed = 0`，
+    // `Game.fixedUpdate` 对 0 直接短路，完全不施加冲量）。所以现在它约束的是
+    // **台面/币床的归属划分**，不是力学。
+    //
+    // ★★ S13 把判据从「高度带」换成「体积」之后，**币塔的高度上限被解除了**。
+    // 旧判据是 `y ∈ [0.14, 0.34]` 就报错 —— 塔顶必须 < 0.14，也就是最多 5 层。
+    // 新判据多了一条 `z ∈ [pusherBackZ, pusherFrontZAtRest]`，而塔摆在 `z = 0.62`
+    // 远在 `pusherFrontZAtRest = −0.16` 之前，**再高也不会落进体积里**。
+    // 于是「塔能盖多高」重新变成一个纯物理问题（会不会倒），不再是记账问题。
+    if (isOnDeckVolume(coin.x, coin.y, coin.z, DECK_REST_RANGE)) {
+      throw new Error(
+        `币床有币落在台面体积里：(${coin.x.toFixed(3)}, ${coin.y.toFixed(3)}, ${coin.z.toFixed(3)})` +
+          `（体积：y ∈ [${DECK_MIN_Y}, ${TABLE.conveyor.maxY}]、` +
+          `z ∈ [${DECK_REST_RANGE.back}, ${DECK_REST_RANGE.front}]）` +
+          `—— 币床的 z 必须整体落在推板归位前缘 ${TABLE.pusherFrontZAtRest} 之后`,
       );
     }
   }
@@ -311,6 +461,23 @@ export function layoutValue(layout: CoinPlacement[]): number {
   return layout.reduce((sum, coin) => sum + COIN_BASE_CHIPS[coin.kind], 0);
 }
 
+/**
+ * 盘面**容量**：把所有「稀疏铺」（`pick` / `pickFrom`）去掉之后，这份配置能放多少枚。
+ *
+ * 存在的理由（纪律 2「判据不写第二份公式」）：验证脚本原先写死「满盘应在 280~320 枚」，
+ * 而那个区间是**盘面容量的代理**，容量随币尺寸档位下降（币越大，网格列/行越少）——
+ * `?coin=1.2` 下盘面天然只有 257 枚，写死的区间会一直红。那不是缺陷，是判据没跟上尺寸。
+ *
+ * 有了这个数，判据可以改问一个**与尺寸无关**的问题：「盘面填到容量的几成」。
+ * 容量本身由 `buildLayout` 现算，所以改配置不用改判据。
+ */
+export function layoutCapacity(spec: LayoutSpec): number {
+  return buildLayout({
+    ...spec,
+    regions: spec.regions.map((region) => ({ ...region, pick: undefined, pickFrom: undefined })),
+  }).length;
+}
+
 export type LayoutSummary = {
   total: number;
   deck: number;
@@ -323,7 +490,8 @@ export type LayoutSummary = {
 
 /** 盘面摘要：布局模式打印它，也用来给断言一个稳定的输入。 */
 export function layoutSummary(layout: CoinPlacement[]): LayoutSummary {
-  const byKind: Record<CoinKind, number> = { bronze: 0, pattern: 0, payout: 0, bounty: 0 };
+  // 按 `COIN_KINDS` 建零表（P6）：新增币种不用回来补这一行。
+  const byKind = Object.fromEntries(COIN_KINDS.map((kind) => [kind, 0])) as Record<CoinKind, number>;
   let deck = 0;
   let topY = 0;
   for (const coin of layout) {

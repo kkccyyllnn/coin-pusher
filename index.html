@@ -32,12 +32,12 @@
           </div>
         </header>
 
-        <!-- 三路集章：贴在币床上缘（top 由 Game 按镜头投影写入），不挡盘面。 -->
+        <!--
+          XIXI 集章：四槽的亮灭**已经画在 3D 模型里**（推板前缘的四段内嵌标牌，
+          见 `Pusher.buildXixiLanes`），所以这里只留一行进度文字，
+          不再重复四个 DOM 圆点 —— 两套同样的东西叠在同一处屏幕上只会互相打架。
+        -->
         <div id="xixi-marks" aria-label="XIXI 集章状态">
-          <div class="mark" data-slot="0"><span class="mark-glyph">X</span></div>
-          <div class="mark" data-slot="1"><span class="mark-glyph">I</span></div>
-          <div class="mark" data-slot="2"><span class="mark-glyph">X</span></div>
-          <div class="mark" data-slot="3"><span class="mark-glyph">I</span></div>
           <span id="mark-note">投币点亮 XIXI 四槽，集齐摇老虎机</span>
         </div>
 
@@ -66,10 +66,6 @@
               <button id="reload-button" type="button">
                 <span>后装填</span>
                 <small id="reload-state">花 1 筹码 · 注入 3 枚</small>
-              </button>
-              <button id="wheel-button" type="button">
-                <span>转轮</span>
-                <small id="wheel-state">收尾押注</small>
               </button>
               <button id="bet-button" type="button">
                 <span>加注</span>

@@ -1,8 +1,18 @@
 import type { Coin } from '../entities/Coin';
 import type { CoinPool } from '../entities/CoinPool';
 import { COIN, TABLE } from '../game/constants';
+import { COIN_SCALE } from '../game/coinScale';
 
-export type MechanismId = 'sweeper' | 'grapple' | 'reload' | 'wheel';
+/**
+ * 机关 id（P7 起只剩三个）。
+ *
+ * **`wheel`（风险转轮）已在 P7 删除**（决策 8）：它的定位是「明码标价的方差选择」，
+ * 而 XIXI 背板老虎机（P5）已经把这件事故做得更好——同样是「用方差换机会」，
+ * 老虎机有集章前置、有背板实体、有演出，转轮只是一个按钮。
+ * 两个机制并存只会稀释彼此，所以转轮并入老虎机，`MechanismId` / HUD 按钮 /
+ * `spin()` / `WHEEL_TABLE` / 验证用例一并清除。
+ */
+export type MechanismId = 'sweeper' | 'grapple' | 'reload';
 
 export type MechanismResult = {
   ok: boolean;
@@ -10,17 +20,12 @@ export type MechanismResult = {
   reason?: string;
   /** 受影响的币数。 */
   affected?: number;
-  /** 转轮的结果。 */
-  outcome?: WheelOutcome;
 };
-
-export type WheelOutcome = 'reload' | 'front' | 'sink';
 
 /** 每局的机关次数（后装填不限次数，受额度限制）。 */
 export const MECHANISM_USES: Record<Exclude<MechanismId, 'reload'>, number> = {
   sweeper: 1,
   grapple: 2,
-  wheel: 1,
 };
 
 /** 机关成本（单位：筹码）。 */
@@ -28,7 +33,6 @@ export const MECHANISM_COST = {
   sweeper: 0,
   grapple: 2,
   reload: 1,
-  wheel: 0,
 } as const;
 
 /** 抓斗的作用区半边长（0.3 × 0.3 米）。 */
@@ -37,23 +41,25 @@ const GRAPPLE_HALF = 0.15;
 const GRAPPLE_TARGET_Z = TABLE.scoreLineZ - 0.2;
 /** 扫板只作用于贴着得分线的这一段。 */
 const SWEEP_ZONE = 0.15;
-/** 扫板给币的冲量。币的质量约 0.18 kg，0.12 N·s 约等于 0.67 m/s。 */
-const SWEEP_IMPULSE = 0.12;
-/** 转轮三格概率：两格有用、一格沉没，期望值略低于 1。 */
-const WHEEL_TABLE: Array<{ outcome: WheelOutcome; weight: number }> = [
-  { outcome: 'front', weight: 34 },
-  { outcome: 'reload', weight: 34 },
-  { outcome: 'sink', weight: 32 },
-];
+/**
+ * 扫板给币的冲量（N·s）。
+ *
+ * ★ S13 起**必须乘 `COIN_SCALE³`**：冲量是定值，而币的质量是 `πr²·2h·ρ`——
+ * 半径与半厚各乘 k 就是 **k³**。不补这一项的话，×1.2 时每枚币的质量涨到 1.73 倍
+ * 而冲量不变，扫板的效果只剩 58%（`Δv = J / m`），玩家会感觉「这个机关变废了」。
+ * 而这条改动**不会有任何报错**，只是手感悄悄漂移——正是最该写成派生的一类。
+ *
+ * 原尺寸下：币的质量约 0.18 kg，0.12 N·s 约等于 0.67 m/s。
+ */
+const SWEEP_IMPULSE = 0.12 * COIN_SCALE ** 3;
 
 /**
- * 四个机关。
+ * 三个机关。
  *
  * 移植判据只有一条：**它是否制造新的玩家决策**。所以：
  *   · 扫板把收尾从「等」变成「主动收割」；
  *   · 抓斗是全游戏唯一能主动改变盘面几何的操作（把花纹筹码从够不到的深处搬到前沿）；
- *   · 后装填把额度的**时间价值**引进来（现在花 1 枚，两三个循环后才产出）；
- *   · 风险转轮是明码标价的方差选择，只在收尾开放。
+ *   · 后装填把额度的**时间价值**引进来（现在花 1 枚，两三个循环后才产出）。
  *
  * 所有机关都只施加物理作用力或位置，结算仍然只由「币是否越过得分线」决定——
  * 没有一个机关会直接加分。
@@ -114,10 +120,11 @@ export class Mechanisms {
 
     this.uses.grapple -= 1;
     targets.forEach((coin, index) => {
-      // 横向摊开，避免整堆落在同一个点上互相穿透。
+      // 横向摊开，避免整堆落在同一个点上互相穿透。间距随币径走（原尺寸 0.055 / 0.06 米），
+      // 否则 ×1.2 时 0.055 的间距还不到币径的一半，几枚币会叠在同一个位置反复解穿透。
       const spread = (index % 5) - 2;
-      const x = clamp(centerX + spread * 0.055, -TABLE.drop.halfLane, TABLE.drop.halfLane);
-      const z = GRAPPLE_TARGET_Z - Math.floor(index / 5) * 0.06;
+      const x = clamp(centerX + spread * 0.055 * COIN_SCALE, -TABLE.drop.halfLane, TABLE.drop.halfLane);
+      const z = GRAPPLE_TARGET_Z - Math.floor(index / 5) * 0.06 * COIN_SCALE;
       coin.body.setTranslation({ x, y: TABLE.pusherTopY + 0.28, z }, true);
       coin.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
       coin.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
@@ -151,44 +158,6 @@ export class Mechanisms {
       placed += 1;
     }
     return { ok: placed > 0, affected: placed, reason: placed > 0 ? undefined : '盘面已满' };
-  }
-
-  /**
-   * 风险转轮：把剩余投币额度押上去。
-   *
-   * 只在收尾开放。三格结果：全部直落前沿 / 全部转成后装填 / 全部沉没。
-   * 期望值刻意做成略小于 1（赌博机的标准定价）——靠方差吸引，不靠期望。
-   */
-  spin(credits: number): MechanismResult {
-    if (this.uses.wheel <= 0) return { ok: false, reason: '本局转轮已用完' };
-    if (credits <= 0) return { ok: false, reason: '没有可押的额度' };
-    this.uses.wheel -= 1;
-
-    const roll = Math.random() * 100;
-    let accumulated = 0;
-    let outcome: WheelOutcome = 'sink';
-    for (const entry of WHEEL_TABLE) {
-      accumulated += entry.weight;
-      if (roll < accumulated) {
-        outcome = entry.outcome;
-        break;
-      }
-    }
-
-    let affected = 0;
-    if (outcome === 'front' || outcome === 'reload') {
-      const z = outcome === 'front' ? GRAPPLE_TARGET_Z : 0.42;
-      const y = outcome === 'front' ? TABLE.pusherTopY + 0.28 : TABLE.pusherTopY + 0.34;
-      for (let index = 0; index < credits; index += 1) {
-        if (this.coins.remaining <= 0) break;
-        const coin = this.coins.acquire();
-        if (!coin) break;
-        const x = ((index % 7) - 3) * 0.11;
-        coin.spawn('bronze', x, y + (index % 3) * 0.05, z, index * 0.5, false);
-        affected += 1;
-      }
-    }
-    return { ok: true, affected, outcome };
   }
 }
 

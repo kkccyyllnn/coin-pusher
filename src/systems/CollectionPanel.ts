@@ -91,10 +91,13 @@ export class CollectionPanel {
 
       const swatch = document.createElement('span');
       swatch.className = 'skin-swatch';
+      // 机柜色块取**主色** `panel`（背板 + 两侧高墙，画面面积最大、最能代表整套皮肤）。
+      // ★ S20 之前取的是 `pusherTop` —— 那是推板顶面，也就是**币的舞台**：它必须取冷色
+      // 才能把暖铜币托出来，拿它当色块等于让「色块好看」与「币好辨认」互相打架。
       swatch.style.background =
         kind === 'coin'
           ? (skin as CoinSkin).palette.bronze.base
-          : (skin as CabinetSkin).colors.pusherTop;
+          : (skin as CabinetSkin).colors.panel;
       card.append(swatch);
 
       const label = document.createElement('span');

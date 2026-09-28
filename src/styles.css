@@ -48,6 +48,18 @@ body {
   height: 100vh;
   outline: none;
   touch-action: none;
+  /*
+   * 像素化（V1）：画布按「CSS 尺寸 ÷ 整数倍率」渲染（见 `render/PixelScale.ts`），
+   * 这里用最近邻把它放大回 CSS 尺寸。倍率是整数，所以每个 texel 占的像素块等大——
+   * 非整数放大会出现粗细不均的条纹，正是要避免的「脏」。
+   *
+   * 由 `applyPixelated()` 写 `:root[data-pixel]` 控制开关（`?pixel=off` 可关）。
+   */
+  image-rendering: pixelated;
+}
+
+:root[data-pixel='off'] #game-canvas {
+  image-rendering: auto;
 }
 
 /* 高潮反馈：只在边缘闪一下，不遮挡盘面，避免「用特效盖住因果」。 */
@@ -64,6 +76,19 @@ body {
 
 #climax-flash.green {
   animation: climax-green 560ms ease-out;
+}
+
+/* 钻石（`KINDS.diamond.climax.tone = 'blue'`）：冷色闪光，与暖色的金/绿区分开。
+   色调名单的真源是 `src/game/kinds.ts` 的 `ClimaxTone`——新增色调要三处一起改。 */
+#climax-flash.blue {
+  animation: climax-blue 600ms ease-out;
+}
+
+/* 连落 5 次（`FEEDBACK.comboClimax`）：**白闪**，比其余三档更亮更短。
+   它是唯一一个「与币种无关」的色调——表达的是玩家连着把币推下去这件事，
+   所以刻意比金/绿/蓝更中性、更刺眼，读作「操作本身被认可了」。 */
+#climax-flash.white {
+  animation: climax-white 380ms ease-out;
 }
 
 @keyframes climax-gold {
@@ -85,6 +110,28 @@ body {
   100% {
     opacity: 0;
     box-shadow: inset 0 0 150px 34px rgba(111, 211, 165, 0);
+  }
+}
+
+@keyframes climax-blue {
+  0% {
+    opacity: 1;
+    box-shadow: inset 0 0 70px 8px rgba(143, 227, 255, 0.5);
+  }
+  100% {
+    opacity: 0;
+    box-shadow: inset 0 0 150px 34px rgba(143, 227, 255, 0);
+  }
+}
+
+@keyframes climax-white {
+  0% {
+    opacity: 1;
+    box-shadow: inset 0 0 110px 22px rgba(255, 252, 240, 0.62);
+  }
+  100% {
+    opacity: 0;
+    box-shadow: inset 0 0 190px 52px rgba(255, 252, 240, 0);
   }
 }
 
@@ -446,7 +493,11 @@ body {
   border-color: var(--brass);
 }
 
-/* XIXI 集章：贴在币床上缘的一排小圆点，top 由 Game 按镜头投影写入。 */
+/*
+ * XIXI 集章：只剩一行进度文字，贴在币床上缘（top 由 Game 按镜头投影写入）。
+ * 四槽的亮灭**已经画进 3D 模型**（推板前缘的四段标牌，见 `Pusher.buildXixiLanes`），
+ * 所以这里不再有 `.mark` 圆点 —— 两套同样的东西叠在同一处屏幕上只会互相打架。
+ */
 #xixi-marks {
   position: absolute;
   top: 50%;
@@ -454,39 +505,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 10px;
+  border-radius: 999px;
   transform: translate(-50%, -50%);
-}
-
-.mark {
-  display: grid;
-  place-items: center;
-  width: 26px;
-  height: 26px;
-  border: 1px solid rgba(242, 232, 210, 0.42);
-  border-radius: 50%;
-  background: rgba(8, 14, 11, 0.62);
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.45);
-  transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
-}
-
-.mark .mark-glyph {
-  font-size: 0.72rem;
-  color: var(--ink-dim);
-}
-
-.mark.lit {
-  border-color: var(--brass);
-  background: rgba(224, 176, 97, 0.42);
-  box-shadow: 0 0 12px rgba(224, 176, 97, 0.55);
-}
-
-.mark.lit .mark-glyph {
-  color: #ffe1a8;
-}
-
-.mark.disabled {
-  opacity: 0.36;
 }
 
 #mark-note {
@@ -507,6 +527,23 @@ body {
   text-shadow: 0 1px 6px rgba(0, 0, 0, 0.7);
   pointer-events: none;
   will-change: transform, opacity;
+}
+
+/*
+ * 大号飞字（`FEEDBACK.flyScoreBig`，P10 ⑨）：一笔就有感觉的入账要**一眼看出分量**。
+ *
+ * 描边用四向 `text-shadow` 而不是 `-webkit-text-stroke`：后者是私有前缀属性，
+ * 而且会把字形压细一圈；四向阴影在深色币床上给出的是干净的外描边，不改字形。
+ */
+.fly-score.big {
+  font-size: 1.34rem;
+  font-weight: 700;
+  text-shadow:
+    1px 1px 0 #201305,
+    -1px 1px 0 #201305,
+    1px -1px 0 #201305,
+    -1px -1px 0 #201305,
+    0 2px 10px rgba(0, 0, 0, 0.75);
 }
 
 /* 徽标飞行：集齐三路与跪求赏赐到账都用它。 */
@@ -618,7 +655,6 @@ body {
 #sweeper-button,
 #grapple-button,
 #reload-button,
-#wheel-button,
 #bet-button {
   display: flex;
   flex-direction: column;
@@ -639,7 +675,6 @@ body {
 #sweeper-button small,
 #grapple-button small,
 #reload-button small,
-#wheel-button small,
 #bet-button small {
   color: var(--ink-faint);
   font-size: 0.6rem;
@@ -648,13 +683,8 @@ body {
 #sweeper-button:not(:disabled):hover,
 #grapple-button:not(:disabled):hover,
 #reload-button:not(:disabled):hover,
-#wheel-button:not(:disabled):hover,
 #bet-button:not(:disabled):hover {
   border-color: var(--brass);
-}
-
-#wheel-button:not(:disabled) {
-  border-color: var(--danger);
 }
 
 #bet-button {
@@ -668,7 +698,6 @@ body {
 #sweeper-button:disabled,
 #grapple-button:disabled,
 #reload-button:disabled,
-#wheel-button:disabled,
 #bet-button:disabled {
   opacity: 0.34;
   cursor: default;
@@ -878,6 +907,8 @@ body {
 [data-motion='reduced'] #earned-value.bump,
 [data-motion='reduced'] #climax-flash.gold,
 [data-motion='reduced'] #climax-flash.green,
+[data-motion='reduced'] #climax-flash.blue,
+[data-motion='reduced'] #climax-flash.white,
 [data-motion='reduced'] #boost-button:not(:disabled) {
   animation: none;
 }
@@ -896,7 +927,78 @@ body {
   #earned-value.bump,
   #climax-flash.gold,
   #climax-flash.green,
+  #climax-flash.blue,
+  #climax-flash.white,
   #boost-button:not(:disabled) {
     animation: none;
   }
+}
+
+/* ── 调试面板（?debug）───────────────────────────────────────────────── */
+
+/*
+ * 下面几个类服务的是**用 JS 注入进 lil-gui DOM 子树**的元素（见 DebugTools 的
+ * `appendNote` / `buildAudioUploadFolder`）。它们必须挂在 `folder.$children` 里——
+ * 挂到 `document.body` 的话 `hideDebugUi`（走 `gui.hide()`）隐藏不到，
+ * 会污染截图测试。类名统一加 `cp-` 前缀，避免和 lil-gui 自带样式撞名。
+ */
+
+.cp-debug-note {
+  margin: 4px 6px;
+  padding: 6px 8px;
+  border-left: 3px solid var(--danger);
+  border-radius: 0 4px 4px 0;
+  background: rgba(208, 103, 74, 0.08);
+  color: var(--ink-dim);
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+
+.cp-audio-upload {
+  padding: 6px 8px 8px;
+}
+
+.cp-audio-file {
+  width: 100%;
+  color: var(--ink-dim);
+  font: inherit;
+  font-size: 0.7rem;
+}
+
+.cp-audio-file::file-selector-button {
+  margin-right: 8px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+
+.cp-audio-file::file-selector-button:hover {
+  border-color: var(--brass);
+}
+
+.cp-audio-status {
+  margin-top: 6px;
+  padding: 5px 7px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--ink-dim);
+  font-size: 0.66rem;
+  line-height: 1.5;
+  /* 文件路径可能很长，不换行会把面板撑宽。 */
+  overflow-wrap: anywhere;
+}
+
+.cp-audio-status[data-tone='ok'] {
+  background: rgba(111, 211, 165, 0.12);
+  color: var(--mint);
+}
+
+.cp-audio-status[data-tone='error'] {
+  background: rgba(208, 103, 74, 0.14);
+  color: var(--danger);
 }

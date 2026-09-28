@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import type { PixelScale } from '../render/PixelScale';
 
 export function createRenderer(canvas: HTMLCanvasElement): THREE.WebGLRenderer {
   const renderer = new THREE.WebGLRenderer({
@@ -15,21 +16,37 @@ export function createRenderer(canvas: HTMLCanvasElement): THREE.WebGLRenderer {
   return renderer;
 }
 
+/**
+ * 按 `PixelScale` 调整画布。
+ *
+ * 与旧版的区别：**DPR 不再参与分辨率计算**，改成 `setPixelRatio(1 / upscale)`。
+ * 画布 backing store 变成「CSS 尺寸 ÷ 整数倍率」，再由 CSS 的
+ * `image-rendering: pixelated` 最近邻放大回去——这就是像素化的全部机制。
+ *
+ * `updateStyle = false`：CSS 尺寸仍由 `#game-canvas { width:100vw; height:100vh }` 决定，
+ * 所以我们只改 backing store，不动布局。
+ *
+ * `camera.aspect` 仍用 **CSS** 宽高：aspect 与倍率无关，而且 `toScreen()` 也是按
+ * `canvas.clientWidth/Height` 投影的，两者必须同一口径——这是「零玩法扰动」的关键。
+ */
 export function resizeRenderer(
   renderer: THREE.WebGLRenderer,
   camera: THREE.PerspectiveCamera,
-  maxDpr = 2,
+  pixel: PixelScale,
 ): boolean {
   const canvas = renderer.domElement;
   const width = Math.max(1, Math.floor(canvas.clientWidth));
   const height = Math.max(1, Math.floor(canvas.clientHeight));
-  const dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
-  const bufferWidth = Math.floor(width * dpr);
-  const bufferHeight = Math.floor(height * dpr);
-  const needsResize = canvas.width !== bufferWidth || canvas.height !== bufferHeight;
+  const bufferWidth = Math.max(1, Math.floor(width * pixel.pixelRatio));
+  const bufferHeight = Math.max(1, Math.floor(height * pixel.pixelRatio));
+  // 倍率变化也要触发重设（切档时 CSS 尺寸不变，但 backing store 要跟着变）。
+  const needsResize =
+    renderer.getPixelRatio() !== pixel.pixelRatio ||
+    canvas.width !== bufferWidth ||
+    canvas.height !== bufferHeight;
 
   if (needsResize) {
-    renderer.setPixelRatio(dpr);
+    renderer.setPixelRatio(pixel.pixelRatio);
     renderer.setSize(width, height, false);
     camera.aspect = width / height;
     camera.updateProjectionMatrix();

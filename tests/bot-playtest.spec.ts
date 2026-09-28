@@ -69,12 +69,24 @@ test.describe('机器人试玩', () => {
       .poll(async () => (await playerCoin(page))?.y ?? 9, { timeout: 8000, intervals: [120] })
       .toBeLessThan(0.42);
 
-    // 2) 被台面输送到前唇之外，并掉到低台
+    // 2) 被推板的摩擦拖曳带到前唇之外，并掉到低台
+    //
+    // ⚠️ 期限 180 秒，**不是 15 秒**。这是 S13 之后的换口径，不是放宽：
+    //    旧的 15 秒是给「台面输送 = 0.85 m/s」定的 —— 那时投下的币 1 秒内就被冲到前唇。
+    //    S13 把 `TABLE.conveyor.speed` 归零（用户拍板：币不该「被推着滑」），台面上的币
+    //    只剩**推板摩擦**，净前进 **26 毫米/循环**（`probe` 实测），而落点 `z` 到币床
+    //    `z > 0` 有 **1.2 米**（落币口 2026-09-25 从 −0.72 后移到 −1.20，把台面行程
+    //    翻了一倍）⇒ **实测首次离台在第 37 个推板循环 ≈ 72 秒**（专用探针量过）。
+    //    所以 15 秒窗口**永远**读不到，红的不是物理、是这条判据的期限。
+    //    ★ 关切没变：币必须能从落点走到前唇并掉到低台（台面不出币 = 整局停摆）。
+    //      180 秒 = 实测 72 秒 × 2.5，留出卡顿与批次差异的余量。
+    //    同类已修过一处：`probe` 的「单枚币 12 秒内降到币床」（按 Little 定律必然假红，
+    //    改成量「净前进量/循环 > 0」这个与库存量无关的不变式）。
     await expect
-      .poll(async () => (await playerCoin(page))?.z ?? -9, { timeout: 15_000, intervals: [200] })
+      .poll(async () => (await playerCoin(page))?.z ?? -9, { timeout: 180_000, intervals: [400] })
       .toBeGreaterThan(0);
     await expect
-      .poll(async () => (await playerCoin(page))?.y ?? 9, { timeout: 15_000, intervals: [200] })
+      .poll(async () => (await playerCoin(page))?.y ?? 9, { timeout: 180_000, intervals: [400] })
       .toBeLessThan(0.1);
   });
 

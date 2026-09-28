@@ -15,11 +15,10 @@ export type LaneInput = {
   dropPressed: boolean;
   boostPressed: boolean;
   giveUpPressed: boolean;
-  /** 机关：扫板 / 抓斗 / 后装填 / 风险转轮。 */
+  /** 机关：扫板 / 抓斗 / 后装填。 */
   sweepPressed: boolean;
   grapplePressed: boolean;
   reloadPressed: boolean;
-  wheelPressed: boolean;
   /** 无尽模式：切换加注档位。 */
   betPressed: boolean;
 };
@@ -78,7 +77,6 @@ export class InputController {
   private sweepQueued = false;
   private grappleQueued = false;
   private reloadQueued = false;
-  private wheelQueued = false;
   private betQueued = false;
   private enabled = true;
 
@@ -180,11 +178,6 @@ export class InputController {
     this.reloadQueued = true;
   };
 
-  private readonly onWheelClick = (event: Event) => {
-    event.preventDefault();
-    this.wheelQueued = true;
-  };
-
   private readonly onBetClick = (event: Event) => {
     event.preventDefault();
     this.betQueued = true;
@@ -198,7 +191,6 @@ export class InputController {
     private readonly sweepButton: HTMLElement,
     private readonly grappleButton: HTMLElement,
     private readonly reloadButton: HTMLElement,
-    private readonly wheelButton: HTMLElement,
     private readonly betButton: HTMLElement,
   ) {
     window.addEventListener('keydown', this.onKeyDown);
@@ -213,7 +205,6 @@ export class InputController {
     sweepButton.addEventListener('pointerdown', this.onSweepClick);
     grappleButton.addEventListener('pointerdown', this.onGrappleClick);
     reloadButton.addEventListener('pointerdown', this.onReloadClick);
-    wheelButton.addEventListener('pointerdown', this.onWheelClick);
     betButton.addEventListener('pointerdown', this.onBetClick);
   }
 
@@ -269,7 +260,6 @@ export class InputController {
       sweepPressed: this.sweepQueued,
       grapplePressed: this.grappleQueued,
       reloadPressed: this.reloadQueued,
-      wheelPressed: this.wheelQueued,
       betPressed: this.betQueued,
     };
     this.dropQueued = false;
@@ -278,7 +268,6 @@ export class InputController {
     this.sweepQueued = false;
     this.grappleQueued = false;
     this.reloadQueued = false;
-    this.wheelQueued = false;
     this.betQueued = false;
     return result;
   }
@@ -332,7 +321,6 @@ export class InputController {
     this.sweepButton.removeEventListener('pointerdown', this.onSweepClick);
     this.grappleButton.removeEventListener('pointerdown', this.onGrappleClick);
     this.reloadButton.removeEventListener('pointerdown', this.onReloadClick);
-    this.wheelButton.removeEventListener('pointerdown', this.onWheelClick);
     this.betButton.removeEventListener('pointerdown', this.onBetClick);
   }
 

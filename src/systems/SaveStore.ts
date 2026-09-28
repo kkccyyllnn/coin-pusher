@@ -77,6 +77,8 @@ type LegacySave = {
  */
 export class SaveStore {
   private data: SaveData;
+  /** 累计充值额。**刻意不落盘、不被 `clear()` 清零** —— 见 `refillWallet`。 */
+  private refilledTotal = 0;
 
   constructor() {
     const { data, migrated } = this.read();
@@ -117,6 +119,39 @@ export class SaveStore {
   depositWallet(amount: number): void {
     if (amount <= 0) return;
     this.data.wallet += amount;
+    this.write();
+  }
+
+  /**
+   * 充值/补充钱包（调试与验证脚本用）。
+   *
+   * `refilled` 是**单调递增的累计值，`clear()` 也不清零** —— 钱包守恒算式
+   * `wallet终 = wallet起 + Σ充值 − Σ买入 + Σ回存` 要用它的增量，
+   * 中途被 `clear()` 归零会让增量变成负数、算式凭空多出一笔。
+   */
+  refillWallet(amount: number = 100): void {
+    if (amount <= 0) return;
+    this.data.wallet += amount;
+    this.refilledTotal += amount;
+    this.write();
+  }
+
+  /** 累计充值额（不落盘，只在本次会话内累计）。 */
+  get refilled(): number {
+    return this.refilledTotal;
+  }
+
+  /**
+   * 直接把钱包设成某个值（验证脚本用）。
+   *
+   * 差额记进 `refilledTotal`：这样无论调用方把钱包改成多少，
+   * 守恒式 `wallet终 = wallet起 + Σ充值 − Σ买入 + Σ回存` 依然精确成立，
+   * 不会因为「测试偷偷改了钱包」而报出假失败。
+   */
+  setWallet(amount: number): void {
+    const next = Math.max(0, Math.round(amount));
+    this.refilledTotal += next - this.data.wallet;
+    this.data.wallet = next;
     this.write();
   }
 
@@ -196,8 +231,15 @@ export class SaveStore {
   /** v3 存档：字段缺失时用默认值补齐，不写入 undefined。 */
   private parse(raw: string, base: SaveData): SaveData {
     const parsed = JSON.parse(raw) as Partial<SaveData>;
+    let wallet = typeof parsed.wallet === 'number' ? parsed.wallet : base.wallet;
+    const runs = Array.isArray(parsed.runs) ? parsed.runs : base.runs;
+    const totalBegs = typeof parsed.totalBegs === 'number' ? parsed.totalBegs : base.totalBegs;
+    // 如果无有效历史局且无跪求记录、但钱包被扣空（如频繁刷新），自动重置为起始钱包，防止新局坏死
+    if (wallet <= 0 && runs.length === 0 && totalBegs === 0) {
+      wallet = base.wallet;
+    }
     return {
-      wallet: typeof parsed.wallet === 'number' ? parsed.wallet : base.wallet,
+      wallet,
       coinSkins:
         Array.isArray(parsed.coinSkins) && parsed.coinSkins.length > 0 ? parsed.coinSkins : base.coinSkins,
       cabinetSkins:
@@ -211,8 +253,8 @@ export class SaveStore {
           ? parsed.selectedCabinetSkin
           : base.selectedCabinetSkin,
       bestEarned: typeof parsed.bestEarned === 'number' ? parsed.bestEarned : base.bestEarned,
-      totalBegs: typeof parsed.totalBegs === 'number' ? parsed.totalBegs : base.totalBegs,
-      runs: Array.isArray(parsed.runs) ? parsed.runs : base.runs,
+      totalBegs,
+      runs,
       // v3 存档没有 xixi 字段 → 默认全灭；有则原样沿用（四槽亮灭是持续进度）。
       xixi:
         Array.isArray(parsed.xixi) && parsed.xixi.length === 4

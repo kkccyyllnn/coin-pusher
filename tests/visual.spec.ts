@@ -203,12 +203,25 @@ test.describe('币塔街机机台', () => {
     await waitForFrame(page, 5);
 
     const spec = await table(page);
-    const initialChips = (await diagnostics(page))?.chips ?? 0;
+    const before = await diagnostics(page);
+    const initialChips = before?.chips ?? 0;
     await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.drop?.(0));
     await waitFrames(page, 30);
 
     const mid = await diagnostics(page);
-    expect(mid?.chips).toBe(initialChips - 1);
+    // ★ 「一次有效投币只扣 1 枚筹码」的正确读数是**消耗账本**（`spent`），不是 `chips`。
+    //
+    // `chips` 会被返值污染：投币之后的这 30 帧里只要有币越线结算，`chips` 就**不降反升**
+    // （实测偶发 `initialChips−1` 变成 `initialChips+2`，与推板 1.8 枚/循环的节奏撞上就红）。
+    // 那是**合法结算**，不是「扣多了/扣少了」——用 `chips` 直接比就是一条概率性判据。
+    // 所以：扣减量读 `spent`；`chips` 用三账本恒等式把返值解释掉。
+    expect((mid?.spent ?? 0) - (before?.spent ?? 0)).toBe(1);
+    expect(mid?.chips).toBe(
+      initialChips -
+        1 +
+        ((mid?.earned ?? 0) - (before?.earned ?? 0)) +
+        ((mid?.begged ?? 0) - (before?.begged ?? 0)),
+    );
     expect(mid?.phase).toBe('playing');
 
     await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.startRun?.());
@@ -224,6 +237,86 @@ test.describe('币塔街机机台', () => {
     expect(state?.activeCoins).toBe(spec?.coins);
     expect(state?.xixi).toEqual([false, false, false, false]);
     expect(state?.boostCharges).toBe(0);
+  });
+
+  test('像素分辨率：整数倍率生效，且关掉后画面仍非空白（可逆）', async ({ page }) => {
+    await page.goto('/');
+    await waitFrames(page, 5);
+
+    // ① 默认像素化：倍率是**整数**且 ≥ 2。
+    //    非整数放大时一个 texel 时而占 1 个 CSS 像素、时而占 2 个，
+    //    画面会出现粗细不均的条纹——这是这套方案唯一不能破的不变量。
+    //
+    //    每个断言都带上现场读数：这条曾经在 iPhone 13（视口 390×**664**）上红过——
+    //    `floor(664/360) = 1`，倍率 1 等于不降分辨率，「像素化」变成名义开关。
+    //    没有现场读数就得靠猜是哪个视口、哪个数字不对。
+    const on = await diagnostics(page);
+    const site =
+      `upscale=${on?.performance.upscale} pixelated=${on?.performance.pixelated} ` +
+      `backing=${on?.canvas.width}x${on?.canvas.height} css=${on?.canvas.clientWidth}x${on?.canvas.clientHeight} ` +
+      `internalH=${on?.performance.internalHeight}`;
+    expect(on?.performance.pixelated, site).toBe(true);
+    expect(Number.isInteger(on?.performance.upscale), site).toBe(true);
+    expect(on?.performance.upscale ?? 0, site).toBeGreaterThanOrEqual(2);
+
+    // ② 倍率真的落到了画布上：backing store = CSS 尺寸 ÷ 倍率。
+    //    `upscale` 是引擎算的，`canvas.width` 是画布实际被设成的值——两者必须一致。
+    const expectedBacking = Math.floor(
+      (on?.canvas.clientWidth ?? 0) / (on?.performance.upscale ?? 1),
+    );
+    expect(Math.abs((on?.canvas.width ?? 0) - expectedBacking), site).toBeLessThanOrEqual(1);
+    // 内部高度必须真的低于 CSS 高度，否则「像素化」只是名义上的。
+    expect(on?.performance.internalHeight ?? 0, site).toBeLessThan(on?.canvas.clientHeight ?? 0);
+
+    // ③ 关掉 → 回到原生分辨率，且**画面仍非空白**（不是渲染坏掉）。
+    //    这条同时覆盖 `?pixel=off` 走的同一条路径。
+    const off = await page.evaluate(() =>
+      window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ pixelated: false }),
+    );
+    expect(off?.upscale).toBe(1);
+    expect(off?.pixelRatio).toBe(1);
+    await waitFrames(page, 3);
+    const offSample = await sampleCanvas(page);
+    expect(offSample.ok).toBe(true);
+
+    // ④ 再打开 → 倍率回来。可逆，不是一次性开关。
+    const back = await page.evaluate(() =>
+      window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ pixelated: true }),
+    );
+    expect(back?.pixelated, site).toBe(true);
+    expect(back?.upscale ?? 0, site).toBeGreaterThanOrEqual(2);
+
+    // ⑤ 倍率下限：把目标高度设得比视口还高时，`floor(视口高 / 目标高度)` 会算出 1，
+    //    此时**必须**被 `minUpscale` 兜住。这条专门钉住 iPhone 13 上踩过的那个坑：
+    //    矮视口下像素化静默失效，画面与改造前一模一样，而开关还显示「开」。
+    const floored = await page.evaluate(() =>
+      window.__THREE_GAME_TEST_HOOKS__?.setPixelScale?.({ targetHeight: 10000 }),
+    );
+    expect(floored?.upscale ?? 0, `targetHeight=10000 时 ${JSON.stringify(floored)}`).toBeGreaterThanOrEqual(2);
+  });
+
+  test('换肤真的改变画面（toon 材质下不会静默失效）', async ({ page }) => {
+    await page.goto('/');
+    await waitFrames(page, 5);
+    const before = await page.locator('#game-canvas').screenshot();
+
+    // V2 把机柜材质换成 `MeshToonMaterial` 之后，`applyCabinetSkin` 里原来的
+    // `instanceof THREE.MeshStandardMaterial` 判定会**静默跳过全部部件**：
+    // 换肤函数照跑、零报错、返回成功，但颜色一点都不变。
+    // 这种缺陷截图对比之外很难发现，所以这里逐字节比画面。
+    const unlocked = await page.evaluate(() =>
+      window.__THREE_GAME_TEST_HOOKS__?.unlockSkin?.('cabinet', 'amber', 20),
+    );
+    expect(unlocked?.unlocked).toBe(true);
+
+    const picked = await page.evaluate(() =>
+      window.__THREE_GAME_TEST_HOOKS__?.selectSkin?.('cabinet', 'amber'),
+    );
+    expect(picked?.cabinetSkin).toBe('amber');
+
+    await waitFrames(page, 5);
+    const after = await page.locator('#game-canvas').screenshot();
+    expect(before.equals(after)).toBe(false);
   });
 
   test('画质分档只改渲染参数，不改盘面与返值规则', async ({ page }) => {

@@ -21,6 +21,11 @@ export type RunSnapshot = {
   spent: number;
   /** 局内筹码峰值。 */
   chipsPeak: number;
+  /**
+   * 本局被老虎机罚掉的筹码（P10 的胡萝卜四连）。
+   * **不进恒等式**——已含在 `spent` 里；它是「罚款发生了没有、扣了多少」的对账口径。
+   */
+  fines: number;
   boostCharges: number;
   boostUsesLeft: number;
   boostEnabled: boolean;
@@ -79,6 +84,11 @@ export class RunState {
   begged = 0;
   /** 本局消耗掉的筹码。 */
   spent = 0;
+  /**
+   * 本局被老虎机罚掉的筹码（P10）。**不进三账本恒等式**——它已经包含在 `spent` 里。
+   * 单独记一份是为了能对账「惩罚到底发生了没有、发生了几次、扣了多少」。
+   */
+  fines = 0;
   /** 局内筹码峰值。 */
   chipsPeak: number;
   boostCharges = 0;
@@ -204,6 +214,32 @@ export class RunState {
   }
 
   /**
+   * 老虎机惩罚（P10）：胡萝卜四连，扣本局筹码。
+   *
+   * ## 为什么不新增账本项
+   *
+   * 三账本恒等式 `chips = buyIn + earned + begged − spent` 是 `economy` 模式逐帧验的东西，
+   * 加一个 `fined` 项就要同步改 `Ledger` / `ledgerBalances` / 所有断言点——
+   * 那是**账本契约变更**，和「加一个惩罚」是两件事，混在一次改动里违反纪律 1。
+   * 所以罚款走 `spendChips`（唯一扣减入口），`spent` 把它一起吸收；
+   * 另用 `fines` 记**罚款额**（不进恒等式），断言靠 `fines` 与 `spent ≥ fines` 对账。
+   *
+   * ## 扣到 0 为止
+   *
+   * 余额不足时不是「拒收」，而是**扣光**——惩罚的意义就在于它能把你打到沉降里。
+   * 归零后由既有的 `updateRunState` 沉降分支接管（`enterRuinSettle` → 破产窗 / 跪求），
+   * **不新开破产路径**。
+   */
+  fineChips(amount: number): number {
+    const wanted = Math.max(0, Math.floor(amount));
+    const applied = Math.min(wanted, this.chips);
+    if (applied <= 0) return 0;
+    this.spendChips(applied);
+    this.fines += applied;
+    return applied;
+  }
+
+  /**
    * 记一次投币。
    *
    * 与筹码消耗**分开计数**：机关也花筹码，但只有投币算「存活投数」，
@@ -313,6 +349,7 @@ export class RunState {
       begged: this.begged,
       spent: this.spent,
       chipsPeak: this.chipsPeak,
+      fines: this.fines,
       boostCharges: this.boostCharges,
       boostUsesLeft: this.boostUsesLeft,
       boostEnabled: this.boostUsesLeft > 0,

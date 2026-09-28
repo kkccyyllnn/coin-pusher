@@ -24,14 +24,29 @@
  */
 import { chromium } from 'playwright';
 
-const BASE = process.env.BASE_URL ?? 'http://127.0.0.1:5188';
+/** 币尺寸档位：`COIN=1.2 node scripts/tune-physics.mjs`，与手改地址栏同一条路径。 */
+const BASE = (() => {
+  const url = process.env.BASE_URL ?? 'http://127.0.0.1:5188';
+  if (!process.env.COIN) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}coin=${encodeURIComponent(process.env.COIN)}`;
+})();
 const TUNE = process.env.TUNE ? JSON.parse(process.env.TUNE) : {};
 const PLAY = process.env.PLAY === '1';
-/** 地板顶面（`TABLE.floorY`）与单层静置时的币心高度（币半厚）。 */
+/** 地板顶面（`TABLE.floorY`）——机台硬件尺寸，与币无关，不派生。 */
 const FLOOR_TOP = 0;
-const REST_Y = 0.01;
-/** 层高：币厚 + 一点余量，与 `layout.LAYER_STEP` 同式。 */
-const LAYER_STEP = 0.01 * 2 + 0.0012;
+/**
+ * 单层静置的币心高度与层高。★ S13 起**从页面读**（`coinGeometry()`），不再手抄：
+ * `?coin=1.1/1.2` 会同时改掉币半厚与层高，手抄的那份不会跟着变——
+ * 「同格层间距应 0.0212」这条判据在别的档位下会一直红，而抄反方向时会一直绿。
+ * 读不到就让脚本**直接炸**（`NaN` 会让所有比较静默变 false = 全绿）。
+ */
+let REST_Y = NaN;
+let LAYER_STEP = NaN;
+/**
+ * 上层（推板顶面）与币床的分界：★ S13 起走引擎的 `isOnDeckAt`（体积判据），
+ * **不再用高度中点近似**。近似在币塔盖到 9 层（塔顶 0.216）之后会把塔上的币
+ * 算成台面币——读数看着正常、其实是假的。见 `deckMask()`。
+ */
 /** 判定「沉入地板」的容差（毫米级接触穿透是正常的）。 */
 const SINK_TOLERANCE = 0.002;
 
@@ -49,8 +64,36 @@ const state = () => page.evaluate(() => window.__THREE_GAME_DIAGNOSTICS__);
 const penetration = () =>
   page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.penetrationReport?.(4) ?? null);
 
-function summarize(list) {
-  const bed = list.filter((coin) => coin.y < 0.15);
+// 币的几何量：页面是唯一真源。读不到直接抛——`NaN` 会让下游所有比较静默变 false。
+const COIN_GEO = await page.evaluate(
+  () => window.__THREE_GAME_TEST_HOOKS__?.coinGeometry?.() ?? null,
+);
+if (!COIN_GEO) throw new Error('未读到 coinGeometry()：页面版本太旧？');
+REST_Y = COIN_GEO.restY;
+LAYER_STEP = COIN_GEO.layerStep;
+console.log(
+  `[info] 币尺寸档位 ×${COIN_GEO.scale}：直径 ${(COIN_GEO.diameter * 1000).toFixed(1)} mm、` +
+    `层高 ${(LAYER_STEP * 1000).toFixed(2)} mm、静置 ${(REST_Y * 1000).toFixed(2)} mm`,
+);
+
+/**
+ * 一次 evaluate 把整批币的「是否在台面上」判出来（引擎的 `isOnDeckAt`）。
+ * 判据只有引擎那一份（`layout.isOnDeckVolume`），脚本不写第二份公式。
+ */
+const deckMask = (list) =>
+  page
+    .evaluate(
+      (points) => {
+        const fn = window.__THREE_GAME_TEST_HOOKS__?.isOnDeckAt;
+        return points.map((p) => (fn ? fn(p[0], p[1], p[2]) : false));
+      },
+      list.map((coin) => [coin.x, coin.y, coin.z]),
+    )
+    .catch(() => list.map(() => false));
+
+async function summarize(list) {
+  const onDeck = await deckMask(list);
+  const bed = list.filter((_, index) => !onDeck[index]);
   const sunk = bed.filter((coin) => coin.y < FLOOR_TOP + REST_Y - SINK_TOLERANCE).length;
   const meanY = bed.reduce((sum, coin) => sum + coin.y, 0) / Math.max(1, bed.length);
   const cells = new Map();
@@ -103,7 +146,7 @@ const applied = (await state())?.physics?.tuning;
 console.log(
   `旋钮：重力 ${applied?.gravity}｜全局迭代 ${applied?.solverIterations}｜ERP ${applied?.erp}｜币额外迭代 ${applied?.coinSolverIterations}`,
 );
-report('静置 2.5s', summarize(await coins()), await penetration());
+report('静置 2.5s', await summarize(await coins()), await penetration());
 
 if (PLAY) {
   for (let i = 0; i < 60; i += 1) {
@@ -123,7 +166,7 @@ if (PLAY) {
     const fastest = (await coins()).reduce((max, coin) => Math.max(max, coin.speed ?? 0), 0);
     quiet = fastest < 0.08 ? quiet + 1 : 0;
   }
-  report('10 循环后静止', summarize(await coins()), await penetration());
+  report('10 循环后静止', await summarize(await coins()), await penetration());
 }
 
 await browser.close();
