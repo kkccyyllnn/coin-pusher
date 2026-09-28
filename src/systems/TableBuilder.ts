@@ -17,6 +17,7 @@ import {
   createArcaneHotZoneTexture,
   createArcaneScoreLineTexture,
 } from '../render/cabinetTexture';
+import { marqueeScreen } from '../render/marqueeScreen';
 
 /**
  * 机柜件的默认圆角半径（米）。
@@ -847,6 +848,7 @@ let cabinetMaterialCache: {
   panelArt: LitMaterial;
   rail: LitMaterial;
   trim: LitMaterial;
+  screen: LitMaterial;
 } | null = null;
 
 function cabinetMaterials(): {
@@ -854,6 +856,7 @@ function cabinetMaterials(): {
   panelArt: LitMaterial;
   rail: LitMaterial;
   trim: LitMaterial;
+  screen: LitMaterial;
 } {
   if (!cabinetMaterialCache) {
     const panelParams = {
@@ -891,6 +894,22 @@ function cabinetMaterials(): {
         ...ROLE_DETAIL.trim,
         ...ROLE_RIM.trim,
       }),
+      // ★ R3-U4 招牌显示屏。**defines 与 panelArt 一字不差**（同 detailKind、
+      // 同挂 map + emissiveMap）⇒ 复用同一个 program，只多一个 draw call。
+      //
+      // 底色压到近黑是刻意的：这块面**不该被场景光照**，它的光全来自 emissiveMap。
+      // 留一点余量（不是纯 0）是为了让檐板的圆角高光能在屏面上落一道极淡的边 ——
+      // 完全不吃光的贴片看起来像 PS 上去的。
+      screen: makeToonMaterial({
+        name: 'marqueeScreen',
+        color: '#0b0f0c',
+        ramp: ROLE_RAMP.panel,
+        ...ROLE_DETAIL.panel,
+        map: marqueeScreen().texture,
+        emissiveMap: marqueeScreen().texture,
+        emissive: '#ffffff',
+        emissiveIntensity: 1.15,
+      }),
     };
   }
   return cabinetMaterialCache;
@@ -905,7 +924,7 @@ function cabinetMaterials(): {
  */
 export function buildCabinetShell(): THREE.Group {
   const shell = new THREE.Group();
-  const { panel, panelArt, rail, trim } = cabinetMaterials();
+  const { panel, panelArt, rail, trim, screen } = cabinetMaterials();
 
   // ── 7 件外壳 ──
   //
@@ -917,7 +936,7 @@ export function buildCabinetShell(): THREE.Group {
   //   低段与背板仍走 `panel` / `rail`。见 `cabinetMaterials()` 里 `panelArt` 的注释。
   shell.add(buildSideWall(-1, { tall: panelArt, low: rail }));
   shell.add(buildSideWall(1, { tall: panelArt, low: rail }));
-  shell.add(buildHood(trim));
+  shell.add(buildHood(trim, screen));
   shell.add(buildBackPanel(panel));
 
   return shell;
@@ -1189,7 +1208,7 @@ function buildSideWall(
  * （`Game.pickCabinetMap` 本来就把它分到招牌那一支），代价是垂直压缩 ≈42%。
  * 侧墙高段的「檐板托」正好托在它下沿（`valanceBottomY`）上。
  */
-function buildHood(material: LitMaterial): THREE.Group {
+function buildHood(material: LitMaterial, screen: LitMaterial): THREE.Group {
   const { hood } = cabinetShape();
   const group = new THREE.Group();
 
@@ -1216,7 +1235,37 @@ function buildHood(material: LitMaterial): THREE.Group {
     ),
   );
 
+  // ★ R3-U4：檐板正前 2 mm 的一块 LED 小屏（见 `render/marqueeScreen.ts`）。
+  group.add(buildMarqueeScreenMesh(screen));
+
   return group;
+}
+
+/**
+ * 招牌显示屏的贴片（R3-U4）。
+ *
+ * 尺寸从檐板反推，不写死：屏占满檐板**倒角以内**的平坦区，宽高比锁 4:1
+ * 与 256×64 的纹理一致 —— 比例不对会让 LED 点阵变成扁椭圆，那是最刺眼的穿帮。
+ *
+ * 没有 `userData.role` / `userData.part`：换肤（`applyCabinetSkin`）与贴图分发
+ * （`Game.applyCabinetMapTextures`）都是按这两个字段找件的，屏既不吃机柜配色
+ * 也不吃 Arcane 构图，让它俩天然跳过比自己写一条「如果是屏就 continue」干净。
+ */
+function buildMarqueeScreenMesh(material: LitMaterial): THREE.Mesh {
+  const { hood } = cabinetShape();
+  const bevel = partBevel('hoodValance').radius;
+  const faceHeight = hood.topY - hood.valanceBottomY - bevel * 2;
+  const faceWidth = hood.halfWidth * 2 - bevel * 2;
+  const height = Math.min(0.24, faceHeight);
+  const width = Math.min(height * 4, faceWidth);
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, height), material);
+  mesh.name = 'marqueeScreen';
+  mesh.position.set(
+    0,
+    (hood.valanceBottomY + hood.topY) / 2,
+    hood.valanceFrontZ + 0.002,
+  );
+  return mesh;
 }
 
 /**

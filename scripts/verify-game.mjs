@@ -4862,6 +4862,32 @@ async function runCabinet(page, context) {
     valance ? `法线 (${valance.normal.map((v) => v.toFixed(3)).join(', ')})` : '缺件',
   );
 
+  // R3-U4：招牌显示屏。它**不在**上面那 7 件里（没有 `part`，换肤与贴图分发都不吃它），
+  // 所以只能单开一条通道看。三件事要问：在不在、贴没贴上、有没有吃自己的纹理 ——
+  // 第三件最容易静默失效：`emissiveMap` 忘了挂时屏是纯黑的，而纯黑的屏在截图里
+  // 和「没开灯的招牌」几乎没区别，任何计数型判据都不会红。
+  const screen = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.marqueeReport?.() ?? null,
+  );
+  check(
+    '招牌屏挂在檐板正前 2 mm、居中、比例锁 4:1、map 与 emissiveMap 都是那块画布',
+    Boolean(screen) &&
+      Boolean(valance) &&
+      Math.abs(screen.world[2] - (valance.max[2] + 0.002)) < 1e-3 &&
+      Math.abs(screen.world[0]) < 1e-6 &&
+      screen.world[1] > valance.min[1] &&
+      screen.world[1] < valance.max[1] &&
+      Math.abs(screen.width / screen.height - 4) < 0.01 &&
+      screen.mapIsScreen === true &&
+      screen.emissiveMapIsScreen === true &&
+      screen.materialName === 'marqueeScreen',
+    screen
+      ? `屏 ${screen.width.toFixed(3)}×${screen.height.toFixed(3)} 米 @ z=${fmt(screen.world[2])}` +
+        `（檐板前面 ${fmt(valance.max[2])} + 2 mm），map=${screen.mapIsScreen}` +
+        ` emissiveMap=${screen.emissiveMapIsScreen}`
+      : '缺件',
+  );
+
   // ⑦ 「它还长得像一台机柜吗」两条量纲级断言
   const fatWalls = truth.parts.filter((part) => {
     if (!part.startsWith('sideWall')) return false;

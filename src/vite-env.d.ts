@@ -610,6 +610,19 @@ interface ThreeGameTestHooks {
    */
   programRoster?(): Array<{ fingerprint: string; variants: number }>;
   /**
+   * 招牌显示屏实测读数（R3-U4）。屏不在 `cabinetReport()` 的 7 件里
+   * （它不吃换肤与贴图分发，所以没有 `part`），只能靠这个通道观测。
+   */
+  marqueeReport?(): {
+    width: number;
+    height: number;
+    world: [number, number, number];
+    materialName: string;
+    mapIsScreen: boolean;
+    emissiveMapIsScreen: boolean;
+    offsetX: number;
+  } | null;
+  /**
    * 推币机扩展（V4）：币面贴图的实际纹素与采样设置。
    * `center` 是贴图正中心（有字形时是字色），`quarter` 是 1/4 处（纹样/颗粒区）。
    */

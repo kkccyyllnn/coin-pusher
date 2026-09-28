@@ -20,6 +20,7 @@ import {
   syncCameraRigAngles,
   toRad,
 } from '../render/cameraRig';
+import { marqueeScreen } from '../render/marqueeScreen';
 import { rampLutCount } from '../render/RampLut';
 import { makeToonMaterial, isLitMaterial, rimStrengthOf, type LitMaterial } from '../render/ToonMaterial';
 import {
@@ -390,7 +391,7 @@ export class Game {
     this.shows = new ShowDirector({
       coins: this.coins,
       telemetry: this.telemetry,
-      notify: (message) => this.hud.setStatus(message),
+      notify: (message) => this.announce(message),
       now: () => this.elapsed,
       rng: () => this.rng(),
       reducedMotion: () => this.motion.reduced,
@@ -399,7 +400,7 @@ export class Game {
     this.slotMachine = new SlotMachine({
       shows: this.shows,
       telemetry: this.telemetry,
-      notify: (message) => this.hud.setStatus(message),
+      notify: (message) => this.announce(message),
       now: () => this.elapsed,
       rng: () => this.rng(),
       reducedMotion: () => this.motion.reduced,
@@ -602,6 +603,9 @@ export class Game {
     if (this.governor.sample(delta)) this.applyQuality();
     this.debugTools.update();
     this.publishHud();
+    // 招牌屏的推进放在**循环**里而不是 `publishHud()`：后者还有六个来自测试钩子
+    // 与重置流程的调用点，那些地方没有 delta，也不该被当成过了帧。
+    marqueeScreen().tick(delta, this.config.name);
     this.publishDiagnostics();
   }
 
@@ -2088,6 +2092,17 @@ export class Game {
     return resting;
   }
 
+  /**
+   * 一句要让玩家看见的话：**同时**进状态行与招牌屏（R3-U4）。
+   *
+   * 只开这一个口，是因为「老虎机开奖说了什么」在 DOM 和 3D 招牌上是同一件事 ——
+   * 分成两处调用的话，早晚会有一处漏掉某个事件，而那种不一致没有任何判据能发现。
+   */
+  private announce(message: string): void {
+    this.hud.setStatus(message);
+    marqueeScreen().subtitle(message);
+  }
+
   private publishHud(): void {
     // XIXI 标牌跟着 HUD 一起刷新：**同一个数据源**（`this.xixi`），
     // 所以 3D 标牌与 DOM 圆点不可能对不上。爆闪由 `updateXixiFlash` 递减。
@@ -2096,8 +2111,9 @@ export class Game {
       this.xixiFlashTimer > 0 ? this.xixiFlashSlot : -1,
       this.xixiFlashTimer > 0 ? this.xixiFlashTimer / XIXI_FLASH_SECONDS : 0,
     );
+    const snapshot = this.run.snapshot();
     this.hud.update(
-      this.run.snapshot(),
+      snapshot,
       this.config,
       this.save.snapshot.bestEarned,
       this.mechanismSnapshot(),
@@ -2105,6 +2121,8 @@ export class Game {
       this.save.wallet,
       this.xixi,
     );
+    // 屏上的账本与 DOM 读的是**同一个 snapshot 对象**：不存在「HUD 说 56、招牌说 54」。
+    marqueeScreen().pushLedger({ wallet: this.save.wallet, earned: snapshot.earned });
   }
 
   /**
@@ -2522,6 +2540,30 @@ export class Game {
           max: this.rendererPeakDrawCalls,
         };
         return base;
+      },
+      /**
+       * 招牌显示屏的**实测读数**（R3-U4）。
+       *
+       * 屏是第 8 个外壳网格，但**故意不带** `userData.part` / `role`：换肤与贴图分发
+       * 都按这两个字段找件，屏两者都不吃。代价是 `cabinetReport()` 那 7 件看不见它 ——
+       * 没有这个通道，「屏到底在不在、贴没贴上、有没有吃自己的纹理」就只能盯截图。
+       */
+      marqueeReport: () => {
+        const mesh = this.tableGroup?.getObjectByName('marqueeScreen') as THREE.Mesh | undefined;
+        if (!mesh) return null;
+        const texture = marqueeScreen().texture;
+        const material = mesh.material as THREE.MeshToonMaterial;
+        const size = (mesh.geometry as THREE.PlaneGeometry).parameters;
+        const world = mesh.getWorldPosition(new THREE.Vector3());
+        return {
+          width: size.width ?? 0,
+          height: size.height ?? 0,
+          world: [world.x, world.y, world.z] as [number, number, number],
+          materialName: material.name,
+          mapIsScreen: material.map === texture,
+          emissiveMapIsScreen: material.emissiveMap === texture,
+          offsetX: Number(texture.offset.x.toFixed(4)),
+        };
       },
       /**
        * 已编译程序的**指纹名单**（R2-T2）。
