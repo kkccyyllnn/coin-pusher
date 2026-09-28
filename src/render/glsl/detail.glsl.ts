@@ -96,9 +96,23 @@ float sdDetail2D( vec2 uv ) {
 	//
 	// 幅度刻意压到 ±10%：第一版是 ±22%，在护栏那种斜视角的大平面上
 	// 读起来是「斜条纹」而不是「金属拉丝」——纹样要像材质，不能像图案。
+	// ★ R2-T1-4：两层 → **三层**，全部各向异性（横向压缩、纵向拉密）。
+	//
+	// 为什么加的是第三个 sdNoise 而不是 sdBand2 的第三层 octave：
+	// noise.glsl.ts 的硬线是「octave 上限 2，要更细就抬 detailScale」—— 那条管的是
+	// **单个 fbm 内部**的 octave 数（改了会同时抬所有 kind 的成本）。这里加的是**另一层**
+	// 单层噪声（+1 次 hash 调用，只作用于 kind 1 的那三四个材质），两条约束都不破：
+	// 没有第三 octave，也没有新增 define 值（SD_DETAIL_KIND 沿用 1）。
+	//
+	// 三层的方向刻意不同：真实拉丝是「多道不同间距的划痕」叠加，两层同向读起来像壁纸
+	// 条纹（间距一致 → 摩尔纹），三层错频才像磨损。权重相加 = 1，所以 detail 仍落在
+	// 0.90~1.10 —— 换层数不该让金属变亮或变暗。
+	// ⚠️ 这段注释里**不要写反引号**：它在 JS 模板字符串内部，一个反引号就会截断整个模块
+	//   （报的是 TS1443「Module declaration names may only...」，行号还指不到真正的原因）。
 	float fine = sdNoise( vec2( uv.x * 0.5, uv.y * 16.0 ) );
+	float mid = sdNoise( vec2( uv.x * 1.6, uv.y * 6.5 ) );
 	float coarse = sdNoise( vec2( uv.x * 0.13, uv.y * 3.4 ) );
-	float streak = fine * 0.65 + coarse * 0.35;
+	float streak = fine * 0.45 + mid * 0.30 + coarse * 0.25;
 	detail = 0.90 + streak * 0.20;
 #elif SD_DETAIL_KIND == 2
 	// 木纹：年轮 = 被拉伸的噪声的等值线；窄段取深色细线，再叠高频木丝。
