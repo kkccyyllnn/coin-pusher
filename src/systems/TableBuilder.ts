@@ -11,7 +11,7 @@ import {
   type CabinetShellPart,
   type WallPointId,
 } from '../game/cabinetShape';
-import { DETAIL_SURFACE, ROLE_DETAIL, ROLE_RAMP } from '../game/artDirection';
+import { DETAIL_SURFACE, ROLE_DETAIL, ROLE_RAMP, ROLE_RIM } from '../game/artDirection';
 import { isLitMaterial, makeToonMaterial, type LitMaterial } from '../render/ToonMaterial';
 import {
   createArcaneHotZoneTexture,
@@ -764,6 +764,7 @@ function buildFrontBaffle(): THREE.Group {
       color: COLORS.cabinetTrim,
       ramp: ROLE_RAMP.trim,
       ...ROLE_DETAIL.trim,
+      ...ROLE_RIM.trim,
     }),
   );
   lip.position.set(0, top, frontZ);
@@ -881,12 +882,14 @@ function cabinetMaterials(): {
         ramp: ROLE_RAMP.rail,
         // V3：护栏是金属件，走各向异性拉丝。
         ...ROLE_DETAIL.rail,
+        ...ROLE_RIM.rail,
       }),
       trim: makeToonMaterial({
         name: 'trim',
         color: COLORS.cabinetTrim,
         ramp: ROLE_RAMP.trim,
         ...ROLE_DETAIL.trim,
+        ...ROLE_RIM.trim,
       }),
     };
   }

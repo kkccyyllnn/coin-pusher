@@ -52,17 +52,31 @@
  */
 export const RIM_DECL = /* glsl */ `
 uniform vec3 uRimColor;
+uniform vec3 uRimColorHigh;
 uniform float uRimStrength;
 uniform float uRimPower;
 uniform float uRimEmissiveFloor;
+uniform float uMatcapStrength;
 float sdRimFres;
+float sdRimUp;
 `;
 
 export const RIM_APPLY = /* glsl */ `
 	{
 		vec3 sdRimView = normalize( vViewPosition );
 		sdRimFres = pow( 1.0 - saturate( dot( normal, sdRimView ) ), uRimPower );
-		diffuseColor.rgb += uRimColor * ( sdRimFres * uRimStrength );
+		// 双色 rim（R2-T1-1）：下缘暖、上缘冷 —— Arcane 的霓虹是**从下往上打**的，
+		// 单一 rim 色会把这件事抹平。分界线取视空间法线的 y：机位基本固定（俯视台面），
+		// 所以视空间的「上」与世界的「上」在这里够用了。
+		sdRimUp = saturate( normal.y * 0.5 + 0.5 );
+		diffuseColor.rgb += mix( uRimColor, uRimColorHigh, sdRimUp ) * ( sdRimFres * uRimStrength );
+		// matcap-lite（R2-T1-2）：**不新增采样**，直接查已经在用的色带 LUT，
+		// 拿菲涅尔当横坐标。于是「金属边缘高光」是**量化过的色带档**而不是连续泛光，
+		// 三渲二的硬边调性不被破坏 —— 这正是不用真 matcap 贴图的理由（那要 +1 纹理 +1 program）。
+		// 包在 USE_GRADIENTMAP 里：gradientMap 这个 uniform 本身就只在该 define 打开时声明。
+		#ifdef USE_GRADIENTMAP
+			diffuseColor.rgb += texture2D( gradientMap, vec2( sdRimFres, 0.5 ) ).rgb * uMatcapStrength;
+		#endif
 	}
 `;
 

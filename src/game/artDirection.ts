@@ -103,6 +103,41 @@ export const DETAIL_SURFACE = {
 } as const;
 
 /**
+ * 机台部件角色 → 边缘光与 matcap-lite（R2-T1-1 / T1-2）。
+ *
+ * 与 `ROLE_RAMP` / `ROLE_DETAIL` 同键，所以同样可以 `...ROLE_RIM.rail` 直接展开。
+ * 两个新参数都**默认恒等**（上缘色跟随下缘色、matcap 强度 0），没列进来的角色零变化。
+ *
+ * ## 为什么只给金属件
+ *
+ * 双色 rim 与 matcap-lite 都是零程序代价的通道（GLSL 无条件注入，生效与否由逐材质
+ * uniform 表达）。但「零程序」≠「零风险」：rim 是加在 **albedo** 上的，强度一高会把
+ * 色带顶到更亮一档，整件泛白（S16 的钻石就是这么变成白球的）。所以只开给**金属件**，
+ * 漆面（panel / floor）与币保持 0。
+ *
+ * ## 为什么写死、不跟换肤走
+ *
+ * 下暖上冷表达的是**机台所处的环境光**（Arcane 的霓虹从下往上打），不是机台涂装。
+ * 跟着皮肤变会让「同一间屋子」的每台风色温都不一样 —— 那才是错的复用。
+ */
+export const ROLE_RIM = {
+  rail: {
+    rimColor: '#ffd08a',
+    rimColorHigh: '#8fd0ff',
+    rimStrength: 0.3,
+    rimPower: 2.6,
+    matcapStrength: 0.18,
+  },
+  trim: {
+    rimColor: '#ffd08a',
+    rimColorHigh: '#8fd0ff',
+    rimStrength: 0.26,
+    rimPower: 3.2,
+    matcapStrength: 0.14,
+  },
+} as const;
+
+/**
  * 机台部件角色 → 表面细节。与 `ROLE_RAMP` 同键，便于一处改完。
  *
  * 注意 `role ↔ 材质` 在机柜里是 1:1，所以细节可以挂在材质上。

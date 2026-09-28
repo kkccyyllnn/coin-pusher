@@ -92,6 +92,20 @@ export type ToonMaterialParams = {
    * 默认 `1`：对既有材质零影响。
    */
   rimEmissiveFloor?: number;
+  /**
+   * 双色 rim 的**上缘**色（R2-T1-1）。下缘用 `rimColor`，两者按视空间法线的 y 混合。
+   *
+   * 默认**跟随 `rimColor`** —— 也就是「没填 = 单色 rim」，对既有材质是恒等变换。
+   * 填了两个色才出现「下暖上冷」：Arcane 的霓虹是从下往上打的，单色 rim 会抹平这件事。
+   */
+  rimColorHigh?: THREE.ColorRepresentation;
+  /**
+   * matcap-lite 强度（R2-T1-2）：拿菲涅尔当横坐标查**现有的**色带 LUT 当边缘高光。
+   *
+   * 默认 0 ⇒ 这段等于没写。用真 matcap 贴图要 +1 纹理 +1 program，而量化过的色带档
+   * 反而更符合三渲二的硬边调性。
+   */
+  matcapStrength?: number;
   /** 调试用标签，**不进程序缓存键**（进键会让每个材质编译一份程序）。 */
   name?: string;
 };
@@ -151,6 +165,13 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
   const rimStrengthUniform = { value: params.rimStrength ?? 0 };
   const rimPowerUniform = { value: params.rimPower ?? 3 };
   const rimEmissiveFloorUniform = { value: params.rimEmissiveFloor ?? 1 };
+  // R2-T1：新增的两个**默认恒等**（上缘色跟随下缘色、matcap 强度 0），
+  // 所以对既有材质零视觉变化 —— 与 rim 本身同一套纪律：GLSL 无条件注入，
+  // 生效与否完全由逐材质 uniform 表达（加 define 就是加程序变体）。
+  const rimColorHighUniform = {
+    value: new THREE.Color(params.rimColorHigh ?? params.rimColor ?? '#000000'),
+  };
+  const matcapStrengthUniform = { value: params.matcapStrength ?? 0 };
 
   // ★ 把强度**记在材质上**，供验证判据计数（`materialReport().rim`）。
   //
@@ -165,6 +186,8 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
     shader.uniforms.uRimStrength = rimStrengthUniform;
     shader.uniforms.uRimPower = rimPowerUniform;
     shader.uniforms.uRimEmissiveFloor = rimEmissiveFloorUniform;
+    shader.uniforms.uRimColorHigh = rimColorHighUniform;
+    shader.uniforms.uMatcapStrength = matcapStrengthUniform;
 
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>\n${SURFACE_DETAIL_VERTEX_VARYINGS}`)
