@@ -73,8 +73,13 @@ export const ARCANE_PALETTES: Record<ArcanePaletteKey, readonly [string, string,
  * 厚涂 = 多层半透明 Bezier 笔触；
  * 喷墨 = 一堆 RadialGradient；
  * 霓虹 = 主轮廓 + alpha 0.3 外圈重复。
+ *
+ * ★ S25（R1-M3）加第四种 `lampHousing`：侧板上的**内凹灯位**。
+ * 它是「贴图近似版」——Three 没有布尔运算，真凹陷要做围合几何（一圈细边 + 一块
+ * 背光底板合并成一个 geometry，+1 draw call）。贴图版**零 draw call、零 program**
+ * （同一份 `map` 通道），先看够不够，不够再上几何。
  */
-type PaintKind = 'marquee' | 'scoreLine' | 'hotZone';
+type PaintKind = 'marquee' | 'scoreLine' | 'hotZone' | 'lampHousing';
 
 function paintBase(ctx: CanvasRenderingContext2D, w: number, h: number, ink: string): void {
   /** 煤黑底——整张涂 ink（palette[4]），其它笔触在它上面覆盖。 */
@@ -307,6 +312,162 @@ function paintHotZoneCanvas(
     path.lineTo(w * 0.95, y + (i % 2 === 0 ? h * 0.1 : -h * 0.1));
     paintNeonEdge(ctx, path, hue, deep, 3, 9);
   }
+}
+
+/**
+ * 圆角矩形路径。
+ *
+ * 不直接用 `ctx.roundRect`：那是较新的 API，而 `cabinetTex` 判据要跑在 WebKit 上
+ * （Playwright 的 `mobile-safari` 项目）。`Path2D` 是这里所有笔触的公共形状语言，
+ * `paintNeonEdge` / `paintThickBrush` 都吃它。
+ */
+function roundRectPath(x: number, y: number, w: number, h: number, r: number): Path2D {
+  const path = new Path2D();
+  const radius = Math.min(r, w / 2, h / 2);
+  path.moveTo(x + radius, y);
+  path.lineTo(x + w - radius, y);
+  path.quadraticCurveTo(x + w, y, x + w, y + radius);
+  path.lineTo(x + w, y + h - radius);
+  path.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+  path.lineTo(x + radius, y + h);
+  path.quadraticCurveTo(x, y + h, x, y + h - radius);
+  path.lineTo(x, y + radius);
+  path.quadraticCurveTo(x, y, x + radius, y);
+  path.closePath();
+  return path;
+}
+
+/**
+ * 侧板灯饰画布（512×608，R1-M3 的「内凹灯位」贴图近似版）。
+ *
+ * ## 三层假出凹陷（Three 没有布尔运算）
+ *
+ * 1. **井壁**：整块 `deep`（调色板第 4 档）外框 —— 凹陷的暗边。
+ * 2. **内腔**：`deep → ink` 的垂直渐变，上缘受光、越深越暗 ⇒ 读作「凹进去」。
+ * 3. **灯管**：内腔中线一条 `light` 实心条，背后先铺一层 `glow` 径向光晕；
+ *    最后给内腔轮廓走 `paintNeonEdge`（高对比边缘，斜视角也读得出「这里有灯」）。
+ *
+ * ## 构图为什么铺满整张画布
+ *
+ * 侧墙的 UV 由剖面归一化而来（见 `TableBuilder.cabinetPrismMesh`），但 `ExtrudeGeometry`
+ * 的默认 UV 生成器会**自己挑轴**，「哪一条带被玩家看到」不是能稳定推出的量。
+ * 实测把灯位压在画布上半时，游玩视角看到的是下半的涂鸦底色 —— 灯位整块看不见。
+ * 所以灯位均匀铺满全高：任何可见切片上都有灯。
+ */
+function paintLampHousingCanvas(
+  ctx: CanvasRenderingContext2D,
+  palette: readonly [string, string, string, string, string],
+  key: ArcanePaletteKey,
+): void {
+  const w = ctx.canvas.width;
+  const h = ctx.canvas.height;
+  const [light, glow, hue, deep, ink] = palette;
+  const rng = makeRng(key, 'lampHousing', 4);
+
+  paintBase(ctx, w, h, ink);
+  paintSprayInk(ctx, w, h, deep, rng, 8);
+
+  /**
+   * 灯位**铺满整张画布**，不压在任何「可见带」里。
+   *
+   * 这里刻意不留「只画上半截」那种优化：端面 UV 的 v 到底对应剖面的 y 还是 z，
+   * 取决于 `ExtrudeGeometry` 走的是 `generateTopUV` 还是 `generateSideWallUV`
+   * （它按相邻顶点的 Δx/Δy 大小**自己选轴**）。实测把构图压在画布顶部 42%，
+   * 游玩视角看到的仍是画布**下半**的涂鸦 —— 也就是选错了带，灯饰整块被平均成一坨暗斑。
+   * 与其再猜一次带，不如让**任何**可见切片上都至少有一条灯管：代价是灯位从 2 个变 3 个、
+   * 每格略小，换来的是这条构图不再依赖一个我没验证过的 UV 假设。
+   */
+  const wells = 3;
+  const wellH = h * 0.15;
+  const gap = (h - wellH * wells) / (wells + 1);
+  const side = w * 0.16;
+  const wellW = w - side * 2;
+
+  // 井间涂鸦：Arcane 的街头感靠几道斜笔撑，但**不抢灯饰**——只用主色 / 深色两档，
+  // 而且画在灯位**之前**（灯管压在上面），否则灯位铺满全画布后每道笔都会夹在灯缝里。
+  for (let i = 0; i < 4; i += 1) {
+    const y = h * (0.12 + i * 0.22);
+    const tag = new Path2D();
+    tag.moveTo(w * (0.1 + rng() * 0.1), y);
+    tag.quadraticCurveTo(w * 0.5, y - h * 0.05, w * (0.62 + rng() * 0.26), y + h * 0.02);
+    paintThickBrush(ctx, tag, i % 2 === 0 ? hue : deep, ink, 4);
+  }
+
+  for (let i = 0; i < wells; i += 1) {
+    const y = gap * (i + 1) + wellH * i;
+    // ① 井壁
+    ctx.fillStyle = deep;
+    ctx.fill(roundRectPath(side, y, wellW, wellH, wellH * 0.28));
+    // ② 内腔（渐变 = 深度）
+    const inset = wellH * 0.2;
+    const cavity = roundRectPath(
+      side + inset,
+      y + inset,
+      wellW - inset * 2,
+      wellH - inset * 2,
+      wellH * 0.2,
+    );
+    const depth = ctx.createLinearGradient(0, y, 0, y + wellH);
+    depth.addColorStop(0, deep);
+    depth.addColorStop(1, ink);
+    ctx.fillStyle = depth;
+    ctx.fill(cavity);
+    // ③ 光晕 + 灯管
+    const cx = side + wellW / 2;
+    const cy = y + wellH / 2;
+    const halo = ctx.createRadialGradient(cx, cy, 0, cx, cy, wellW * 0.42);
+    halo.addColorStop(0, glow);
+    halo.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.globalAlpha = 0.75;
+    ctx.fillStyle = halo;
+    ctx.fill(cavity);
+    ctx.globalAlpha = 1;
+    // 灯管**必须画得粗**（0.3 倍井高，不是「真实灯管」的比例）：侧墙是斜着看的，
+    // 一个 minification 层级就把细线整个平均掉了 —— 实测细管版本在游玩视角只剩
+    // 一坨暗斑，「灯饰」这件事完全读不出来。粗一点 + 高 alpha 才活得过 mipmap。
+    const tubeH = wellH * 0.3;
+    ctx.fillStyle = light;
+    ctx.fill(
+      roundRectPath(
+        side + inset * 2,
+        cy - tubeH / 2,
+        wellW - inset * 4,
+        tubeH,
+        tubeH / 2,
+      ),
+    );
+    // ④ 霓虹描边：内腔轮廓
+    paintNeonEdge(ctx, cavity, light, glow, 3, 12);
+  }
+}
+
+/**
+ * 侧板灯饰贴图（512×608）。
+ *
+ * 高宽比按**侧墙内表面的实际跨度**挑：z 跨度 ≈ 1.60 米、y 跨度 ≈ 1.90 米 ⇒ 0.84:1。
+ * 取 512×608（0.842）而不是 512×512，否则三个灯位会被垂直压扁 16%。
+ * ⚠️ 这条比例只在 `cabinetPrismMesh` 把剖面 UV 归一化到 0..1 之后成立。
+ *
+ * filter 与招牌同档（`Linear` + mipmap）：侧板是斜着看的大面，方块感来自得分线那种
+ * 极窄条，不来自这里。
+ */
+export function createArcaneLampHousingTexture(
+  paletteKey: ArcanePaletteKey,
+  width = 512,
+  height = 608,
+): THREE.CanvasTexture {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('无法创建机柜灯饰贴图上下文。');
+  paintLampHousingCanvas(ctx, ARCANE_PALETTES[paletteKey], paletteKey);
+  const texture = makeTexture(canvas, THREE.LinearFilter, THREE.LinearMipmapLinearFilter);
+  // 侧墙是**斜着看**的大面：一个纹素覆盖的屏幕面积在横向被压得很扁，各向异性过滤
+  // 是同时保住两个方向采样密度的唯一手段（three 会按 `getMaxAnisotropy()` 夹住，
+  // 写高了不会坏）。招牌不需要它——檐板基本正对相机。
+  texture.anisotropy = 8;
+  return texture;
 }
 
 /**

@@ -294,6 +294,22 @@ interface ThreeCabinetPartReport {
   max: [number, number, number];
   /** 局部 +z 在世界里的单位方向。 */
   normal: [number, number, number];
+  /**
+   * 该件材质实例名 / 其 `map` 的 uuid（无 map 为 `null`）。
+   *
+   * 「贴图到底挂在哪一件上」只有这一条观测通道：`cabinetMapCount()` 是全场总量，
+   * 答不出「侧板挂了、背板没挂」——而后者正是 R1-M3 拆 `panelArt` 的全部意义。
+   */
+  material: string | null;
+  map: string | null;
+  /**
+   * `emissiveMap` 的 uuid（null = 没挂）。
+   *
+   * 与 `map` 分开报，是因为「贴图挂上了」和「灯亮着」是两件事：侧墙走深色 `panel`
+   * 色带，`MeshToonMaterial` 又是 `color × map`，只挂 `map` 的灯饰在游玩视角读作
+   * 暗斑。判据要能分辨「只挂了 map」和「map + emissiveMap」。
+   */
+  glow: string | null;
 }
 
 /**

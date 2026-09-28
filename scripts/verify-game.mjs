@@ -4336,6 +4336,8 @@ async function runCabinetTex(page) {
     const marquee = ct.createArcaneMarqueeTexture('jinxMagenta');
     const scoreLine = ct.createArcaneScoreLineTexture('viArcane');
     const hotZone = ct.createArcaneHotZoneTexture('firelight');
+    // S25 / R1-M3：侧板内凹灯饰（第四种构图）。
+    const lampHousing = ct.createArcaneLampHousingTexture('cobaltArcane');
     // 把 texture 真接打包成可序列化：uuid + 中间/角落的像素 RGB。
     // 跨 evaluate 边界 `CanvasTexture` 不能 structured-clone，但 `texture.image.canvas`
     // 是真正的 `<canvas>` DOM，可以跨边界——只是序列化后会变 canvas element 不是像素。
@@ -4352,17 +4354,30 @@ async function runCabinetTex(page) {
       marquee: { uuid: marquee.uuid, ...samples(marquee) },
       scoreLine: { uuid: scoreLine.uuid, ...samples(scoreLine) },
       hotZone: { uuid: hotZone.uuid, ...samples(hotZone) },
+      lampHousing: { uuid: lampHousing.uuid, ...samples(lampHousing) },
+      // 灯饰画布的高宽比是照**侧墙剖面跨度**挑的（≈0.84:1）。它一旦和那个比例脱钩，
+      // 灯位就会被垂直拉扁 / 压长，而画面照样「有图」——所以在这里钉住尺寸本身。
+      lampSize: [lampHousing.image.width, lampHousing.image.height],
     };
   });
 
-  // 三张图必须不同实例——同款判据（`spray` mode）已经踩过：用同一份贴图
+  // 四张图必须不同实例——同款判据（`spray` mode）已经踩过：用同一份贴图
   // 不能跨切肤，否则 dispose 会把兄弟贴图也释放掉。
+  const texUuids = [
+    cabinetTex.marquee.uuid,
+    cabinetTex.scoreLine.uuid,
+    cabinetTex.hotZone.uuid,
+    cabinetTex.lampHousing.uuid,
+  ];
   check(
-    '三张 CanvasTexture 必须是不同实例（共享会让 dispose 误杀兄弟）',
-    cabinetTex.marquee !== cabinetTex.scoreLine &&
-      cabinetTex.marquee !== cabinetTex.hotZone &&
-      cabinetTex.scoreLine !== cabinetTex.hotZone,
-    `marquee=${cabinetTex.marquee} scoreLine=${cabinetTex.scoreLine} hotZone=${cabinetTex.hotZone}`,
+    '四张 CanvasTexture 必须是不同实例（共享会让 dispose 误杀兄弟）',
+    new Set(texUuids).size === 4,
+    texUuids.join(' '),
+  );
+  check(
+    '灯饰画布比例 ≈ 侧墙剖面跨度（0.84:1，偏离就会把灯位拉扁）',
+    Math.abs(cabinetTex.lampSize[0] / cabinetTex.lampSize[1] - 0.84) < 0.02,
+    `lamp=${cabinetTex.lampSize.join('×')} → ${(cabinetTex.lampSize[0] / cabinetTex.lampSize[1]).toFixed(3)}`,
   );
 
   // 调色板槽数与各档颜色。`ARCANE_PALETTES[key][0..4]` 与 `MODEL_TONES.length === 5` 同档。
@@ -4419,10 +4434,54 @@ async function runCabinetTex(page) {
     let n = 0;
     return window.__THREE_GAME_TEST_HOOKS__?.cabinetMapCount?.() ?? -1;
   });
+  // 带 map 的材质实例数。⚠️ 这个计数是**全场**的（币面贴图也算，实测 16），
+  // 所以它只是一道「贴图通道整体还活着」的粗闸；「灯饰挂在哪一件上」由下面那条
+  // 按 `part` 逐件比对的判据负责——那条才是 `panelArt` 拆分的守门人。
   check(
-    '机柜带 map 通道的材质数 ≥ 3（scoreLine + hotZone + trim）',
-    mapCount >= 3,
+    '机柜带 map 通道的材质数 ≥ 4（scoreLine + hotZone + trim + panelArt 的下界）',
+    mapCount >= 4,
     `cabinetMapCount=${mapCount}`,
+  );
+
+  // 贴图**落在哪一件上**（S25 / R1-M3）。上面那条总量判据答不出这件事，
+  // 而 `panelArt` 这份材质拆分的**全部意义**就是「侧板挂灯饰、背板不挂」：
+  // 哪天有人把它并回 `panel`，背板会被一起刷成灯位，而且零报错。
+  const mapsByPart = await page.evaluate(() => {
+    const maps = {};
+    const glows = {};
+    for (const entry of window.__THREE_GAME_TEST_HOOKS__?.cabinetReport?.() ?? []) {
+      maps[entry.part] = entry.map;
+      glows[entry.part] = entry.glow;
+    }
+    return {
+      tallL: maps['sideWall.tall.L'] ?? null,
+      tallR: maps['sideWall.tall.R'] ?? null,
+      back: maps.backPanel ?? null,
+      valance: maps.hoodValance ?? null,
+      glowL: glows['sideWall.tall.L'] ?? null,
+      // 只有侧墙该发光：檐板（招牌）走的是**亮**色带，`color × map` 本来就够亮，
+      // 给它加 emissive 会把招牌刷成过曝白 —— 所以「glow 只在侧墙」也是判据。
+      glowValance: glows.hoodValance ?? null,
+    };
+  });
+  check(
+    '灯饰贴图只落在两侧墙高段（左右同图、背板不挂、檐板仍是招牌）',
+    mapsByPart.tallL !== null &&
+      mapsByPart.tallR === mapsByPart.tallL &&
+      mapsByPart.back === null &&
+      mapsByPart.valance !== null &&
+      mapsByPart.valance !== mapsByPart.tallL,
+    JSON.stringify(mapsByPart),
+  );
+  // ★ 「挂了图」≠「灯亮着」。侧墙是深色 `panel` 色带，而 toon 材质是 `color × map`：
+  //   只挂 `map` 时贴图里的近白灯管会被乘成暗斑（实测就是这样，画布上明明有灯）。
+  //   亮条要靠 `emissiveMap` 走自发光的加法通道 —— 这条判据守的就是那一步有没有漏。
+  check(
+    '灯饰同时挂了 emissiveMap（深色带上只有自发光通道能变亮），且不外溢到招牌',
+    mapsByPart.glowL !== null &&
+      mapsByPart.glowL === mapsByPart.tallL &&
+      mapsByPart.glowValance === null,
+    `glow=${mapsByPart.glowL} sameAsMap=${mapsByPart.glowL === mapsByPart.tallL} valanceGlow=${mapsByPart.glowValance}`,
   );
 
   // 三张贴图实测在 page 内，cache 同 UUID ⇒ 切肤时会撞 dispose 链；

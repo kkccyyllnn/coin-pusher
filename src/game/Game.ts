@@ -24,6 +24,7 @@ import { rampLutCount } from '../render/RampLut';
 import { makeToonMaterial, isLitMaterial, rimStrengthOf, type LitMaterial } from '../render/ToonMaterial';
 import {
   createArcaneHotZoneTexture,
+  createArcaneLampHousingTexture,
   createArcaneMarqueeTexture,
   createArcaneScoreLineTexture,
   type ArcanePaletteKey,
@@ -1860,7 +1861,7 @@ export class Game {
    * 所以逐件处理会对同一份材质反复 `create*` 再 `dispose` —— 白造两张 1024×512 的
    * `CanvasTexture`。`touched` 让每份材质只处理一次。
    *
-   * 老贴图必须 `dispose()`，否则 GC 收不掉，泄漏的是 GPU 资源——三张 CanvasTexture
+   * 老贴图必须 `dispose()`，否则 GC 收不掉，泄漏的是 GPU 资源——四张 CanvasTexture
    * 全坏掉也会有「gpu memory leak」的红色（headless Chrome 会报）。
    */
   private applyCabinetMapTextures(cabinetSkin: CabinetSkin): void {
@@ -1877,11 +1878,25 @@ export class Game {
       for (const entry of list) {
         if (!isLitMaterial(entry)) continue;
         if (touched.has(entry)) continue;
-        const nextMap = pickCabinetMap(part, palette);
-        if (!nextMap) continue;
+        const next = pickCabinetMap(part, palette);
+        if (!next) continue;
         touched.add(entry);
         const previous = entry.map;
-        entry.map = nextMap;
+        entry.map = next.map;
+        // 灯饰的亮条走 `emissiveMap` = **同一张**贴图：`emissive` 给纯白，于是
+        // 「按贴图自己的颜色发光」（亮条亮、暗腔仍暗，见 `ToonMaterial.emissiveMap` 注释）。
+        // 不新增纹理单元（同 0 通道同 UV），也不新增 draw call。
+        //
+        // ★ 只在 `glow` 时动 emissive 三件套，**不要**给不发光的那几件写回黑色：
+        //   得分线 / 热区的材质在建场时带了 `emissive: COLORS.scoreLine`（`TableBuilder`），
+        //   这里清零 = 换肤把它们的自发光照一起关掉，又是一条静默失效。
+        // ⚠️ emissiveMap 不单独 dispose：它和 `map` 永远是同一个实例，再 dispose 一次
+        //    会让下次换肤拿到已释放的纹理。
+        if (next.glow) {
+          entry.emissiveMap = next.map;
+          entry.emissive.set('#ffffff');
+          entry.emissiveIntensity = 0.85;
+        }
         entry.needsUpdate = true;
         previous?.dispose();
       }
@@ -2554,6 +2569,18 @@ export class Game {
            * 半径那一条要靠 `?model` 的截图人眼核。
            */
           vertices: number;
+          /**
+           * 这件挂的**材质实例名**与 `map` 的 uuid（S25 / R1-M3 新增，无 map 时为 null）。
+           *
+           * 为什么判据需要它：`cabinetMapCount()` 只数「全场带 map 的材质有几份」，
+           * 那是个**总量**——币面贴图也算进去（实测 16），所以「侧板到底挂没挂上图」
+           * 「侧板和背板是不是被刷成同一张」这类问题它一个都答不了。
+           * 而这两件事恰恰是 `panelArt` 那份材质拆分的**全部意义**：
+           * 拆坏了（并回 `panel`）就是背板也被画满灯位，零报错。
+           */
+          material: string | null;
+          map: string | null;
+          glow: string | null;
         }> = [];
         const vertex = new THREE.Vector3();
         this.tableGroup?.traverse((child) => {
@@ -2591,6 +2618,14 @@ export class Game {
             profile,
             bevelable: mesh.userData.bevelable === true,
             vertices: mesh.geometry?.getAttribute?.('position')?.count ?? 0,
+            material: (mesh.material as THREE.Material | undefined)?.name ?? null,
+            map:
+              ((mesh.material as { map?: THREE.Texture | null } | undefined)?.map?.uuid ?? null),
+            // 「贴图挂上了」≠「灯真的亮」：`emissiveMap` 才是让深色色带上的亮条活过来的
+            // 那一环，漏了它画面照样「有图」但只剩暗斑 —— 本仓库最恨的静默失效。
+            glow:
+              (mesh.material as { emissiveMap?: THREE.Texture | null } | undefined)?.emissiveMap
+                ?.uuid ?? null,
           });
         });
         return out;
@@ -3633,6 +3668,9 @@ function round3(value: number): number {
  * - `hotZone` → `createArcaneHotZoneTexture`
  * - `hoodRoof` / `hoodValance` → `createArcaneMarqueeTexture`（两件共用一份
  *   `trimMaterial`，所以这里只会真的建一张 —— 见 `applyCabinetMapTextures` 的 `touched`）
+ * - `sideWall.tall.L` / `.R` → `createArcaneLampHousingTexture`（S25 / R1-M3 的内凹灯饰。
+ *   两件共用 `panelArt` 那一份材质 ⇒ 也只真的建一张；**侧板高段能单独挂图**靠的就是
+ *   那份从 `panel` 拆出来的独立实例，见 `TableBuilder.cabinetMaterials()`）
  *
  * ★ S21：招牌 `marquee` 这一件被删除了，但**这条通路一个字都不用改** ——
  * `hoodValance`（檐板）本来就在上面那一支里，删掉 `marquee` 之后它自然成为
@@ -3649,12 +3687,27 @@ function round3(value: number): number {
  * 一个字段干两件事，就必然在某个维度上少一个词。补上 `part` 之后，
  * `role` 回到纯粹的「色带」语义。见 `game/cabinetShape.ts` 的 `CabinetPart`。
  */
-function pickCabinetMap(part: string | undefined, palette: ArcanePaletteKey): THREE.Texture | null {
-  if (part === 'scoreLine') return createArcaneScoreLineTexture(palette);
-  if (part === 'hotZone') return createArcaneHotZoneTexture(palette);
+function pickCabinetMap(
+  part: string | undefined,
+  palette: ArcanePaletteKey,
+): { map: THREE.Texture; glow: boolean } | null {
+  // `glow` = 这张贴图还要走 `emissiveMap`。判据放在这里（而不是 `applyCabinetMapTextures`
+  // 里再 `if (part === …)` 一次），是为了「哪件挂哪张图 / 要不要自发光」始终只有一个出处。
+  if (part === 'scoreLine') return { map: createArcaneScoreLineTexture(palette), glow: false };
+  if (part === 'hotZone') return { map: createArcaneHotZoneTexture(palette), glow: false };
   // 檐板＝招牌画布（S21）；顶板与它共用 `trimMaterial`，所以实际只会建一张贴图。
   if (part === 'hoodRoof' || part === 'hoodValance') {
-    return createArcaneMarqueeTexture(palette);
+    return { map: createArcaneMarqueeTexture(palette), glow: false };
+  }
+  // 侧板高段＝内凹灯饰（S25 / R1-M3 的贴图近似版）。两件共用 `panelArt` 一份材质，
+  // 走 `touched` 去重 ⇒ 只建一张。左右两件**必须**给同一个 key：它们是同一份材质，
+  // 若这里按 `side` 分叉就会变成「后建的那张覆盖前一张」的静默抖动。
+  //
+  // ★ 只有这一件要 `glow: true`：侧墙走 `panel` 色带（深色），而 `MeshToonMaterial` 是
+  //   `color × map` —— 深色带会把贴图里任何近白像素一起压暗，实测灯管在游玩视角只剩
+  //   一坨暗斑。贴图不能靠 `map` 变亮（乘法不会放大），所以亮条改走 `emissiveMap`。
+  if (part === 'sideWall.tall.L' || part === 'sideWall.tall.R') {
+    return { map: createArcaneLampHousingTexture(palette), glow: true };
   }
   return null;
 }

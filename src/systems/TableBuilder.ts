@@ -841,18 +841,38 @@ function buildFrontBaffle(): THREE.Group {
  *
  * 所以材质是单例，重建只 dispose **几何**（见 `disposeCabinetShell`）。
  */
-let cabinetMaterialCache: { panel: LitMaterial; rail: LitMaterial; trim: LitMaterial } | null = null;
+let cabinetMaterialCache: {
+  panel: LitMaterial;
+  panelArt: LitMaterial;
+  rail: LitMaterial;
+  trim: LitMaterial;
+} | null = null;
 
-function cabinetMaterials(): { panel: LitMaterial; rail: LitMaterial; trim: LitMaterial } {
+function cabinetMaterials(): {
+  panel: LitMaterial;
+  panelArt: LitMaterial;
+  rail: LitMaterial;
+  trim: LitMaterial;
+} {
   if (!cabinetMaterialCache) {
+    const panelParams = {
+      color: COLORS.cabinet,
+      ramp: ROLE_RAMP.panel,
+      // V3：背板 / 侧板的接缝 + 铆钉（格边长 0.5 米）。
+      ...ROLE_DETAIL.panel,
+    };
     cabinetMaterialCache = {
-      panel: makeToonMaterial({
-        name: 'panel',
-        color: COLORS.cabinet,
-        ramp: ROLE_RAMP.panel,
-        // V3：背板 / 侧板的接缝 + 铆钉（格边长 0.5 米）。
-        ...ROLE_DETAIL.panel,
-      }),
+      panel: makeToonMaterial({ name: 'panel', ...panelParams }),
+      // ★ 与 `panel` **同色带、同纹样、不同实例**，为的是能挂一张不同的 `map`。
+      //
+      // S18 的教训是反方向生效的：当时「招牌 / 顶沿 / 前立面压条」共用一份 `trim`
+      // 材质，于是 `pickCabinetMap` 只能给三件同一个构图（`role` 撞名）。这里把
+      // **要挂灯饰贴图的侧板高段**单独拆一份实例：
+      //   - `role` 仍是 `panel` ⇒ 换肤照旧走同一条色带，两件永远同色；
+      //   - defines 与 `panel` 一字不差 ⇒ **不涨 program**（`perf` 判据不让步）；
+      //   - 只是多一个材质对象 ⇒ **不涨 draw call**（件数没变）。
+      // 背板留在 `panel` 上：它的可见部分只有币床上方那一条，贴图会被金币堆糊满。
+      panelArt: makeToonMaterial({ name: 'panelArt', ...panelParams }),
       // 侧墙**低段**（币床两侧的围挡）走 `rail` 色带 —— 它就是从原来那条看得见的
       // 护栏长上来的：护栏网格早已不存在（S17 起两侧围挡就是侧墙低段），色带还在用。
       rail: makeToonMaterial({
@@ -882,15 +902,18 @@ function cabinetMaterials(): { panel: LitMaterial; rail: LitMaterial; trim: LitM
  */
 export function buildCabinetShell(): THREE.Group {
   const shell = new THREE.Group();
-  const { panel, rail, trim } = cabinetMaterials();
+  const { panel, panelArt, rail, trim } = cabinetMaterials();
 
   // ── 7 件外壳 ──
   //
   // 顺序即「从里往外」：两侧墙（高段 + 低段）→ 顶板 + 檐板 → 背板。
   // 每件的中心与尺寸都在对应的 `build*` 里直接由 `cabinetShape()` 的字段算出，
   // 这里只负责挂上去 —— 写在这儿的任何数字都会变成「第二份真源」。
-  shell.add(buildSideWall(-1, { panel, rail }));
-  shell.add(buildSideWall(1, { panel, rail }));
+  //
+  // ★ 高段走 `panelArt`（同一份色带、独立材质实例），它要挂 R1-M3 的内凹灯饰贴图；
+  //   低段与背板仍走 `panel` / `rail`。见 `cabinetMaterials()` 里 `panelArt` 的注释。
+  shell.add(buildSideWall(-1, { tall: panelArt, low: rail }));
+  shell.add(buildSideWall(1, { tall: panelArt, low: rail }));
   shell.add(buildHood(trim));
   shell.add(buildBackPanel(panel));
 
@@ -958,6 +981,46 @@ function cabinetBoxMesh(
 }
 
 /**
+ * 把剖面挤出件的 UV 从「米」归一到 0..1。
+ *
+ * `THREE.ExtrudeGeometry` 的默认 UV 生成器给**端面**的是 shape 自己的 `(x, y)`，
+ * 也就是世界的 `(z, y)`、单位是米（±1.4 这种值），不是 0..1。直接挂贴图 = 一张图
+ * 在墙上按米平铺、原点还落在中间。这里按**剖面自身的范围**线性归一，让一整个端面
+ * 恰好铺满一张图 —— 灯饰构图才能按画布坐标设计（见 `render/cabinetTexture.ts` 的
+ * `createArcaneLampHousingTexture`，它的高宽比就是照这里的跨度挑的）。
+ *
+ * 范围从**入参剖面**取，不从 `geometry.boundingBox` 取：端面顶点的 uv 就是剖面坐标，
+ * 两者必须同源；而包围盒还额外含着挤出方向那 6 厘米，是另一个量。
+ *
+ * ⚠️ 侧壁（挤出那一圈薄边）的 uv 由另一条公式给出、会落到范围外 ⇒ 夹到 [0,1]。
+ * 那几面只有 6 厘米宽，采样边缘像素比按 `RepeatWrapping` 平铺干净。
+ */
+function normalizeProfileUv(
+  geometry: THREE.BufferGeometry,
+  profile: readonly (readonly [number, number])[],
+): void {
+  const uv = geometry.getAttribute('uv');
+  let minZ = Infinity;
+  let maxZ = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const [z, y] of profile) {
+    minZ = Math.min(minZ, z);
+    maxZ = Math.max(maxZ, z);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  }
+  const spanZ = Math.max(1e-6, maxZ - minZ);
+  const spanY = Math.max(1e-6, maxY - minY);
+  for (let i = 0; i < uv.count; i += 1) {
+    const u = Math.min(1, Math.max(0, (uv.getX(i) - minZ) / spanZ));
+    const v = Math.min(1, Math.max(0, (uv.getY(i) - minY) / spanY));
+    uv.setXY(i, u, v);
+  }
+  uv.needsUpdate = true;
+}
+
+/**
  * 由 **(z, y) 平面的闭合轮廓**沿 x 挤出一块机柜件，并把**身份**挂上。
  *
  * ## 为什么需要它（S21）
@@ -997,6 +1060,7 @@ function cabinetPrismMesh(
     bevelEnabled: false,
     curveSegments: 1,
   });
+  normalizeProfileUv(geometry, profile);
   geometry.rotateY(-Math.PI / 2);
   // 挤出段落在 `x ∈ [−thickness, 0]`：先把它**居中**（±thickness/2），再由网格位置
   // 摆到那一侧。这样左右两件共用同一份几何、只是 x 位置取反 ——
@@ -1052,7 +1116,12 @@ type WallCorner = {
 
 function buildSideWall(
   side: -1 | 1,
-  materials: { panel: LitMaterial; rail: LitMaterial },
+  /**
+   * 两段各自的材质。参数名按**件**而不是按**色带**取（`tall` / `low`）：
+   * 高段的色带是 `panel`，但材质实例是 `panelArt`（要单独挂灯饰贴图），
+   * 用 `panel` 当参数名会把「同色带 ≠ 同材质」这件事藏起来。
+   */
+  materials: { tall: LitMaterial; low: LitMaterial },
 ): THREE.Group {
   const { wall, bevel } = cabinetShape();
   const group = new THREE.Group();
@@ -1076,7 +1145,7 @@ function buildSideWall(
       ]),
       'rail',
       `sideWall.low${suffix}` as CabinetPart,
-      materials.rail,
+      materials.low,
       side,
       true,
     ),
@@ -1096,7 +1165,7 @@ function buildSideWall(
       ]),
       'panel',
       `sideWall.tall${suffix}` as CabinetPart,
-      materials.panel,
+      materials.tall,
       side,
     ),
   );
