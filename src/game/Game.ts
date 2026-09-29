@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { InputController, type LaneInput, type LaneMode } from '../core/InputController';
 import { Loop } from '../core/Loop';
 import { createRenderer, resizeRenderer } from '../core/Renderer';
+import { surfaceDetailEnabled } from './artDirection';
 import {
   PIXEL_SCALE_DEFAULTS,
   applyPixelated,
@@ -22,7 +23,13 @@ import {
 } from '../render/cameraRig';
 import { marqueeScreen } from '../render/marqueeScreen';
 import { rampLutCount } from '../render/RampLut';
-import { makeToonMaterial, isLitMaterial, rimStrengthOf, type LitMaterial } from '../render/ToonMaterial';
+import {
+  makeToonMaterial,
+  isLitMaterial,
+  rimBreakOf,
+  rimStrengthOf,
+  type LitMaterial,
+} from '../render/ToonMaterial';
 import {
   createArcaneHotZoneTexture,
   createArcaneLampHousingTexture,
@@ -635,7 +642,9 @@ export class Game {
     this.publishHud();
     // 招牌屏的推进放在**循环**里而不是 `publishHud()`：后者还有六个来自测试钩子
     // 与重置流程的调用点，那些地方没有 delta，也不该被当成过了帧。
-    marqueeScreen().tick(delta, this.config.name);
+    // 常态行留空（用户批注：不要「无尽 · xixi 大王大赏」这行字）。
+    // 屏上只在该有内容时出字：账本一行 + 开奖/机关字幕，平时不拿机器名去占第二行。
+    marqueeScreen().tick(delta, '');
     this.publishDiagnostics();
   }
 
@@ -863,6 +872,11 @@ export class Game {
     // 所以「哪几个材质真的有边缘光」这件事**完全由这个数表达**。它是 0 或 3 都说明
     // 参数传错了，而画面上的表现只是「宝石看起来平了一点」——截图判不出来。
     let rim = 0;
+    // G0-b 断线的两个读数：开了几个、其中几个是**空转**。
+    // 空转 = 传了 `rimBreak` 但这件没有边缘光 —— 掩码乘在 0 上，零视觉变化，
+    // 而面板/判据上都显示「断线开了」。这就是「以为开了其实没开」，只能数出来。
+    let rimBreak = 0;
+    let rimBreakIdle = 0;
     const seen = new Set<THREE.Material>();
     this.scene.traverse((child) => {
       if (!(child instanceof THREE.Mesh)) return;
@@ -875,15 +889,22 @@ export class Game {
           const kind = String(material.defines?.SD_DETAIL_KIND ?? '?');
           detailKinds[kind] = (detailKinds[kind] ?? 0) + 1;
           if (rimStrengthOf(material) > 0) rim += 1;
+          if (rimBreakOf(material) > 0) {
+            rimBreak += 1;
+            if (rimStrengthOf(material) === 0) rimBreakIdle += 1;
+          }
         } else if (material instanceof THREE.MeshStandardMaterial) counts.standard += 1;
         else if (material instanceof THREE.MeshBasicMaterial) counts.basic += 1;
         else counts.other += 1;
       }
     });
-    const flattened: Record<string, number> = { ...counts, ...detailKinds, rim };
+    const flattened: Record<string, number> = { ...counts, ...detailKinds, rim, rimBreak, rimBreakIdle };
     flattened.total = seen.size;
     flattened.ramps = rampLutCount();
     flattened.programs = this.renderer.info.programs?.length ?? 0;
+    // 肌理总开关的读数（1 = on）。判据靠它决定「该不该有纹样」——
+    // harness 里再抄一个 `false` 就是第二份真源，翻开关的人不会记得改，判据会静默反向。
+    flattened.detailEnabled = surfaceDetailEnabled() ? 1 : 0;
     return flattened;
   }
 
@@ -3882,12 +3903,28 @@ function round3(value: number): number {
  * 一个字段干两件事，就必然在某个维度上少一个词。补上 `part` 之后，
  * `role` 回到纯粹的「色带」语义。见 `game/cabinetShape.ts` 的 `CabinetPart`。
  */
+/**
+ * 柜身烘焙贴图总开关（用户批注：柜身只要纯色）。
+ *
+ * 关的是**柜身四件**：檐板 `hoodValance`、顶板 `hoodRoof`、背板 `backPanel`、
+ * 侧板灯饰 `sideWall.tall.L/R` —— 只留色带 `color`，不再挂 `map` / `emissiveMap`。
+ * 台面标记（得分线 / 热区）、筹码币面、老虎机滚筒与招牌 LED 屏都不在此列，不受影响。
+ * 留成常量而不是删掉那几行：那些构图是 R1/R2 做出来的，要对比时改一个词即可。
+ */
+const CABINET_BODY_MAPS = false;
+
 function pickCabinetMap(
   part: string | undefined,
   palette: ArcanePaletteKey,
 ): { map: THREE.Texture; glow: boolean } | null {
   // `glow` = 这张贴图还要走 `emissiveMap`。判据放在这里（而不是 `applyCabinetMapTextures`
   // 里再 `if (part === …)` 一次），是为了「哪件挂哪张图 / 要不要自发光」始终只有一个出处。
+  // 用户批注：机柜（含台面标记）一律纯色 ⇒ 这里直接不给任何烘焙贴图。
+  // 下面的分支保留但**当前全部不可达**，为的是「想回看对比时改一个词」；
+  // 恢复时注意 `glow: true` 那几件（顶板 / 侧板灯饰）还要连 `emissive` 三件套一起回来。
+  // ⚠️ 得分线与热区高亮条也在这条路上被关掉 = **玩法提示消失**（热区是「该往哪推」的信号）。
+  //    若只要柜身平、台面标记留着，把下面第一条分支挪回 `scoreLine` / `hotZone` 之后即可。
+  if (!CABINET_BODY_MAPS) return null;
   if (part === 'scoreLine') return { map: createArcaneScoreLineTexture(palette), glow: false };
   if (part === 'hotZone') return { map: createArcaneHotZoneTexture(palette), glow: false };
   // 檐板＝招牌画布（S21）。顶板 R2-T1-5 起走自己那份构图。

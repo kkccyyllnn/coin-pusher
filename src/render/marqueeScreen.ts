@@ -26,11 +26,9 @@ import * as THREE from 'three';
  * 自发光是必须的：三渲二的 `color × map` 里，暗底色带永远乘不出亮像素。
  */
 
-/** LED 点阵的物理分辨率（256×64 都是 2 的幂 ⇒ mipmap 与 RepeatWrapping 都合法）。 */
+/** LED 面板的物理分辨率（256×64 都是 2 的幂 ⇒ mipmap 与 RepeatWrapping 都合法）。 */
 const W = 256;
 const H = 64;
-/** 一个 LED 像素占 4×4 texel ⇒ 点阵 64×16 颗。 */
-const CELL = 4;
 /** 重画节流：8 fps 封顶。 */
 const MIN_INTERVAL = 0.125;
 /** 滚动速度（`texture.offset.x` 单位/秒）。 */
@@ -40,11 +38,10 @@ const SUBTITLE_SECONDS = 6;
 
 const FONT = 'bold 20px "Courier New", monospace';
 const LED_OFF = '#05090a';
-const LED_SEAM = 'rgba(0, 0, 0, 0.85)';
+/** 扫描线：只压暗横行，**不画纵缝**（纵横都压就是网格）。 */
+const SCANLINE = 'rgba(0, 0, 0, 0.35)';
 const BRASS = '#ffd88a';
 const DIM = '#7f8a76';
-/** 压圈色 = `--brass-deep`。屏面是黑的，不给边框就会被读成招牌上的一块洞。 */
-const BEZEL = '#a9762c';
 
 export type MarqueeLedger = { wallet: number; earned: number };
 
@@ -145,27 +142,28 @@ export class MarqueeScreen {
     ctx.fillStyle = LED_OFF;
     ctx.fillRect(0, 0, W, H);
     ctx.textBaseline = 'middle';
+    // 屏现在铺满檐板 ⇒ 没有第二行时把唯一一行**垂直居中**，
+    // 否则上半屏有字、下半屏一片空黑，看着像坏了一半。
     ctx.fillStyle = BRASS;
-    ctx.fillText(top, 8, 18);
-    ctx.fillStyle = DIM;
-    ctx.fillText(bottom, 8, 44);
-    // 边框：没有它，这块黑面在彩绘招牌上读成一个**洞**而不是一个**器件**。
-    // 描在纹理里而不是加几何 —— 一像素的铜色内沿就足以让眼睛把它当成金属压圈。
-    ctx.strokeStyle = BEZEL;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(1, 1, W - 2, H - 2);
-    this.paintSeams();
+    ctx.fillText(top, 8, bottom ? 18 : H / 2);
+    if (bottom) {
+      ctx.fillStyle = DIM;
+      ctx.fillText(bottom, 8, 44);
+    }
+    // 不再画压圈边框：屏已经铺满檐板的平坦区，檐板自己的倒角就是它的框。
+    // （原先那条 2px 实线还被点阵缝隙横穿、切成了一段段的「虚线框」——
+    //  缝隙去掉后它顶多变成实线，而实线也不是想要的。）
+    this.paintScanlines();
     this.painted = [top, bottom];
     this.dirty = false;
     this.texture.needsUpdate = true;
   }
 
-  /** 点阵缝隙：每颗 LED 之间压一道暗线，把「文字」变成「灯点」。 */
-  private paintSeams(): void {
+  /** 扫描线：每隔一行压暗一道横纹，做出「发光面板」的条纹；**不画纵缝**（那就是网格）。 */
+  private paintScanlines(): void {
     const ctx = this.ctx;
-    ctx.fillStyle = LED_SEAM;
-    for (let x = CELL - 1; x < W; x += CELL) ctx.fillRect(x, 0, 1, H);
-    for (let y = CELL - 1; y < H; y += CELL) ctx.fillRect(0, y, W, 1);
+    ctx.fillStyle = SCANLINE;
+    for (let y = 2; y < H; y += 4) ctx.fillRect(0, y, W, 1);
   }
 }
 

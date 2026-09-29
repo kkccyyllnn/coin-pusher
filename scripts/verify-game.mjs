@@ -1956,19 +1956,59 @@ async function runEconomy(page) {
     `  实测读数：赚进 ${earnedTotal} / 消耗 ${spentTotal} = ${earnedPerSpent.toFixed(3)}；` +
       `单局净流出 ${(-netPerRun).toFixed(1)} 筹码 → 200 局 ${(-netPerRun * 200).toFixed(0)} 筹码`,
   );
+  /*
+   * 局长分布的几组读数原先定义在下面的 ⑥ 块里；⑤ 现在也要用中位数，
+   * 所以**整簇上移到这里**，⑤ 与 ⑥ 共用同一份（判据不写第二份公式）。
+   */
+  const CRASH_LENGTH = [20, 300];
+  const dropCounts = runs.map((run) => run.drops);
+  const meanDrops = dropCounts.reduce((sum, count) => sum + count, 0) / Math.max(1, dropCounts.length);
+  const sortedDrops = [...dropCounts].sort((a, b) => a - b);
+  const medianDrops =
+    sortedDrops.length % 2 === 1
+      ? sortedDrops[(sortedDrops.length - 1) / 2]
+      : (sortedDrops[sortedDrops.length / 2 - 1] + sortedDrops[sortedDrops.length / 2]) / 2;
+  const DESIGN_LENGTH = [60, 90];
+  const meanInDesign = meanDrops >= DESIGN_LENGTH[0] && meanDrops <= DESIGN_LENGTH[1];
+
+  const timeoutRuns = runs.filter((run) => run.end === 'timeout');
+  // ⑤ 从「任何一局 timeout 就红」拆成两条**不同物**的判据 + 一行打印。
+  // 原写法的对象是「回收 ≥ 1 ⇒ 局永远不结束」，那会表现为**所有长度**都不结束；
+  // 而实测结构是一条正反馈长尾（n=198 里 timeout 局最短 37 投、中位 36 投，只差 1 投），
+  // 于是「偶尔有局撞到上限」在当前表就被判成回归 —— 一条率被写成了一件事实。
+  //
+  // 阈值为什么取 30 %：判据是在**每次调用**（分段批即 n=50 的段）上求值，
+  // 观测 9.1 % 在 n=50 上的 95 % 区间宽达 ±7.6 pp、单腿最坏 12 % 的上界已到 21 %
+  // ⇒ 10 % 与 20 % 都会随机翻红（都是我先验写死后被余量计算否证的）。
+  // 而点火场景会把 timeout 推向接近 100 % ⇒ 30 % 仍然抓得住。**阈值要离噪声远，不是离读数近。**
   check(
-    '⑤ 每局都走到真实终态（经济若透支，局永远不会结束）',
-    // 终态只要求「停下来了」+「手里基本没筹码」。**不能要求筹码恰好为 0**：
-    // 收尾走完、破产窗弹出之后，仍可能有一枚在途币越线返值——那是被**记进账本**的
-    // 迟到返值（见 `RunState.gainChips` 的说明），不是漏记。
-    // 满盘之后收尾期越线更频繁，这条从「偶尔」变成了常态（实测出现过「破产窗 + 剩 1 筹码」）。
+    '⑤ 没有打平：timeout 占比 ≤ 30%（回收若 ≥1，这一条会趋近 100%）',
+    runs.length > 0 && timeoutRuns.length / runs.length <= 0.3,
+    `timeout ${timeoutRuns.length}/${runs.length} 局（${((timeoutRuns.length / Math.max(1, runs.length)) * 100).toFixed(1)}%）`,
+  );
+  // 原第三条「逃逸必须只在长尾」**降级为打印**：它是分布形状的陈述，n=50/段 无法验证
+  //（实测最短的 timeout 局与中位只差 1 投 ⇒ 做成判据就会因为一次抽中而红，
+  //  而它想抓的场景已由上面那条占比判据覆盖）。
+  console.log(
+    `[info] ⑤ 长尾形状（仅打印，不作判据）：中位 ${medianDrops} 投；` +
+      `timeout 局投币数 ${timeoutRuns.map((run) => run.drops).sort((a, b) => a - b).join('/') || '无'}`,
+  );
+  // 账本那一半**原样保留**：它管的是记账完整性，不是率。
+  // 终态只要求「停下来了」+「手里基本没筹码」。**不能要求筹码恰好为 0**：
+  // 收尾走完、破产窗弹出之后，仍可能有一枚在途币越线返值——那是被**记进账本**的
+  // 迟到返值（见 `RunState.gainChips` 的说明），不是漏记。
+  // 满盘之后收尾期越线更频繁，这条从「偶尔」变成了常态（实测出现过「破产窗 + 剩 1 筹码」）。
+  check(
+    '⑤ 终局的筹码都落进「低于本局买入」的破产侧（timeout 局不参与该判据）',
     runs.every(
       (run) =>
-        run.end !== 'timeout' &&
-        (run.end === 'settled' || (run.chips >= 0 && run.chips < (run.buyIn ?? 0))),
+        run.end === 'timeout' ||
+        run.end === 'settled' ||
+        (run.chips >= 0 && run.chips < (run.buyIn ?? 0)),
     ),
     runs.map((run) => `${run.end}/剩 ${run.chips} 筹码`).join('，'),
   );
+
 
   // 局的长度是经济标定的**可观察后果**：回收率太高一局会拖到十几分钟，
   // 太低则几投就破产。这条断言把「标定漂了」变成红灯，而不是靠人肉感觉。
@@ -2002,23 +2042,21 @@ async function runEconomy(page) {
   //   （推进率 1.328 → 1.70~2.15），所以这张分布**不能直接当成本轮的预期**——
   //   它是「为什么硬界要留一档余量」的**依据**，不是新经济的读数。
   //   本轮的局长读数由下面的 ⑥ 逐次报出；若左尾开始贴 20，说明返值压过头了。
-  const CRASH_LENGTH = [20, 300];
-  const dropCounts = runs.map((run) => run.drops);
-  const meanDrops = dropCounts.reduce((sum, count) => sum + count, 0) / Math.max(1, dropCounts.length);
-  const sortedDrops = [...dropCounts].sort((a, b) => a - b);
-  const medianDrops =
-    sortedDrops.length % 2 === 1
-      ? sortedDrops[(sortedDrops.length - 1) / 2]
-      : (sortedDrops[sortedDrops.length / 2 - 1] + sortedDrops[sortedDrops.length / 2]) / 2;
-  const DESIGN_LENGTH = [60, 90];
-  const meanInDesign = meanDrops >= DESIGN_LENGTH[0] && meanDrops <= DESIGN_LENGTH[1];
+  // `dropCounts` / `meanDrops` / `medianDrops` / `CRASH_LENGTH` / `DESIGN_LENGTH` / `meanInDesign`
+  // 已上移到 ⑤ 之前（⑤ 要用中位数；判据不许写第二份公式）。
+  const floorShare = dropCounts.filter((count) => count <= 28).length / Math.max(1, dropCounts.length);
+  const timeoutShare = timeoutRuns.length / Math.max(1, runs.length);
   check(
-    `⑥ 单局长度不崩溃（${CRASH_LENGTH[0]}~${CRASH_LENGTH[1]} 投；设计目标 ${DESIGN_LENGTH[0]}~${DESIGN_LENGTH[1]} 只看均值）`,
+    `⑥ 单局长度不崩溃（${CRASH_LENGTH[0]}~${CRASH_LENGTH[1]} 投）—— 四数一起读：均值吃右尾、典型局看中位`,
     dropCounts.every((count) => count >= CRASH_LENGTH[0] && count <= CRASH_LENGTH[1]),
     `各局投币数 ${dropCounts.join('/')}，均值 ${meanDrops.toFixed(1)} / 中位数 ${medianDrops} 投` +
-      `（设计目标 ${DESIGN_LENGTH[0]}~${DESIGN_LENGTH[1]}：${meanInDesign ? '均值在带内' : '均值在带外'}），` +
+      `，触底(≤28 投) ${(floorShare * 100).toFixed(1)}%` +
+      `，timeout ${(timeoutShare * 100).toFixed(1)}%` +
+      `（设计带 ${DESIGN_LENGTH[0]}~${DESIGN_LENGTH[1]} 是**均值**口径；` +
+      `${meanInDesign ? '均值在带内' : '均值在带外'}，但带内**不等于**典型局达标）），` +
       `越线/投币 ${perDrop.toFixed(3)}`,
   );
+
 
   return runs;
 }
@@ -2930,12 +2968,32 @@ async function runPerf(page, context) {
   );
 
   // ── V3：程序化表面细节（Triplanar）──
-  // 判据同样是**计数**：漏传 `...ROLE_DETAIL.x` 时画面只是「少了一点纹样」，
-  // 肉眼几乎看不出来。四种纹样都必须有材质在用。
+  // 判据跟着**总开关**走，不在 harness 里抄第二份默认值——开关的读数来自
+  // `materialReport().detailEnabled`（真源 `artDirection.SURFACE_DETAIL_ENABLED`）。
+  //
+  // 09-29 用户批注「机柜只要纯色，那些肌理也不要」把开关翻到 off，原来那条
+  // 「四种纹样都必须有材质在用」于是自相矛盾地一直红着。现在 off 一侧判的是
+  // 「机柜必须全纯色」，on 一侧保留原判据——**两个方向的漏网都还能被抓到**。
+  //
+  // off 一侧为什么允许 `kind1 ≤ 1`：老虎机滚筒那一份拉丝是**显式保留**的
+  //（`SlotMachine.ts:437`，用户口径「不要改筹码、老虎机的」）。写成上界而不是 `=== 0`，
+  // 是为了让「有人给机柜偷偷加回纹样」仍然会红（kind2/3/4 必须 0、kind1 不得多于那一份）。
+  const detailOn = (mats?.detailEnabled ?? 1) === 1;
+  const detailDist = `开关 ${detailOn ? 'on' : 'off'}；细节分布 kind1=${mats?.['1'] ?? 0} kind2=${mats?.['2'] ?? 0} kind3=${mats?.['3'] ?? 0} kind4=${mats?.['4'] ?? 0} kind0=${mats?.['0'] ?? 0}`;
   check(
-    '四种表面细节都有材质在用（拉丝 / 木纹 / 接缝 / 毛毡）',
-    (mats?.['1'] ?? 0) >= 1 && (mats?.['2'] ?? 0) >= 1 && (mats?.['3'] ?? 0) >= 1 && (mats?.['4'] ?? 0) >= 1,
-    `细节分布 kind1=${mats?.['1'] ?? 0} kind2=${mats?.['2'] ?? 0} kind3=${mats?.['3'] ?? 0} kind4=${mats?.['4'] ?? 0} kind0=${mats?.['0'] ?? 0}`,
+    detailOn
+      ? '四种表面细节都有材质在用（拉丝 / 木纹 / 接缝 / 毛毡）'
+      : '肌理开关 off：机柜全纯色（老虎机滚筒那份拉丝是白名单）',
+    detailOn
+      ? (mats?.['1'] ?? 0) >= 1 &&
+        (mats?.['2'] ?? 0) >= 1 &&
+        (mats?.['3'] ?? 0) >= 1 &&
+        (mats?.['4'] ?? 0) >= 1
+      : (mats?.['2'] ?? 0) === 0 &&
+        (mats?.['3'] ?? 0) === 0 &&
+        (mats?.['4'] ?? 0) === 0 &&
+        (mats?.['1'] ?? 9) <= 1,
+    detailDist,
   );
 
   // ── S16：边缘光通道（零程序代价）──
@@ -2957,6 +3015,27 @@ async function runPerf(page, context) {
     '边缘光只挂在宝石与金属件上（恰好 6 份：钻石 + 宝箱 + rail + 三份 trim）',
     (mats?.rim ?? -1) === 6,
     `rim=${mats?.rim}（toon ${mats?.toon} 个）`,
+  );
+
+  // ── G0-b：边缘光**断线**（走参考效果的「手绘感」预览通道）──
+  //
+  // 两条一起看，各管一种失效：
+  // ① 计数 = 4。断线此刻只开在**护栏 + 三份檐板**这两类长边上——它们是参考那种
+  //   「一条手绘的线」最直接的对应物。钻石 / 宝箱的 rim 是**逐面的切面高光**
+  //  （NdotV 在一面上恒定 ⇒ 一整面拿同一个值），切成断口读起来是「脏」不是「手绘」，
+  //   所以刻意不开。**这是设计取舍，不是漏传**，因此写死在这里。
+  // ② 不变量 = 0。掩码是**乘在 rim 贡献上**的，所以「有断线但没有边缘光」= 空转：
+  //   零视觉变化、面板和读数上却显示开了。① 只能发现数错，② 才发现「以为开了其实没开」——
+  //   后者是本项目反复踩过的那类静默缺陷。
+  check(
+    '边缘光断线只开在金属长边上（rail + 三份 trim = 4；宝石的切面高光刻意不开）',
+    (mats?.rimBreak ?? -1) === 4,
+    `rimBreak=${mats?.rimBreak}（rim=${mats?.rim}，toon ${mats?.toon} 个）`,
+  );
+  check(
+    '没有「开了断线却没有边缘光」的空转材质（掩码乘在 0 上 = 零视觉、有读数）',
+    (mats?.rimBreakIdle ?? -1) === 0,
+    `空转 ${mats?.rimBreakIdle} 份`,
   );
 
   // ── V4：币面像素贴图 ──

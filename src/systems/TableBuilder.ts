@@ -11,14 +11,15 @@ import {
   type CabinetShellPart,
   type WallPointId,
 } from '../game/cabinetShape';
-import { DETAIL_SURFACE, ROLE_DETAIL, ROLE_RAMP, ROLE_RIM } from '../game/artDirection';
+import { DETAIL_SURFACE, flatDetail, ROLE_DETAIL, ROLE_RAMP, ROLE_RIM } from '../game/artDirection';
 import { isLitMaterial, makeToonMaterial, type LitMaterial } from '../render/ToonMaterial';
 import {
   createArcaneHotZoneTexture,
   createArcaneScoreLineTexture,
 } from '../render/cabinetTexture';
 import { marqueeScreen } from '../render/marqueeScreen';
-import { surfaceNormalMap } from '../render/normalMaps';
+// `surfaceNormalMap` 的导入随 R2 的拉丝法线一起撤掉（机柜只要纯色）；
+// 需要恢复时连同 :915 那段注释一起看，别只补导入。
 
 /**
  * 机柜件的默认圆角半径（米）。
@@ -433,7 +434,10 @@ export function buildTable(world: RAPIER.World): TableBuild {
     color: COLORS.peg,
     ramp: 'metal',
     // 钉子半径只有 0.008 米，拉丝在它身上基本看不出——给个细粒度毛毡更实在。
-    ...DETAIL_SURFACE.felt,
+    // 但它必须过**同一个**肌理总开关：`peg` 刻意不挂 `role`，拿不到 `ROLE_DETAIL`，
+    // 直接展开 `DETAIL_SURFACE.felt` 就会在「机柜全纯色」之后留下一处漏网的纹样
+    //（而漏网的这一处正是 perf 判据要数出来的那种静默不一致）。
+    ...flatDetail(DETAIL_SURFACE.felt),
   });
   const pegQuaternion = axisAngleX(Math.PI / 2);
   const pegTotal = PEG_ROWS.reduce((total, row) => total + row.xs.length, 0);
@@ -675,8 +679,8 @@ function buildTray(): THREE.Mesh {
       name: 'tray',
       color: '#3a4a42',
       ramp: 'cabinet',
-      // 出币托盘用木纹：它与推板顶面同属「木作」，视觉上是一组。
-      ...DETAIL_SURFACE.wood,
+      // 出币托盘原先走木纹（与推板顶面同属「木作」）——机柜与推板都改纯色之后，
+      // 这一件单独留纹样会变成全场唯一一块「有图案的面」，反而更刺眼，所以一并平掉。
     }),
   );
   tray.position.set(0, TABLE.floorY - 0.08, TABLE.scoreLineZ + 0.18);
@@ -911,12 +915,10 @@ function cabinetMaterials(): {
         // V3：护栏是金属件，走各向异性拉丝。
         ...ROLE_DETAIL.rail,
         ...ROLE_RIM.rail,
-        // R2-T1 末项：拉丝金属的**法线扰动**。挑 `rail` 而不挑别的件，是因为
-        // 「拉丝」这件事以前只作用在**颜色**上（detail 乘 albedo），受光仍是整块同色，
-        // 近看还是贴片；法线扰动是唯一能让它出现真实明暗起伏的手段。
-        // ⚠️ 这一行会把程序数从 24 抬到 25（`USE_NORMALMAP_TANGENTSPACE`）——
-        //   这是 R2 里唯一被允许破例的一项，判据只看程序数，涨到 ≥ 29 就整块撤掉。
-        normalMap: surfaceNormalMap('brushed'),
+        // R2-T1 末项的拉丝法线扰动**已撤**（用户批注：机柜只要纯色、肌理也不要）。
+        // 撤掉它同时把 `USE_NORMALMAP_TANGENTSPACE` 那个 program 变体省回去：
+        // R2 当时记的是「程序数 24 → 25，唯一被允许的破例」，现在这个破例没有对象了。
+        // ⚠️ 别在这里再补回 `normalMap: surfaceNormalMap('brushed')` —— 那正是本次要去掉的东西。
       }),
       // ★ 顶板与檐板**同色带、同纹样、不同实例**（和上面 panel / panelArt 同一手法），
       // 为的是 R2-T1-5：两件要挂不同的 Arcane 构图。
@@ -1286,8 +1288,9 @@ function buildHood(
 /**
  * 招牌显示屏的贴片（R3-U4）。
  *
- * 尺寸从檐板反推，不写死：屏占满檐板**倒角以内**的平坦区，宽高比锁 4:1
- * 与 256×64 的纹理一致 —— 比例不对会让 LED 点阵变成扁椭圆，那是最刺眼的穿帮。
+ * 尺寸从檐板反推、不写死：屏**铺满檐板倒角以内的整块平坦区**（用户批注：直接做满）。
+ * 早先这里锁 4:1 与 256×64 的纹理对齐，理由是「比例不对会把 LED 点阵拉成扁椭圆」——
+ * 点阵已经去掉、只留扫描线之后，那个理由不再成立，剩下的只有轻微的字宽拉伸。
  *
  * 没有 `userData.role` / `userData.part`：换肤（`applyCabinetSkin`）与贴图分发
  * （`Game.applyCabinetMapTextures`）都是按这两个字段找件的，屏既不吃机柜配色
@@ -1296,11 +1299,10 @@ function buildHood(
 function buildMarqueeScreenMesh(material: LitMaterial): THREE.Mesh {
   const { hood } = cabinetShape();
   const bevel = partBevel('hoodValance').radius;
-  const faceHeight = hood.topY - hood.valanceBottomY - bevel * 2;
-  const faceWidth = hood.halfWidth * 2 - bevel * 2;
-  const height = Math.min(0.24, faceHeight);
-  const width = Math.min(height * 4, faceWidth);
+  const height = hood.topY - hood.valanceBottomY - bevel * 2;
+  const width = hood.halfWidth * 2 - bevel * 2;
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, height), material);
+
   mesh.name = 'marqueeScreen';
   mesh.position.set(
     0,

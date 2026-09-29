@@ -106,7 +106,8 @@ export const DETAIL_SURFACE = {
  * 机台部件角色 → 边缘光与 matcap-lite（R2-T1-1 / T1-2）。
  *
  * 与 `ROLE_RAMP` / `ROLE_DETAIL` 同键，所以同样可以 `...ROLE_RIM.rail` 直接展开。
- * 两个新参数都**默认恒等**（上缘色跟随下缘色、matcap 强度 0），没列进来的角色零变化。
+ * 三个后加的通道都**默认恒等**（上缘色跟随下缘色、matcap 强度 0、断口占比 0），
+ * 没列进来的角色零变化。
  *
  * ## 为什么只给金属件
  *
@@ -127,6 +128,12 @@ export const ROLE_RIM = {
     rimStrength: 0.3,
     rimPower: 2.6,
     matcapStrength: 0.18,
+    // G0-b 断线：先只开在**护栏与檐板**这两条长边上 —— 它们是参考那种「一条手绘的线」
+    // 最直接的对应物，而钻石 / 宝箱的 rim 是**逐面的切面高光**，切成断口会读成「脏」
+    // 而不是「手绘」（0.22 ≈ 断掉两成多一点；`sdNoiseP` 是平滑场，所以断的是**整团**
+    // 而不是逐像素噪点）。相位两件必须不同，否则几条边的断口同相、变成一层屏幕网格。
+    rimBreak: 0.22,
+    rimPhase: 3.7,
   },
   trim: {
     rimColor: '#ffd08a',
@@ -134,8 +141,57 @@ export const ROLE_RIM = {
     rimStrength: 0.26,
     rimPower: 3.2,
     matcapStrength: 0.14,
+    rimBreak: 0.22,
+    rimPhase: 8.1,
   },
 } as const;
+
+/**
+ * 程序化肌理总开关（用户批注：机柜只要纯色，「那些肌理也不要」）。
+ *
+ * 关掉的是 `ROLE_DETAIL` 全部六条角色的表面细节：台面绒布 `floor`、护栏拉丝 `rail`、
+ * 侧板/饰条板缝 `panel`/`trim`、**推板两件**（`pusherTop` 木纹、`pusherFace` 拉丝，
+ * 09-29 追加批注「把推板的纹理也去掉」），以及**钉子 `peg`**（09-29 第二次追加批注
+ * 「判据改读开关 + peg 归零」；它不在 `ROLE_DETAIL` 里，走下面的 `flatDetail`）。
+ * 展开成 `detailKind: 0` 之后 shader 走无细节分支，材质只剩色带 `color`。
+ *
+ * 筹码币面与老虎机滚筒根本不走 `ROLE_DETAIL`，所以天然不受影响
+ * （老虎机那份拉丝是**显式保留**的，判据白名单里写着）。
+ */
+const SURFACE_DETAIL_ENABLED = false;
+
+/**
+ * 总开关的**对外读数**（`Game.materialReport()` 用它给判据）。
+ *
+ * 导出的理由不是方便，是**防抄本**：`verify-game.mjs` 要知道「现在该不该有纹样」，
+ * 在它自己那边再写一个 `false` 就成了第二份真源——把开关翻回 on 的人不会去改 harness，
+ * 于是判据静默反向（该有纹样时判「必须没有」，没有纹样时判「必须有」，两边都绿不起来）。
+ */
+export function surfaceDetailEnabled(): boolean {
+  return SURFACE_DETAIL_ENABLED;
+}
+
+/**
+ * 角色细节的类型 —— **真源是 `render/ToonMaterial.ts` 的 `SurfaceDetailKind`**，
+ * 这里内联同样的联合是为了不给 `game → render` 加一条类型依赖。
+ * 那边若增删档位，这一行要跟着改（编译器会在使用处报不兼容，不会静默）。
+ */
+type DetailKind = 0 | 1 | 2 | 3 | 4;
+
+/** 开关关掉时把角色细节归零（字段名与 `makeToonMaterial` 入参同名，可直接展开）。 */
+const flat = (entry: { detailKind: DetailKind; detailScale: number }): {
+  detailKind: DetailKind;
+  detailScale: number;
+} => (SURFACE_DETAIL_ENABLED ? entry : { detailKind: 0, detailScale: 0 });
+
+/**
+ * 给 `ROLE_DETAIL` **以外**的部件用同一个开关。
+ *
+ * 存在的理由：钉子 `peg` 刻意不挂 `role`（它是可读性锚点、不参与换肤），
+ * 所以拿不到 `ROLE_DETAIL.floor` 这一类条目。若让它直接展开 `DETAIL_SURFACE.felt`，
+ * 「关掉肌理」就会漏掉一处——而漏掉的这一处正是判据要数出来的那种静默不一致。
+ */
+export const flatDetail = flat;
 
 /**
  * 机台部件角色 → 表面细节。与 `ROLE_RAMP` 同键，便于一处改完。
@@ -144,10 +200,11 @@ export const ROLE_RIM = {
  * **新增可换色部件时不要把两种角色合并到同一个材质**，否则它们会共用同一种纹样。
  */
 export const ROLE_DETAIL = {
-  floor: DETAIL_SURFACE.felt,
-  rail: DETAIL_SURFACE.brushedMetal,
-  panel: DETAIL_SURFACE.panelSeam,
-  trim: DETAIL_SURFACE.panelSeam,
-  pusherTop: DETAIL_SURFACE.wood,
-  pusherFace: DETAIL_SURFACE.brushedMetal,
+  floor: flat(DETAIL_SURFACE.felt),
+  rail: flat(DETAIL_SURFACE.brushedMetal),
+  panel: flat(DETAIL_SURFACE.panelSeam),
+  trim: flat(DETAIL_SURFACE.panelSeam),
+  pusherTop: flat(DETAIL_SURFACE.wood),
+  pusherFace: flat(DETAIL_SURFACE.brushedMetal),
 } as const satisfies Record<string, { detailKind: number; detailScale: number }>;
+

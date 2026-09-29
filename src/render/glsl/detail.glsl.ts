@@ -48,9 +48,24 @@ export const SURFACE_DETAIL_ASSIGN_POSITION = /* glsl */ `
 	vObjPos = position;
 `;
 
-/** 片元着色器声明。 */
-export const SURFACE_DETAIL_FRAGMENT_DECL = /* glsl */ `
+/**
+ * 物体空间坐标的片元声明 —— **无条件**注入（与下面那份条件声明分开）。
+ *
+ * 拆出来的理由是有第二个读者了：边缘光的断线（G0-b）要沿物体表面取噪声相位，
+ * 而纹样总开关关掉时 `vObjPos` 原本根本不会声明。顶点侧它本来就一直在赋值
+ * （`SURFACE_DETAIL_ASSIGN_POSITION` 是无条件的），现在片元侧也一直在 ——
+ * 少掉一处「声明随开关走」的隐藏耦合。
+ *
+ * ★ 代价说清楚：**每个 toon 材质多一个 `vec3` 插值器**。
+ * 以前 kind 0 的材质连 varyings 都不带（移动端寄存器是实打实的成本），现在至少带这一个。
+ * 换来的是断线属于**物体**而不是屏幕（相机一挪不会 shimmer）—— 那正是参考那套手绘感的根基。
+ */
+export const SURFACE_COORD_FRAGMENT_DECL = /* glsl */ `
 varying vec3 vObjPos;
+`;
+
+/** 片元着色器声明（`vObjPos` 在不随开关走的 {@link SURFACE_COORD_FRAGMENT_DECL} 里）。 */
+export const SURFACE_DETAIL_FRAGMENT_DECL = /* glsl */ `
 varying vec3 vObjNormal;
 uniform float uDetailScale;
 `;

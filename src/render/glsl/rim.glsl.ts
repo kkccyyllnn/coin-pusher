@@ -1,3 +1,5 @@
+import { HASH3_GLSL, NOISE_PHASED_GLSL } from './noise.glsl';
+
 /**
  * 边缘光 / 菲涅尔（S16）—— **零程序代价的视觉丰富化通道**。
  *
@@ -25,8 +27,11 @@
  *
  * ## 注入点与可用量
  *
- * - 声明挂在 `<common>` 之后（只声明**自己的** uniform，不碰 `vObjPos` /
- *   `vObjNormal` / `uDetailScale` —— 那是 `detail.glsl.ts` 的条件声明，重复声明会编译失败）。
+ * - 声明挂在 `<common>` 之后。除自己的 uniform 之外还带**两个噪声函数**
+ *   （`sdHash13` / `sdNoiseP`，断线用）和 `vObjPos` 的无条件声明
+ *   （在 `detail.glsl.ts` 的 `SURFACE_COORD_FRAGMENT_DECL` 里，**这里不能重复声明**）。
+ *   ⚠️ 噪声函数名与 `detail.glsl.ts` 的 `sdHash12` / `sdNoise` / `sdBand2` **刻意不同**：
+ *   两组会在同一个片元里并存（纹样开着时），重名直接编译失败。
  * - 运算挂在 `<normal_fragment_maps>` 之后。此时：
  *   - `normal` 已由 `<normal_fragment_begin>` 声明，是**视空间**法线；
  *   - `vViewPosition` 由 `<lights_toon_pars_fragment>` 无条件声明（=`-mvPosition`，
@@ -50,16 +55,23 @@
  * 效果是**边缘的切面亮、正对镜头的切面通透** —— 恰好就是「宝石」的观感，
  * 而且 `uRimEmissiveFloor = 1` 时对既有材质是恒等变换。
  */
-export const RIM_DECL = /* glsl */ `
+export const RIM_DECL = [
+  /* glsl */ `
 uniform vec3 uRimColor;
 uniform vec3 uRimColorHigh;
 uniform float uRimStrength;
 uniform float uRimPower;
 uniform float uRimEmissiveFloor;
 uniform float uMatcapStrength;
+// 断线（G0-b）：断口占比 + 逐材质相位。两个默认值合起来 = 这条通道等于没写。
+uniform float uRimBreak;
+uniform float uRimPhase;
 float sdRimFres;
 float sdRimUp;
-`;
+`,
+  HASH3_GLSL,
+  NOISE_PHASED_GLSL,
+].join('\n');
 
 export const RIM_APPLY = /* glsl */ `
 	{
@@ -69,7 +81,36 @@ export const RIM_APPLY = /* glsl */ `
 		// 单一 rim 色会把这件事抹平。分界线取视空间法线的 y：机位基本固定（俯视台面），
 		// 所以视空间的「上」与世界的「上」在这里够用了。
 		sdRimUp = saturate( normal.y * 0.5 + 0.5 );
-		diffuseColor.rgb += mix( uRimColor, uRimColorHigh, sdRimUp ) * ( sdRimFres * uRimStrength );
+		// ★ 断线（G0-b，走参考效果的「手绘感」预览）。
+		// ⚠️ 这一整段注释里**不能出现反引号**：它在 JS 模板字符串内部，
+		//   一个反引号就会截断整个模块，而且报错行号指不到真正的原因（本项目已踩过四次）。
+		//
+		// 坐标取物体空间（单位是米），所以断口**画在件上**、跟着件转，
+		// 不是屏幕上的一层抖动。代价见 SURFACE_COORD_FRAGMENT_DECL（多一个 vec3 插值器）。
+		//
+		// ★ 为什么是**两个剪切投影**而不是 vObjPos.xy —— 第一版写的就是 vObjPos.xy，
+		//   实测（冻结画面 A/B 的差异掩码）护栏上出现的是**一整条连续的边全断**，
+		//   不是断断续续的虚线。根因：机柜全是轴对齐的 BoxGeometry，
+		//   沿 z 走的长边在 xy 投影下 x、y 都不变 ⇒ 整条边采到**同一个**噪声值 ⇒
+		//   step 出来要么整条留、要么整条没。任何「三维到二维的线性投影」都必有一条
+		//   零方向（核），所以换坐标轴只是把问题挪到另一个方向上；
+		//   真正的解是**让零方向不落在任何一条棱上**：下面两个向量的叉积是
+		//   (-0.414, -0.353, 0.893)，不轴对齐 ⇒ 轴对齐盒子的任何一条棱都会真的走过噪声场。
+		//   一次噪声求值就够（三次投影 × 4 hash = 12 次那条路留着别走）。
+		//
+		// 为什么是 step 而不是 smoothstep：风格纪律（该硬的地方不糊），
+		// 而且它顺带给出**逐字恒等** —— sdNoiseP 的值域是 [0,1)，
+		// 所以 uRimBreak = 0 时 step( 0.0, n ) 恒为 1.0，
+		// 那三十多份没开断线的材质与改动前**画得一模一样**（恒等性判据能成立全靠这一行）。
+		//
+		// 相位走 sdNoiseP 而不是在调用点凑（约定见 noise.glsl.ts 文件头）。
+		vec2 sdRimBreakP = vec2(
+			dot( vObjPos, vec3( 1.0, 0.37, 0.61 ) ),
+			dot( vObjPos, vec3( 0.29, 1.0, 0.53 ) )
+		) * 9.0;
+		float sdRimBreakN = sdNoiseP( sdRimBreakP, uRimPhase );
+		float sdRimMask = step( uRimBreak, sdRimBreakN );
+		diffuseColor.rgb += mix( uRimColor, uRimColorHigh, sdRimUp ) * ( sdRimFres * uRimStrength * sdRimMask );
 		// matcap-lite（R2-T1-2）：**不新增采样**，直接查已经在用的色带 LUT，
 		// 拿菲涅尔当横坐标。于是「金属边缘高光」是**量化过的色带档**而不是连续泛光，
 		// 三渲二的硬边调性不被破坏 —— 这正是不用真 matcap 贴图的理由（那要 +1 纹理 +1 program）。

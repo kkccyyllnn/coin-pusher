@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { RAMP_PALETTES, type RampId } from '../game/artDirection';
 import { rampLutFor } from './RampLut';
 import {
+  SURFACE_COORD_FRAGMENT_DECL,
   SURFACE_DETAIL_APPLY,
   SURFACE_DETAIL_ASSIGN_NORMAL,
   SURFACE_DETAIL_ASSIGN_POSITION,
@@ -105,6 +106,24 @@ export type ToonMaterialParams = {
    */
   rimPower?: number;
   /**
+   * 边缘光的**断口占比**（G0-b，走参考效果的「手绘感」）。默认 0 = 连续的一条线。
+   *
+   * 生效形式是 `step(uRimBreak, sdNoiseP(…))`，所以 0 ⇒ 掩码恒为 1 ⇒ 与改动前**逐字恒等**
+   *（`sdNoiseP` 值域 [0,1)，`step(0.0, n)` 永远返回 1.0）。往上就是「这条边有百分之多少是断的」，
+   * 切口是硬的而不是淡出 —— 这是风格纪律：该硬的地方不糊。
+   *
+   * 只对**已经有边缘光**的件有意义：掩码乘在 rim 贡献上，给没开 rim 的材质传它是空转。
+   */
+  rimBreak?: number;
+  /**
+   * 断口的**逐材质相位**（`sdNoiseP` 的第三维）。默认 0。
+   *
+   * 不同件要给不同值，否则所有边的断口同相，读起来像一层屏幕网格而不是每条边各自的手绘感。
+   * ⚠️ 它**不是时间**：`sdHash13` 对第三维不连续，拿它做动画会得到逐帧沸腾的白噪声
+   *（约定与理由见 `glsl/noise.glsl.ts` 文件头）。
+   */
+  rimPhase?: number;
+  /**
    * 自发光在**正对镜头**的面上的保留比例（`1` = 不衰减，即恒等变换）。
    *
    * 自发光是与法线无关的平铺加色，强度一高就把低多面体的切面差异整个抹平。
@@ -193,6 +212,10 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
     value: new THREE.Color(params.rimColorHigh ?? params.rimColor ?? '#000000'),
   };
   const matcapStrengthUniform = { value: params.matcapStrength ?? 0 };
+  // G0-b 断线：同样是「加 uniform 不加 define」。默认值 (0, 0) 让这条通道等于没写，
+  // 于是它对既有 33 份材质是**逐字恒等**的（判据靠 `step(0.0, n)` 恒为 1 这一点成立）。
+  const rimBreakUniform = { value: params.rimBreak ?? 0 };
+  const rimPhaseUniform = { value: params.rimPhase ?? 0 };
   // R2-T1-3：背面色带。**未填 = 复用正面那张 LUT**，于是 `gl_FrontFacing` 的两个分支
   // 采到同一个采样器对象、同一个值 —— 恒等变换，且 `rampLutCount()` 不会多出一条。
   const gradientBackUniform = {
@@ -208,6 +231,9 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
   // 而「rim 强度漏传 → `undefined` → uniform NaN → 整件变白/黑」是**零报错**的失效形态，
   // 只能靠计数钉住（与 `SD_DETAIL_KIND` 的四种纹样计数同一个道理）。
   material.userData.rimStrength = rimStrengthUniform.value;
+  // 断线记同一个道理（`rimBreakOf`）：漏传 / 传错是「一条边突然不断了」或「边整块没了」，
+  // 截图上都能读成「参数调过了」，只有计数能钉住。
+  material.userData.rimBreak = rimBreakUniform.value;
 
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uDetailScale = detailScaleUniform;
@@ -217,6 +243,8 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
     shader.uniforms.uRimEmissiveFloor = rimEmissiveFloorUniform;
     shader.uniforms.uRimColorHigh = rimColorHighUniform;
     shader.uniforms.uMatcapStrength = matcapStrengthUniform;
+    shader.uniforms.uRimBreak = rimBreakUniform;
+    shader.uniforms.uRimPhase = rimPhaseUniform;
     shader.uniforms.uGradientBack = gradientBackUniform;
 
     shader.vertexShader = shader.vertexShader
@@ -230,8 +258,11 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
         `#include <begin_vertex>\n${SURFACE_DETAIL_ASSIGN_POSITION}`,
       );
 
-    // 细节只在实际用到时才注入——kind 0 的材质连 varyings 都不需要，
-    // 少两个 vec3 插值器（在移动端是实打实的寄存器）。
+    // 纹样本体只在实际用到时才注入（kind 0 省掉整段 `sdSurfaceDetail`）。
+    //
+    // ⚠️ 「kind 0 连 varyings 都不需要」这句**已经不成立了**（G0-b）：断线要沿物体表面取噪声，
+    //   所以 `vObjPos` 现在是**无条件**声明的（见 `SURFACE_COORD_FRAGMENT_DECL`，那里记了这条
+    //   插值器的账）。`vObjNormal` + `uDetailScale` 仍然是条件的。
     //
     // ★ 声明与运算**各只 replace 一次**（S16 收口）。
     //   旧写法是两次独立的 `.replace('#include <common>', …)`（detail 一次、别的再一次）：
@@ -239,6 +270,7 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
     //   所以趁加 rim 把它收成一次。
     const fragmentDecl = [
       RIM_DECL,
+      SURFACE_COORD_FRAGMENT_DECL,
       useDetail ? SURFACE_DETAIL_FRAGMENT_DECL : '',
       useDetail ? SURFACE_DETAIL_BODY : '',
     ]
@@ -292,6 +324,19 @@ export type LitMaterial = THREE.MeshToonMaterial | THREE.MeshStandardMaterial;
  */
 export function rimStrengthOf(material: THREE.Material): number {
   const value = material.userData?.rimStrength;
+  return typeof value === 'number' ? value : 0;
+}
+
+/**
+ * 读回某个材质上的**断口占比**（G0-b）。
+ *
+ * 与 `rimStrengthOf` 同构，但这里有一条**互相咬合**的判据可用：
+ * 掩码乘在 rim 贡献上，所以「有断线的材质数」必须等于「有边缘光的材质数」——
+ * 一个数对了另一个不对，就是有人给没开 rim 的件传了 `rimBreak`（空转），
+ * 或反过来漏传（那条边该断不断）。两个数一起看，比各自断言一个魔法数强。
+ */
+export function rimBreakOf(material: THREE.Material): number {
+  const value = material.userData?.rimBreak;
   return typeof value === 'number' ? value : 0;
 }
 
