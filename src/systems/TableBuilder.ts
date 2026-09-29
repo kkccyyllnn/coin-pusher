@@ -811,7 +811,7 @@ function buildFrontBaffle(): THREE.Group {
  * | part | 形态 | role（色带） |
  * | --- | --- | --- |
  * | `sideWall.tall.L/R` | 侧墙高段（机柜侧板 + 檐板托，**沿 x 挤出的异形板**） | `panel` |
- * | `sideWall.low.L/R` | 侧墙低段（币床围挡，**斜顶**，沿 x 挤出） | `rail` |
+ * | `sideWall.low.L/R` | 侧墙低段（币床围挡，**斜顶**，沿 x 挤出） | `panel`（09-30 起与高段同一份材质） |
  * | `hoodRoof` | 顶板 | `trim` |
  * | `hoodValance` | 檐板（顶板前面垂下来的立面，**S21 起它就是招牌画布**） | `trim` |
  * | `backPanel` | 背板 | `panel` |
@@ -866,7 +866,6 @@ function buildFrontBaffle(): THREE.Group {
 let cabinetMaterialCache: {
   panel: LitMaterial;
   panelArt: LitMaterial;
-  rail: LitMaterial;
   trimRoof: LitMaterial;
   trimValance: LitMaterial;
   screen: LitMaterial;
@@ -875,7 +874,6 @@ let cabinetMaterialCache: {
 function cabinetMaterials(): {
   panel: LitMaterial;
   panelArt: LitMaterial;
-  rail: LitMaterial;
   trimRoof: LitMaterial;
   trimValance: LitMaterial;
   screen: LitMaterial;
@@ -906,21 +904,7 @@ function cabinetMaterials(): {
       //   - 只是多一个材质对象 ⇒ **不涨 draw call**（件数没变）。
       // 背板留在 `panel` 上：它的可见部分只有币床上方那一条，贴图会被金币堆糊满。
       panelArt: makeToonMaterial({ name: 'panelArt', ...panelParams }),
-      // 侧墙**低段**（币床两侧的围挡）走 `rail` 色带 —— 它就是从原来那条看得见的
-      // 护栏长上来的：护栏网格早已不存在（S17 起两侧围挡就是侧墙低段），色带还在用。
-      rail: makeToonMaterial({
-        name: 'rail',
-        color: COLORS.rail,
-        ramp: ROLE_RAMP.rail,
-        // V3：护栏是金属件，走各向异性拉丝。
-        ...ROLE_DETAIL.rail,
-        ...ROLE_RIM.rail,
-        // R2-T1 末项的拉丝法线扰动**已撤**（用户批注：机柜只要纯色、肌理也不要）。
-        // 撤掉它同时把 `USE_NORMALMAP_TANGENTSPACE` 那个 program 变体省回去：
-        // R2 当时记的是「程序数 24 → 25，唯一被允许的破例」，现在这个破例没有对象了。
-        // ⚠️ 别在这里再补回 `normalMap: surfaceNormalMap('brushed')` —— 那正是本次要去掉的东西。
-      }),
-      // ★ 顶板与檐板**同色带、同纹样、不同实例**（和上面 panel / panelArt 同一手法），
+      // ★ 顶板与檐板**同色带、同纹样、不同实例**（和上面 panelArt 同一手法），
       // 为的是 R2-T1-5：两件要挂不同的 Arcane 构图。
       //
       // 为什么拆实例是**唯一**办法：一份材质只有一个 map 槽，两件共用时
@@ -964,7 +948,7 @@ function cabinetMaterials(): {
  */
 export function buildCabinetShell(): THREE.Group {
   const shell = new THREE.Group();
-  const { panel, panelArt, rail, trimRoof, trimValance, screen } = cabinetMaterials();
+  const { panel, panelArt, trimRoof, trimValance, screen } = cabinetMaterials();
 
   // ── 7 件外壳 ──
   //
@@ -972,10 +956,14 @@ export function buildCabinetShell(): THREE.Group {
   // 每件的中心与尺寸都在对应的 `build*` 里直接由 `cabinetShape()` 的字段算出，
   // 这里只负责挂上去 —— 写在这儿的任何数字都会变成「第二份真源」。
   //
-  // ★ 高段走 `panelArt`（同一份色带、独立材质实例），它要挂 R1-M3 的内凹灯饰贴图；
-  //   低段与背板仍走 `panel` / `rail`。见 `cabinetMaterials()` 里 `panelArt` 的注释。
-  shell.add(buildSideWall(-1, { tall: panelArt, low: rail }));
-  shell.add(buildSideWall(1, { tall: panelArt, low: rail }));
+  // ★ 高段走 `panelArt`（与 `panel` 同色带、同纹样，只是独立实例），它要挂 R1-M3 的
+  //   内凹灯饰贴图。★ 用户批注（09-30）：**前侧板（低段）与后侧板（高段）材质统一**
+  //   ⇒ 低段现在共用同一个 `panelArt` 实例，而不是原来那份带金属边缘光的 `rail`。
+  //   共用实例是这件事最强的形式：以后任何一方加贴图/改色带都不可能只落到一半，
+  //   「两块板参数不一致」这类缺陷从结构上消失（原来那份 `rail` 材质已随之删除）。
+  //   代价：`materialReport().rim` 少一份、`rimBreak` 少一份 ⇒ perf 的期望值按实测改。
+  shell.add(buildSideWall(-1, panelArt));
+  shell.add(buildSideWall(1, panelArt));
   shell.add(buildHood(trimRoof, trimValance, screen));
   shell.add(buildBackPanel(panel));
 
@@ -1140,7 +1128,8 @@ function cabinetPrismMesh(
 }
 
 /**
- * 一侧的侧墙：低段（`rail` 色带）+ 高段（`panel` 色带）在 `CABINET.wall.insetZ` 处对接。
+ * 一侧的侧墙：低段 + 高段在 `CABINET.wall.insetZ` 处对接，**两段同一份材质**
+ *（09-30 用户批注：前侧板与后侧板的材质、纹理各参数统一）。
  *
  * ## S21 的两处新形状（用户批注 ③⑤）
  *
@@ -1179,11 +1168,14 @@ type WallCorner = {
 function buildSideWall(
   side: -1 | 1,
   /**
-   * 两段各自的材质。参数名按**件**而不是按**色带**取（`tall` / `low`）：
-   * 高段的色带是 `panel`，但材质实例是 `panelArt`（要单独挂灯饰贴图），
-   * 用 `panel` 当参数名会把「同色带 ≠ 同材质」这件事藏起来。
+   * 高段与低段**共用的一份**材质（09-30 用户批注：前侧板与后侧板材质统一）。
+   *
+   * 参数名按**件**而不是按**色带**取的历史原因仍然成立：这份实例的色带是 `panel`，
+   * 但实例是 `panelArt`（要单独挂灯饰贴图），叫它 `panel` 会把
+   * 「同色带 ≠ 同材质」藏起来。而现在两段连实例都同一份 ⇒ 签名只剩一个参数，
+   * 「两块板各拿一份材质」这条路径在类型层面就没有入口了。
    */
-  materials: { tall: LitMaterial; low: LitMaterial },
+  material: LitMaterial,
 ): THREE.Group {
   const { wall, bevel } = cabinetShape();
   const group = new THREE.Group();
@@ -1205,9 +1197,9 @@ function buildSideWall(
         { id: 'low.roofFront', z: wall.lowFrontZ, y: wall.lowRoofFrontY },
         { id: 'low.roofBack', z: wall.insetZ, y: wall.lowRoofBackY },
       ]),
-      'rail',
+      'panel',
       `sideWall.low${suffix}` as CabinetPart,
-      materials.low,
+      material,
       side,
       true,
     ),
@@ -1227,7 +1219,7 @@ function buildSideWall(
       ]),
       'panel',
       `sideWall.tall${suffix}` as CabinetPart,
-      materials.tall,
+      material,
       side,
     ),
   );
