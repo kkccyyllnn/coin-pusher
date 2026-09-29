@@ -12,6 +12,9 @@ import {
   type PixelScaleSettings,
 } from '../render/PixelScale';
 import { iconReport } from '../render/iconTexture';
+import { GBuffer } from '../render/GBuffer';
+import { FinalPass, readFinalView } from '../render/FinalPass';
+import { attachGInfoFallback } from '../render/glsl/gbuffer.glsl';
 import {
   applyCameraRig,
   cameraRig,
@@ -155,6 +158,18 @@ export class Game {
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene = new THREE.Scene();
   private readonly camera = new THREE.PerspectiveCamera(42, 1, 0.05, 40);
+  /**
+   * G1 通道复用：场景**先**渲染进这块 MRT（附件 0 = 颜色 + 面 ID，附件 1 = 深度 / 线宽），
+   * 再由 `finalPass` 补上色调映射与 sRGB 编码出画。
+   *
+   * 尺寸跟着**内部分辨率**（`pixelScale.internalWidth/Height`）走，在
+   * `applyPixelScale()` 里同步 —— 与 backing store 不一致会让最后一遍做一次非整数缩放。
+   * 初值 1×1 只是占位：字段初始化必须早于第一次 `applyPixelScale()`（它在构造函数里就被调用）。
+   */
+  private readonly gbuffer = new GBuffer(1, 1);
+  private readonly finalPass = new FinalPass();
+  /** `?view=depth` / `?view=id`：把附件直接摊成灰度看，判描边阈值前的前置观测。 */
+  private readonly finalView: number = readFinalView(window.location.search);
   private readonly hud = new Hud();
   private readonly audio = new AudioSystem();
   /**
@@ -385,6 +400,19 @@ export class Game {
   private cameraPeakOffset = 0;
   /** S18：单帧 draw call 峰值，cabinet-tex 模式拿来对位 perf 上限。 */
   private rendererPeakDrawCalls = 0;
+  /**
+   * G1 之后一帧有**两遍** `renderer.render()`（场景 → MRT，再最后一遍出画），
+   * 而 `renderer.info` 每次 render() 开头自己清一次 ⇒ 帧末直接读只剩最后一遍。
+   * 所以这里分开记：
+   * - `sceneDrawCalls`：场景那一遍，**与 G1 之前完全同口径**（three 的 `info.reset()`
+   *   排在 `shadowMap.render()` 之后，阴影 pass 从来不计入 —— 见 `core/Renderer.ts` 的警告）。
+   * - `frameDrawCalls`：两遍合计，才是这一帧真正的绘制调用数。判据读的是这个。
+   */
+  private sceneDrawCalls = 0;
+  private frameDrawCalls = 0;
+  /** 同上，三角形数。两遍出画之后 `info.render.triangles` 也只剩最后一遍的 2 个。 */
+  private sceneTriangles = 0;
+  private frameTriangles = 0;
 
   private constructor(canvas: HTMLCanvasElement, physics: PhysicsWorld) {
     this.physics = physics;
@@ -588,6 +616,10 @@ export class Game {
     // 视觉币通道（S16）：它自带一份圆柱几何与一份材质，**不是**币池的资源，
     // 所以要单独释放 —— 漏了这一行会在重开游戏时漏掉几何体与一张贴图。
     this.spray.dispose();
+    // G1 的两遍出画资源：MRT 是**显式分配**的 GPU 纹理（两张附件 + MSAA 缓冲），
+    // 不释放就是重开一局漏一整帧的显存 —— 这类泄漏 `renderer.info` 看不出来。
+    this.gbuffer.dispose();
+    this.finalPass.dispose();
     this.renderer.dispose();
     window.__THREE_GAME_DIAGNOSTICS__ = undefined;
     window.__THREE_GAME_TEST_HOOKS__ = undefined;
@@ -846,7 +878,9 @@ export class Game {
     );
     this.rendererPeakDrawCalls = Math.max(
       this.rendererPeakDrawCalls,
-      this.renderer.info.render.calls,
+      // 读**自己按帧累计的那份**，不读 `renderer.info.render.calls`：
+      // 两遍出画之后，那个数在帧末只剩最后一遍的 1 次（判据会绿得毫无意义）。
+      this.frameDrawCalls,
     );
   }
 
@@ -934,11 +968,47 @@ export class Game {
     const canvas = this.renderer.domElement;
     this.pixelScale = resolvePixelScale(canvas.clientWidth, canvas.clientHeight, this.pixelSettings);
     applyPixelated(this.pixelScale.pixelated);
-    return resizeRenderer(this.renderer, this.camera, this.pixelScale);
+    const resized = resizeRenderer(this.renderer, this.camera, this.pixelScale);
+    // G1：MRT 必须与 backing store **同尺寸**，否则最后一遍要做一次非整数缩放
+    //（像素风档下就是「明明设了最近邻却还是糊」）。这里跟 `resizeRenderer` 同一条路径，
+    // 所以画质分档 / 视口变化 / `?pixel=` 三种来源都会一起走到。
+    this.gbuffer.resize(this.pixelScale.internalWidth, this.pixelScale.internalHeight);
+    return resized;
   }
 
+  /**
+   * 两遍出画（G1）。
+   *
+   * `scene → GBuffer(MRT) → FinalPass → canvas`。
+   *
+   * 为什么不能像以前那样一遍画完：参考那套观感要的是「物体之间必然有线」，
+   * 而那条线要读的是**面 ID + 深度**，canvas 是 `alpha: false`（`core/Renderer.ts:8`），
+   * 没有通道可写。所以必须先有一块带 alpha 的渲染目标 —— 见 `render/GBuffer.ts`。
+   *
+   * ★ 代价：色调映射与 sRGB 编码**不再由 three 自动做**（进 RT 时它把两者都关了，
+   *   `WebGLPrograms.js:173-182` / `:209`），语义整个搬到 `FinalPass` 里。
+   *   `renderer.toneMapping` / `toneMappingExposure` 那两行仍然是唯一真源，
+   *   这里只是把 exposure 现值交给最后一遍。
+   */
   private render(): void {
+    // 第一遍：场景 → MRT。目标必须在 `render()` 之前设好（`FinalPass` 那边会自己切回 null）。
+    this.renderer.setRenderTarget(this.gbuffer.target);
+    // three 在这次调用内部会先清一次 `info`（`autoReset` 保持默认），
+    // 所以紧接着采样到的就是**场景这一遍**的 draw call —— 与 G1 之前同一个口径
+    //（阴影 pass 在 three 的 `info.reset()` 之前跑，历史上从来不计入，见 `core/Renderer.ts`）。
     this.renderer.render(this.scene, this.camera);
+    this.sceneDrawCalls = this.renderer.info.render.calls;
+    this.sceneTriangles = this.renderer.info.render.triangles;
+    this.finalPass.render(
+      this.renderer,
+      this.gbuffer.color,
+      this.gbuffer.info,
+      this.renderer.toneMappingExposure,
+      this.finalView,
+    );
+    // 第二遍又清一次，所以此刻 `info` 里只剩最后一遍自己 —— 加起来才是这一帧的全部。
+    this.frameDrawCalls = this.sceneDrawCalls + this.renderer.info.render.calls;
+    this.frameTriangles = this.sceneTriangles + this.renderer.info.render.triangles;
   }
 
   /**
@@ -2034,9 +2104,18 @@ export class Game {
 
     const guideBottom = TABLE.pusherTopY + 0.02;
     const guideHeight = TABLE.drop.y - guideBottom;
+    const guideMaterial = new THREE.MeshBasicMaterial({
+      color: COLORS.bronzeRim,
+      transparent: true,
+      opacity: 0.22,
+    });
+    // G1：这是全场景唯一**不走 toon 工厂**的网格材质，所以拿不到 `gInfo` 那条输出。
+    // MRT 下少写一个附件是每帧都刷的验证错误（`visual.spec` 的「无控制台报错」直接红），
+    // 必须补 —— 见 `attachGInfoFallback` 的注释。
+    attachGInfoFallback(guideMaterial);
     const guide = new THREE.Mesh(
       new THREE.BoxGeometry(0.006, guideHeight, 0.006),
-      new THREE.MeshBasicMaterial({ color: COLORS.bronzeRim, transparent: true, opacity: 0.22 }),
+      guideMaterial,
     );
     guide.position.set(0, guideBottom + guideHeight / 2, TABLE.drop.z);
     this.laneMarker.add(guide);
@@ -2659,10 +2738,13 @@ export class Game {
        */
       materialReport: () => {
         const base = this.materialReport();
-        // S18：把 `renderer.info.calls` 顺路带上，cabinet-tex 模式可以读到 draw call。
+        // S18：把 draw call 顺路带上，cabinet-tex 模式可以读到。
+        // ★ 读**自己按帧累计的两份**，不读 `renderer.info`：两遍出画之后那里
+        //   只剩最后一遍的 1 次调用 / 2 个三角形，判据会绿得毫无意义。
         (base as unknown as Record<string, unknown>).renderer = {
-          calls: this.renderer.info.render.calls,
-          triangles: this.renderer.info.render.triangles,
+          calls: this.frameDrawCalls,
+          triangles: this.frameTriangles,
+          sceneCalls: this.sceneDrawCalls,
           max: this.rendererPeakDrawCalls,
         };
         return base;
@@ -3804,8 +3886,9 @@ export class Game {
       },
       reel: this.reelDiagnostics(),
       renderer: {
-        calls: info.render.calls,
-        triangles: info.render.triangles,
+        // 同 `materialReport()`：两遍出画之后 `info` 只剩最后一遍，这里要的是整帧的数。
+        calls: this.frameDrawCalls,
+        triangles: this.frameTriangles,
         geometries: info.memory.geometries,
         textures: info.memory.textures,
       },

@@ -13,6 +13,12 @@ export function createRenderer(canvas: HTMLCanvasElement): THREE.WebGLRenderer {
   renderer.toneMappingExposure = 1.05;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFShadowMap;
+  // ⚠️ **不要**为了「两遍出画要按帧累加」而把 `info.autoReset` 关掉 —— 那样
+  // 峰值 draw call 会从 46 静默变成 56，而多出来的 10 次不是新开销。
+  // 原因在 three 自己的顺序里：`WebGLRenderer.render()` 先跑 `shadowMap.render()`
+  // （:1698）**再** `info.reset()`（:1704），所以历史上这个计数**从来不含阴影 pass**。
+  // 关掉 autoReset 等于把阴影的绘制调用一起放进来 ⇒ 与所有历史读数不可比。
+  // 分 pass 计数在 `Game.render()` 里做（那里能看见两遍各自的数量）。
   return renderer;
 }
 

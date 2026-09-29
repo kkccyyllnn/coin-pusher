@@ -13,6 +13,13 @@ import {
 // GLSL 片段一律放 `render/glsl/`（R2-T2）：注入点集合 = 那个目录的文件清单。
 // 内联在这个文件里时，「到底注入了哪几段」只能靠人肉读 diff 对上程序指纹。
 import { COLOR_RAMP_CHUNK } from './glsl/colorRamp.glsl';
+import {
+  GBUFFER_FRAGMENT_DECL,
+  GBUFFER_VERTEX_ASSIGN,
+  GBUFFER_VERTEX_DECL,
+  GBUFFER_WRITE,
+} from './glsl/gbuffer.glsl';
+import { GBUFFER_DEPTH_SCALE } from './GBuffer';
 import { RIM_APPLY, RIM_DECL, RIM_EMISSIVE_APPLY } from './glsl/rim.glsl';
 
 /**
@@ -216,6 +223,10 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
   // 于是它对既有 33 份材质是**逐字恒等**的（判据靠 `step(0.0, n)` 恒为 1 这一点成立）。
   const rimBreakUniform = { value: params.rimBreak ?? 0 };
   const rimPhaseUniform = { value: params.rimPhase ?? 0 };
+  // G1-b：深度归一化分母。逐材质一份（与上面同一套「program 共享、uniforms 逐材质」），
+  // 值全场景同一个 —— 留成 uniform 而不是常量，是因为它属于**渲染目标**的口径，
+  // 不属于材质；将来 GBuffer 换尺度时不用动任何材质定义。
+  const depthScaleUniform = { value: GBUFFER_DEPTH_SCALE };
   // R2-T1-3：背面色带。**未填 = 复用正面那张 LUT**，于是 `gl_FrontFacing` 的两个分支
   // 采到同一个采样器对象、同一个值 —— 恒等变换，且 `rampLutCount()` 不会多出一条。
   const gradientBackUniform = {
@@ -245,10 +256,11 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
     shader.uniforms.uMatcapStrength = matcapStrengthUniform;
     shader.uniforms.uRimBreak = rimBreakUniform;
     shader.uniforms.uRimPhase = rimPhaseUniform;
+    shader.uniforms.uDepthScale = depthScaleUniform;
     shader.uniforms.uGradientBack = gradientBackUniform;
 
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', `#include <common>\n${SURFACE_DETAIL_VERTEX_VARYINGS}`)
+      .replace('#include <common>', `#include <common>\n${SURFACE_DETAIL_VERTEX_VARYINGS}\n${GBUFFER_VERTEX_DECL}`)
       .replace(
         '#include <beginnormal_vertex>',
         `#include <beginnormal_vertex>\n${SURFACE_DETAIL_ASSIGN_NORMAL}`,
@@ -256,6 +268,12 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
       .replace(
         '#include <begin_vertex>',
         `#include <begin_vertex>\n${SURFACE_DETAIL_ASSIGN_POSITION}`,
+      )
+      // 面 ID 挂在 `<project_vertex>` 之后：那里 `instanceMatrix` 已在作用域内，
+      // 而我们要的只是「模型 + 实例的平移列」（见 `GBUFFER_VERTEX_ASSIGN` 的注释）。
+      .replace(
+        '#include <project_vertex>',
+        `#include <project_vertex>\n${GBUFFER_VERTEX_ASSIGN}`,
       );
 
     // 纹样本体只在实际用到时才注入（kind 0 省掉整段 `sdSurfaceDetail`）。
@@ -271,6 +289,7 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
     const fragmentDecl = [
       RIM_DECL,
       SURFACE_COORD_FRAGMENT_DECL,
+      GBUFFER_FRAGMENT_DECL,
       useDetail ? SURFACE_DETAIL_FRAGMENT_DECL : '',
       useDetail ? SURFACE_DETAIL_BODY : '',
     ]
@@ -296,6 +315,15 @@ export function makeToonMaterial(params: ToonMaterialParams): THREE.MeshToonMate
       .replace(
         '#include <emissivemap_fragment>',
         `#include <emissivemap_fragment>\n${RIM_EMISSIVE_APPLY}`,
+      )
+      // ★ G1-b：通道复用的写出。**追加**而不是替换掉 `<dithering_fragment>`：
+      //   它是 `meshtoon` 片元的最后一个 include（`ShaderLib/meshtoon.glsl.js:110-115`），
+      //   所以一定排在 `opaque_fragment`（那里会把 `a` 按 `diffuseColor.a` 重写一遍）之后 ——
+      //   排在它前面覆盖就是白写。而 dithering 自己只动 `.rgb` 不动 `.a`，
+      //   追加在它后面既保住了抖动，也让 ID 是最后一次对 `a` 的写入。
+      .replace(
+        '#include <dithering_fragment>',
+        `#include <dithering_fragment>\n${GBUFFER_WRITE}`,
       );
   };
   material.customProgramCacheKey = () => CACHE_KEY;
