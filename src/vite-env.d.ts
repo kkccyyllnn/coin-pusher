@@ -647,6 +647,14 @@ interface ThreeGameTestHooks {
    */
   materialReport?(): Record<string, number>;
   /**
+   * G3-a：回读通道附件 0 得到的**面 ID 可分差**实测。
+   *
+   * 键：`width` `height` `distinctIds` `minGap` `objectEdges` `silhouetteEdges`
+   * `edgesBelowThreshold` `backgroundShare` `threshold` `readFailed`。
+   * 描边阈值必须由它来定 —— 见方法注释里「判据要按可分差设计，不是按看起来有描边设计」。
+   */
+  gbufferReport?(): Record<string, number>;
+  /**
    * 已编译程序的**指纹名单**（R2-T2）。
    *
    * `materialReport().programs` 只有一个总数 —— 从 20 涨到 29 判据都还绿，

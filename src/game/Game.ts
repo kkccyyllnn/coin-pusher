@@ -942,6 +942,132 @@ export class Game {
     return flattened;
   }
 
+  /**
+   * G3-a：回读附件 0，量面 ID 的**可分差**（描边阈值的地基）。
+   *
+   * ## 为什么必须回读，而不是看截图
+   *
+   * 「这条边描没描出来」在截图里只能定性看，而它真正的答案是一个数：
+   * **相邻两像素的 ID 差有多小**。ID 存进 8 位 alpha 之后，两个挨着的物件
+   * 完全可能落进同一个桶（`fract()` 只是「几乎必然不同」，不是唯一 ID）——
+   * 那种边**永远不会出现**，而它在截图里长得和「阈值调高了」一模一样。
+   * 参考笔记 §6 第 4 条因此一直标着 `待验证`：**判据要按可分差设计，
+   * 不是按「看起来有描边」设计**，也不能抄参考的数（他的场景是树/叶子尺度）。
+   *
+   * ## 三个数各管什么
+   *
+   * - `distinctIds` 明显小于可见物件数 ⇒ 有物件撞进同一个 ID。
+   * - `minGap` 是「相邻且不同」的 ID 里最小的一档；阈值必须**离它有余量**，
+   *   否则最紧的那条边会随机消失（判据要离噪声远，不是离读数近）。
+   * - `belowThreshold` 是按当前阈值会被**漏掉**的交界像素数 —— 0 才是可接受状态。
+   * - `idBlindButDepthSees`：ID 完全相同、但深度有明显跳变的相邻像素数。
+   *   这一格就是「ID 通道看不见、靠深度兜住」的那批边 —— 也是
+   *   **不能只抄一条判据**的直接证据（只描 ID 会整批漏掉）。
+   *
+   * 两个附件都读：附件 0 的 alpha 只用来认背景（255 = `glClear` 填的），
+   * 真正的 ID 在附件 1（半浮点两维）。半浮点要自己解码 —— `readPixels` 交回来的是
+   * 原始位模式，不是 JS number。
+   */
+  private gbufferReport(): Record<string, number> {
+    const target = this.gbuffer.target;
+    const width = target.width;
+    const height = target.height;
+    const count = width * height;
+    const color = new Uint8Array(count * 4);
+    const info = new Uint16Array(count * 4);
+    this.renderer.readRenderTargetPixels(target, 0, 0, width, height, color, 0, 0);
+    this.renderer.readRenderTargetPixels(target, 0, 0, width, height, info, 0, 1);
+    const thresholds = this.finalPass.outlineThresholds;
+
+    /** IEEE 754 half → number。`readPixels` 交回的是位模式，不解码全是整数垃圾。 */
+    const half = (raw: number): number => {
+      const sign = raw & 0x8000 ? -1 : 1;
+      const exp = (raw >> 10) & 0x1f;
+      const frac = raw & 0x3ff;
+      if (exp === 0) return sign * frac * 2 ** -24;
+      if (exp === 31) return frac ? NaN : sign * Infinity;
+      return sign * (1 + frac / 1024) * 2 ** (exp - 15);
+    };
+
+    // 先整帧解码一遍再扫邻居：省掉每个像素被反复解码 4~5 次（921k 像素的邻接扫描
+    // 是百万级调用，边扫边解码会明显卡到判据超时）。
+    const ids = new Float32Array(count * 2);
+    const depths = new Float32Array(count);
+    const isBackground = new Uint8Array(count);
+    for (let i = 0; i < count; i++) {
+      const o = i * 4;
+      ids[i * 2] = half(info[o + 1]);
+      ids[i * 2 + 1] = half(info[o + 2]);
+      depths[i] = half(info[o]);
+      isBackground[i] = color[o + 3] === 255 ? 1 : 0;
+    }
+
+    const buckets = new Set<number>();
+    let background = 0;
+    let objectEdges = 0;
+    let silhouetteEdges = 0;
+    let belowThreshold = 0;
+    let idBlindButDepthSees = 0;
+    let minGap = Number.POSITIVE_INFINITY;
+
+    const measure = (a: number, b: number): void => {
+      const bgA = isBackground[a] === 1;
+      const bgB = isBackground[b] === 1;
+      if (bgA && bgB) return;
+      if (bgA !== bgB) {
+        silhouetteEdges++;
+        return;
+      }
+      const gap =
+        Math.abs(ids[a * 2] - ids[b * 2]) + Math.abs(ids[a * 2 + 1] - ids[b * 2 + 1]);
+      if (gap === 0) {
+        // 同一 ID：要么真是同一件物体（正常），要么撞桶（缺陷）。
+        // 用深度当旁证 —— 两件挨着的物体几乎总有深度差。
+        if (Math.abs(depths[a] - depths[b]) > thresholds.depth) idBlindButDepthSees++;
+        return;
+      }
+      objectEdges++;
+      if (gap < minGap) minGap = gap;
+      if (gap < thresholds.id) belowThreshold++;
+    };
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = y * width + x;
+        if (isBackground[i] === 1) background++;
+        else {
+          // 量化到 1/512 两维再计数：不量化会把 MSAA resolve 出来的中间值当成新桶，
+          // 数出来的「不同 ID 数」会远大于物件数而毫无意义。
+          buckets.add(
+            (Math.round(ids[i * 2] * 512) << 10) | Math.round(ids[i * 2 + 1] * 512),
+          );
+        }
+        // 水平 + 垂直邻居：与描边那次十字采样覆盖的是同一批边。
+        if (x + 1 < width) measure(i, i + 1);
+        if (y + 1 < height) measure(i, i + width);
+      }
+    }
+
+    return {
+      width,
+      height,
+      distinctIds: buckets.size,
+      // 没量到任何物件交界 ⇒ 报 0 而不是 Infinity：
+      // 「没有样本」和「可分差是满量程」是两件事，判据要分得开。
+      minGap: Number.isFinite(minGap) ? Number(minGap.toFixed(5)) : 0,
+      objectEdges,
+      silhouetteEdges,
+      belowThreshold,
+      idBlindButDepthSees,
+      backgroundShare: Number(((background / count) * 100).toFixed(2)),
+      idThreshold: thresholds.id,
+      depthThreshold: thresholds.depth,
+      // 全 0 = readPixels 什么都没写进来（尺寸不对 / 类型不可读）。
+      // 那时上面所有数都是假的，必须让判据看得见这件事而不是读到「一切正常」。
+      readFailed: buckets.size === 0 && background === 0 ? 1 : 0,
+    };
+  }
+
   private applyQuality(): void {
     const settings = this.governor.current;
     // 降档 = 内部分辨率更低（targetHeight 更小 → 整数倍率更大）→ 更省。
@@ -2750,6 +2876,16 @@ export class Game {
         };
         return base;
       },
+      /**
+       * G3-a：回读通道附件，量「面 ID 能不能分开**真正相邻**的物体」。
+       *
+       * 这条读数是 G3 全部阈值的地基。参考笔记 §6 第 4 条一直标着 `待验证`，
+       * 理由写得很清楚：ID 是 `fract()` 出来的连续标量，量化到 8 位之后
+       * 「两个相邻物体的可分差」可能小于噪声 —— 而**判据要按可分差设计，不是按
+       * 「看起来有描边」设计**。抄参考的数值不行：他的场景尺度（树/叶子）与我们
+       * 的（一米级柜体 + 几厘米的币）完全不同。
+       */
+      gbufferReport: () => this.gbufferReport(),
       /**
        * 招牌显示屏的**实测读数**（R3-U4）。
        *

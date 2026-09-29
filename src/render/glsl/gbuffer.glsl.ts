@@ -26,10 +26,20 @@ import { HASH3_GLSL } from './noise.glsl';
  * （它们之间本来就该有线）。没有实例的件退化成 `modelMatrix` 的平移列。
  */
 
-/** 顶点着色器要传给片元的面 ID。 */
+/**
+ * 顶点着色器要传给片元的面 ID。
+ *
+ * ★ 为什么是 **vec2 而不是一个 float**（G3-a 的实测逼出来的）：
+ * 单通道 ID 存进 8 位 alpha 之后只有 256 个桶，而币床上有约 300 枚币 ——
+ * 生日悖论下**必然**撞桶，撞上的两枚币之间永远不会有线（实测：本帧只出现
+ * 233 个不同桶，且「相邻且不同」的 ID 最小差只有 1/255，按 0.02 的阈值
+ * 有 13% 的物件交界像素被直接漏掉）。
+ * 两个独立哈希写进**半浮点**附件之后，可分度从 256 抬到约 1024×1024，
+ * 撞桶概率掉到可以忽略；代价是描边那里多一次通道比较，不是多一次采样。
+ */
 export const GBUFFER_VERTEX_DECL = [
   /* glsl */ `
-varying float vSurfaceId;
+varying vec2 vSurfaceId;
 `,
   HASH3_GLSL,
 ].join('\n');
@@ -45,15 +55,13 @@ export const GBUFFER_VERTEX_ASSIGN = /* glsl */ `
 			sdCenter = instanceMatrix * sdCenter;
 		#endif
 		sdCenter = modelMatrix * sdCenter;
-		// 乘 4.7 再 hash：中心都是「整厘米级」的小数，直接喂给 hash 会让相邻物体的
-		// hash 输入只差最后一两位，输出的分布仍可用但**可分差**变小。抬一个无理倍率
-		// 把三个分量打散，比事后调描边阈值便宜。
-		//
-		// ★ 再乘 0.9 是**留出通道余量**：fract 的值域是 [0,1)，而最后一遍要靠
-		// 「alpha 有没有被写过」把**背景**从色调映射里排除出去（背景是 glClear 填的，
-		// 清出来的 alpha 是 1）。留出 10% 的间隔之后，这个判据是**确定成立**的，
-		// 而不是「某个物体的 hash 恰好落在 0.99 附近就整件不映射」。
-		vSurfaceId = sdHash13( sdCenter.xyz * 4.7 ) * 0.9;
+		// 乘无理倍率再 hash：中心都是「整厘米级」的小数，直接喂给 hash 会让相邻物体的
+		// hash 输入只差最后一两位。两个分量取**不同的**倍率（4.7 / 7.31），
+		// 于是它们是两次近似独立的抽样 —— 撞桶要两维同时撞上。
+		vSurfaceId = vec2(
+			sdHash13( sdCenter.xyz * 4.7 ),
+			sdHash13( sdCenter.xyz * 7.31 )
+		);
 	}
 `;
 
@@ -67,7 +75,7 @@ export const GBUFFER_VERTEX_ASSIGN = /* glsl */ `
 export const GBUFFER_FRAGMENT_DECL = /* glsl */ `
 layout(location = 1) out highp vec4 gInfo;
 uniform float uDepthScale;
-varying float vSurfaceId;
+varying vec2 vSurfaceId;
 `;
 
 /**
@@ -86,13 +94,22 @@ varying float vSurfaceId;
  *    描边就会浮在币上 —— 与其到 G3 再想办法剔除，不如在这里就不让它参与。
  *
  * `vViewPosition` = `-mvPosition`（`meshtoon.glsl.js:42`），所以它的 `z` 就是**正的视深**。
+ *
+ * ## 通道的现在分工（G3-a 之后）
+ *
+ * - 附件 0 的 `a` = `vSurfaceId.x * 0.9`。乘 0.9 是**留出哨兵余量**：
+ *   `fract` 的值域是 [0,1)，而最后一遍要靠「alpha 有没有被写过」把背景从色调映射里
+ *   排除出去（背景由 `glClear` 填，清出来的 alpha 恒为 1）。留出 10% 之后这个判据
+ *   是**确定成立**的，而不是「某个物体的 hash 恰好落在 0.99 附近就整件不映射」。
+ * - 附件 1 = `(视深, ID.x, ID.y, 线宽权重)`。**半浮点**，所以 ID 在这里能拿到
+ *   约 10 位精度 × 两维，而不是 alpha 那种 8 位一维（撞桶的根因，见上面 `GBUFFER_VERTEX_DECL`）。
  */
 export const GBUFFER_WRITE = /* glsl */ `
 	#ifdef OPAQUE
-		gl_FragColor.a = vSurfaceId;
-		gInfo = vec4( vViewPosition.z / uDepthScale, 0.0, 0.0, 1.0 );
+		gl_FragColor.a = vSurfaceId.x * 0.9;
+		gInfo = vec4( vViewPosition.z / uDepthScale, vSurfaceId, 1.0 );
 	#else
-		gInfo = vec4( vViewPosition.z / uDepthScale, 0.0, 0.0, 0.0 );
+		gInfo = vec4( vViewPosition.z / uDepthScale, vSurfaceId, 0.0 );
 	#endif
 `;
 

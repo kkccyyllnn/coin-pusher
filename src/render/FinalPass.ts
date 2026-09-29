@@ -41,13 +41,16 @@ export const FINAL_VIEW_DEPTH = 1;
 export const FINAL_VIEW_ID = 2;
 
 /**
- * 描边的 ID 梯度阈值（**占位值，待 G3 实测替换**）。
+ * 面 ID 的梯度阈值（G3-b：**实测值，不再是占位**）。
  *
- * 面 ID 被压在 [0, 0.9)，背景 alpha 是 1 ⇒ 「物件轮廓」的梯度天然 ≥ 0.1，
- * 所以 0.02 这个量级只会漏掉「两个 ID 恰好很近」的相邻物件，不会漏掉轮廓。
- * 真正的判据要等 G3 那条「相邻物体最小可分差」的测量出来。
+ * 实测过程见 `Game.gbufferReport()`。两维半浮点 ID 的「相邻且不同」最小可分差
+ * 远大于下面这个数，所以阈值与噪声之间留了足够余量（判据要离噪声远，不是离读数近）。
  */
-export const FINAL_PASS_OUTLINE_THRESHOLD = 0.02;
+export const FINAL_PASS_ID_THRESHOLD = 0.004;
+/** 深度梯度阈值（以「视深 / `GBUFFER_DEPTH_SCALE`」为单位；0.005 ≈ 10 厘米）。 */
+export const FINAL_PASS_DEPTH_THRESHOLD = 0.005;
+/** 掠射放宽系数：面越侧对镜头，深度门槛抬得越高（越不画线）。 */
+export const FINAL_PASS_DEPTH_GRAZING = 0.02;
 
 /**
  * 解析 `?view=` 的通道视图（形状照 `PixelScale.readPixelOverride`：
@@ -91,11 +94,12 @@ export class FinalPass {
         tInfo: { value: null as THREE.Texture | null },
         uView: { value: FINAL_VIEW_SCENE },
         toneMappingExposure: { value: 1 },
-        // G2 描边：0 = 逐字恒等（判据靠这个）。步长在 `render()` 里按 **CSS 尺寸**算，
-        // 阈值此刻是占位 —— 见 `glsl/outline.glsl.ts` 里那条 `待验证`。
+        // G2/G3 描边：0 = 逐字恒等（判据靠这个）。步长在 `render()` 里按 **CSS 尺寸**算。
         uOutlineScale: { value: 0 },
         uOutlineStep: { value: new THREE.Vector2(1 / 1280, 1 / 720) },
-        uOutlineThreshold: { value: FINAL_PASS_OUTLINE_THRESHOLD },
+        uIdThreshold: { value: FINAL_PASS_ID_THRESHOLD },
+        uDepthThreshold: { value: FINAL_PASS_DEPTH_THRESHOLD },
+        uDepthGrazing: { value: FINAL_PASS_DEPTH_GRAZING },
       },
       vertexShader: /* glsl */ `
 varying vec2 vUv;
@@ -114,14 +118,19 @@ varying vec2 vUv;
 ${OUTLINE_GLSL}
 void main() {
 	vec4 scene = texture2D( tScene, vUv );
+	vec4 info = texture2D( tInfo, vUv );
 	// 调试视图**故意**不走色调映射与编码：要看的是附件里的原始数值，
 	// 套上 ACES 之后 0.5 和 0.6 的差别会被压平，反而看不出通道是不是空的。
 	if ( uView > 1.5 ) {
-		gl_FragColor = vec4( vec3( scene.a ), 1.0 );
+		// 面 ID：两维各占一个通道，所以这里画出来的是**彩色**的。
+		// 该看到的形态是「逐块纯色」——一件物体一个颜色；
+		// 如果整屏是噪点，说明 ID 用了逐片元坐标而不是物体中心（最常见的抄错）；
+		// 如果两件挨着的物体颜色**完全一样**，那就是撞桶（G3-a 量过的失效形态）。
+		gl_FragColor = vec4( info.gb, 0.0, 1.0 );
 		return;
 	}
 	if ( uView > 0.5 ) {
-		gl_FragColor = vec4( vec3( texture2D( tInfo, vUv ).r ), 1.0 );
+		gl_FragColor = vec4( vec3( info.r ), 1.0 );
 		return;
 	}
 	// ★ 背景**不参与色调映射** —— 这是 G1 踩出来的，不是设计偏好。
@@ -159,6 +168,20 @@ ${OUTLINE_APPLY}
       depthWrite: false,
     });
     this.scene.add(new THREE.Mesh(geometry, this.material));
+  }
+
+  /**
+   * 当前生效的三条阈值，交给 `gbufferReport()` 做实测对照。
+   *
+   * 单独交出去而不是让 harness 再写一遍常量：判据要能回答
+   * 「**按现在这些阈值**会漏掉多少条边」，读的实际生效值必须是同一个。
+   */
+  get outlineThresholds(): { id: number; depth: number; grazing: number } {
+    return {
+      id: this.material.uniforms.uIdThreshold.value as number,
+      depth: this.material.uniforms.uDepthThreshold.value as number,
+      grazing: this.material.uniforms.uDepthGrazing.value as number,
+    };
   }
 
   /**

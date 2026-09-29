@@ -3038,6 +3038,46 @@ async function runPerf(page, context) {
     `空转 ${mats?.rimBreakIdle} 份`,
   );
 
+  // ── G3：描边通道的**可分性**实测（参考笔记 §6 第 4 条，至此关掉 `待验证`）──
+  //
+  // 这条判据读的是回传附件算出来的数，不是截图。理由写在 `Game.gbufferReport()`：
+  // 「这条边描没描出来」在截图里只能定性看，而它真正的答案是「相邻两像素的 ID 差有多小」。
+  // 面 ID 是 `fract()` 出来的，**不是唯一 ID** —— 两个挨着的物件完全可能撞进同一个桶，
+  // 那种边永远不会出现，而它在截图里长得和「阈值调高了」一模一样。
+  //
+  // ★ 四条一起看，缺一条都会假绿：
+  // ① `readFailed` —— 回读没拿到数据时下面三个数全是 0，看着比什么都「干净」。
+  // ② `objectEdges` 要有量 —— 判据是**比例**，n 太小的话 0 漏检不代表机制对
+  //   （与「阈值要离噪声远，先问判据在哪个 n 上求值」是同一条纪律）。
+  // ③ `belowThreshold` —— 被当前 ID 阈值漏掉的真实交界。
+  // ④ `idBlindButDepthSees` —— ID 撞桶、只能靠深度兜住的那批。它不该为零
+  //   （两枚并排的币本来就只能靠 ID 分），但必须**远小于** objectEdges，
+  //   否则说明 ID 通道在退化，描边实际上全靠深度在撑。
+  const gb = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.gbufferReport?.() ?? null);
+  const edgeSample = gb?.objectEdges ?? 0;
+  console.log(
+    `  [ID 可分性] 交界样本 ${edgeSample}，最小可分差 ${gb?.minGap}，` +
+      `阈值 id=${gb?.idThreshold} depth=${gb?.depthThreshold}，` +
+      `漏检 ${gb?.belowThreshold}，ID 盲但深度可见 ${gb?.idBlindButDepthSees}，` +
+      `不同 ID 桶 ${gb?.distinctIds}，背景占 ${gb?.backgroundShare}%`,
+  );
+  check('通道回读成功（读不到数据时下面几条全是假绿）', (gb?.readFailed ?? 1) === 0, `readFailed=${gb?.readFailed}`);
+  check(
+    '这一帧量到了足够多的物件交界（判据是比例，n 太小没有意义）',
+    edgeSample >= 5000,
+    `objectEdges=${edgeSample}`,
+  );
+  check(
+    'ID 阈值没有漏掉真实交界（belowThreshold 占交界数 < 0.5%）',
+    edgeSample > 0 && (gb?.belowThreshold ?? 1e9) / edgeSample < 0.005,
+    `${gb?.belowThreshold}/${edgeSample} = ${(((gb?.belowThreshold ?? 0) / Math.max(1, edgeSample)) * 100).toFixed(3)}%`,
+  );
+  check(
+    'ID 撞桶的边只占极少数（深度在兜底，但 ID 才是主判据）',
+    edgeSample > 0 && (gb?.idBlindButDepthSees ?? 1e9) / edgeSample < 0.005,
+    `${gb?.idBlindButDepthSees}/${edgeSample}`,
+  );
+
   // ── V4：币面像素贴图 ──
   // 币的颜色链路有四层（调色板 → canvas 逐纹素 → 色带 → ACES），
   // 任何一层出错在截图里都只表现为「颜色不太对」。所以判据直接读**纹素**，
