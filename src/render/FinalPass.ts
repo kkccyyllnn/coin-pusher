@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { OUTLINE_APPLY, OUTLINE_GLSL } from './glsl/outline.glsl';
 
 /**
  * 最后一遍出画（G1-c）。
@@ -38,6 +39,15 @@ import * as THREE from 'three';
 export const FINAL_VIEW_SCENE = 0;
 export const FINAL_VIEW_DEPTH = 1;
 export const FINAL_VIEW_ID = 2;
+
+/**
+ * 描边的 ID 梯度阈值（**占位值，待 G3 实测替换**）。
+ *
+ * 面 ID 被压在 [0, 0.9)，背景 alpha 是 1 ⇒ 「物件轮廓」的梯度天然 ≥ 0.1，
+ * 所以 0.02 这个量级只会漏掉「两个 ID 恰好很近」的相邻物件，不会漏掉轮廓。
+ * 真正的判据要等 G3 那条「相邻物体最小可分差」的测量出来。
+ */
+export const FINAL_PASS_OUTLINE_THRESHOLD = 0.02;
 
 /**
  * 解析 `?view=` 的通道视图（形状照 `PixelScale.readPixelOverride`：
@@ -81,6 +91,11 @@ export class FinalPass {
         tInfo: { value: null as THREE.Texture | null },
         uView: { value: FINAL_VIEW_SCENE },
         toneMappingExposure: { value: 1 },
+        // G2 描边：0 = 逐字恒等（判据靠这个）。步长在 `render()` 里按 **CSS 尺寸**算，
+        // 阈值此刻是占位 —— 见 `glsl/outline.glsl.ts` 里那条 `待验证`。
+        uOutlineScale: { value: 0 },
+        uOutlineStep: { value: new THREE.Vector2(1 / 1280, 1 / 720) },
+        uOutlineThreshold: { value: FINAL_PASS_OUTLINE_THRESHOLD },
       },
       vertexShader: /* glsl */ `
 varying vec2 vUv;
@@ -96,6 +111,7 @@ uniform sampler2D tScene;
 uniform sampler2D tInfo;
 uniform float uView;
 varying vec2 vUv;
+${OUTLINE_GLSL}
 void main() {
 	vec4 scene = texture2D( tScene, vUv );
 	// 调试视图**故意**不走色调映射与编码：要看的是附件里的原始数值，
@@ -136,6 +152,7 @@ void main() {
 	#endif
 	gl_FragColor = vec4( mapped, 1.0 );
 	#include <colorspace_fragment>
+${OUTLINE_APPLY}
 }
 `,
       depthTest: false,
@@ -150,19 +167,31 @@ void main() {
    * @param exposure 与 `renderer.toneMappingExposure` **同一个值**：
    *   色调映射搬到这里来了，所以曝光也得由这里交给 shader。两处不同步就是
    *   「面板上拖滑杆没反应」，所以由调用方每次现给（不在本类里存副本）。
+   * @param cssWidth/cssHeight 描边步长的分母。**必须是 CSS 尺寸而不是 RT 尺寸**：
+   *   `PixelScale` 的整数倍率档会把内部尺寸缩小，用 RT 尺寸当分母的话
+   *   切档瞬间线宽就跳一倍（见 `glsl/outline.glsl.ts` 那条 ★）。
    */
   render(
     renderer: THREE.WebGLRenderer,
     color: THREE.Texture,
     info: THREE.Texture,
-    exposure: number,
-    view: number,
+    params: {
+      exposure: number;
+      view: number;
+      outlineScale: number;
+      cssWidth: number;
+      cssHeight: number;
+    },
   ): void {
     renderer.setRenderTarget(null);
     this.material.uniforms.tScene.value = color;
     this.material.uniforms.tInfo.value = info;
-    this.material.uniforms.uView.value = view;
-    this.material.uniforms.toneMappingExposure.value = exposure;
+    this.material.uniforms.uView.value = params.view;
+    this.material.uniforms.toneMappingExposure.value = params.exposure;
+    this.material.uniforms.uOutlineScale.value = params.outlineScale;
+    const step = this.material.uniforms.uOutlineStep.value as THREE.Vector2;
+    // CSS 尺寸取整到至少 1 像素：0 会把这个向量变成 Infinity，表现是整屏被描黑。
+    step.set(1 / Math.max(1, params.cssWidth), 1 / Math.max(1, params.cssHeight));
     renderer.render(this.scene, this.camera);
   }
 

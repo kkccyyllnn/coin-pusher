@@ -68,6 +68,42 @@ async function canvasSize(page: Page) {
   });
 }
 
+/**
+ * 两张同尺寸 PNG 的差异摘要：像素数 + 包围盒。
+ *
+ * 为什么不用 `Buffer.compare(a,b) === 0` 直接断言：失败信息只会给一个 `1`，
+ * 而「差在哪」决定了这是动画没冻住、画质降档、还是合成器抖动 —— 三种病因的修法完全不同。
+ */
+function diffSummary(a: PNG, b: PNG): string {
+  if (a.width !== b.width || a.height !== b.height) {
+    return `尺寸不同 ${a.width}x${a.height} vs ${b.width}x${b.height}（多半是内部分辨率变了）`;
+  }
+  let count = 0;
+  let minX = a.width;
+  let minY = a.height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let pixel = 0; pixel < a.width * a.height; pixel++) {
+    const offset = pixel * 4;
+    if (
+      a.data[offset] !== b.data[offset] ||
+      a.data[offset + 1] !== b.data[offset + 1] ||
+      a.data[offset + 2] !== b.data[offset + 2]
+    ) {
+      count++;
+      const x = pixel % a.width;
+      const y = (pixel / a.width) | 0;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+  }
+  return count === 0
+    ? '无差异'
+    : `差异 ${count} 像素，包围盒 x[${minX}..${maxX}] y[${minY}..${maxY}]（画布 ${a.width}x${a.height}）`;
+}
+
 async function table(page: Page) {
   return page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.table?.() ?? null);
 }
@@ -358,6 +394,75 @@ test.describe('币塔街机机台', () => {
     await waitFrames(page, 5);
     const after = await page.locator('#game-canvas').screenshot();
     expect(before.equals(after)).toBe(false);
+  });
+
+  test('描边：关掉逐像素全等、开着数得出边缘（G2 的恒等性判据）', async ({ page }) => {
+    // ★ 只在 desktop-chrome 上跑。理由不是「移动视口不重要」，是**这条判据的形式**
+    // 在 mobile-safari 项目上站不住：同一冻结帧连拍两次，实测差 55529 个像素
+    //（包围盒横贯币床，y[383..1446]），而我用 `devices['iPhone 13']` 的完整描述符
+    //（含 isMobile/hasTouch/DPR 3）单独复现时，chromium 与 webkit 都是**逐字节 0 差**。
+    // ⇒ 差异出在 playwright×webkit 的画布取回路径上，与描边无关。
+    // 把恒等判据放宽成「比例阈值」也能过，但那样它就再也抓不到 G1 那类
+    // 「整幅微微变暗」了 —— 宁可只在能证的地方证。
+    // 待办：谁定位到 webkit 那条抖动（怀疑是 preserveDrawingBuffer:false 下的
+    // 合成器重采样），就把这个 skip 摘掉。
+    test.skip(
+      test.info().project.name !== 'desktop-chrome',
+      '逐字节恒等判据依赖帧缓冲可确定性取回；webkit 上不可（见注释）',
+    );
+    await page.goto('/');
+    // 冻结：不冻结的话两次截图之间币堆会继续演化，量到的差就分不清是描边还是动画。
+    // （G0 判 rim 断线时就是这么被自动演示的盘面污染过一次。）
+    await page.evaluate(async () => {
+      const hooks = window.__THREE_GAME_TEST_HOOKS__;
+      await hooks?.setReducedMotion?.(true);
+      hooks?.setState?.('ready');
+      await hooks?.setPausedForScreenshot?.(true);
+      // 显式归零，**不依赖出厂默认**：默认值以后会随判图调整（G2 现在就是 0.35），
+      // 依赖它的话这条判据会在某天早上突然变成「off 帧里本来就有线」。
+      hooks?.setTuning?.({ outlineScale: 0 });
+      // ★ 钉住画质档：`PerformanceGovernor` 会在连续低帧窗口后降档，而降档 =
+      //   改 `pixelTargetHeight` = **改内部分辨率** ⇒ 两张图不可能逐字节相同。
+      hooks?.setQuality?.('high');
+    });
+    // 多等几帧再取基线：开局有若干**节流/倒计时**的东西还在落定（招牌 LED 最多
+    // 125 ms 重画一次，见 `render/marqueeScreen.ts`；`startRun` 扣买入会让账本再变一次）。
+    await waitFrames(page, 30);
+
+    const shot = async () => PNG.sync.read(await page.locator('#game-canvas').screenshot());
+    const off = await shot();
+    const offAgain = await shot();
+    // 先证明「冻结 + 同一设置」真的是确定性的，否则后面两条比较都没有意义。
+    expect(Buffer.compare(off.data, offAgain.data), diffSummary(off, offAgain)).toBe(0);
+
+    await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setTuning?.({ outlineScale: 0.35 }));
+    await waitFrames(page, 3);
+    const on = await shot();
+
+    // 描边是**压暗**，所以两个方向分开数：变暗的像素必须成群（有线），
+    // 变亮的必须几乎没有（有的话说明 mask 串到了别的地方）。
+    let darker = 0;
+    let brighter = 0;
+    for (let pixel = 0; pixel < off.width * off.height; pixel++) {
+      const offset = pixel * 4;
+      const a =
+        0.2126 * off.data[offset] + 0.7152 * off.data[offset + 1] + 0.0722 * off.data[offset + 2];
+      const b =
+        0.2126 * on.data[offset] + 0.7152 * on.data[offset + 1] + 0.0722 * on.data[offset + 2];
+      if (a - b > 8) darker++;
+      else if (b - a > 8) brighter++;
+    }
+    const total = off.width * off.height;
+    expect(darker / total, '描边开着应当至少描出 1% 的像素').toBeGreaterThan(0.01);
+    expect(brighter / total, '描边只该压暗，不该提亮').toBeLessThan(0.001);
+
+    // ★ 恒等性（这条才是主判据）：关掉之后必须与开之前**逐字节全等**。
+    // 它是逐事件恒等式而不是分布统计，所以能钉住「效果没接到但画面看着差不多」，
+    // 也能钉住色彩管线被顺手改动 —— G1 那种「整幅微微变暗」在这里会直接红。
+    await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setTuning?.({ outlineScale: 0 }));
+    await waitFrames(page, 3);
+    const offAfter = await shot();
+    expect(Buffer.compare(off.data, offAfter.data), 'outlineScale 归零必须逐像素回到基线').toBe(0);
   });
 
   test('画质分档只改渲染参数，不改盘面与返值规则', async ({ page }) => {

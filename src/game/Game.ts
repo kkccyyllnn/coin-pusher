@@ -999,13 +999,14 @@ export class Game {
     this.renderer.render(this.scene, this.camera);
     this.sceneDrawCalls = this.renderer.info.render.calls;
     this.sceneTriangles = this.renderer.info.render.triangles;
-    this.finalPass.render(
-      this.renderer,
-      this.gbuffer.color,
-      this.gbuffer.info,
-      this.renderer.toneMappingExposure,
-      this.finalView,
-    );
+    this.finalPass.render(this.renderer, this.gbuffer.color, this.gbuffer.info, {
+      exposure: this.renderer.toneMappingExposure,
+      view: this.finalView,
+      outlineScale: this.tuning.outlineScale,
+      // CSS 尺寸（不是 RT 尺寸）：见 `FinalPass.render` 与 `glsl/outline.glsl.ts`。
+      cssWidth: this.renderer.domElement.clientWidth,
+      cssHeight: this.renderer.domElement.clientHeight,
+    });
     // 第二遍又清一次，所以此刻 `info` 里只剩最后一遍自己 —— 加起来才是这一帧的全部。
     this.frameDrawCalls = this.sceneDrawCalls + this.renderer.info.render.calls;
     this.frameTriangles = this.sceneTriangles + this.renderer.info.render.triangles;

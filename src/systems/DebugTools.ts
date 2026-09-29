@@ -26,6 +26,15 @@ export type GameTuning = {
   coinSolverIterations: number;
   cameraFov: number;
   exposure: number;
+  /**
+   * 屏幕空间描边强度（G2）。0 = **逐字恒等**（这条不是「效果弱」，是判据：
+   * 关掉必须与开之前逐像素全等，见 `glsl/outline.glsl.ts`）。
+   *
+   * 放在 `tuning` 而不是只留一个常量，是因为 A/B 需要**同一帧内**只换这一个变量：
+   * 改源码 + 重载会让币堆/滚筒全部重新演化，两次截图的差就分不清是描边还是动画
+   *（G0 判 rim 断线时就是这么被污染过一次，最后靠 `setState('ready')` + 暂停才量准）。
+   */
+  outlineScale: number;
   /** 内部分辨率的目标高度上限（见 `render/PixelScale.ts`）。调低 = 倍率更大 = 更省。 */
   pixelTargetHeight: number;
   /** 放大方式：true = 最近邻（块状像素），false = 平滑。**不影响内部分辨率**。 */
@@ -87,6 +96,12 @@ export function createDefaultTuning(): GameTuning {
     coinSolverIterations: COIN.additionalSolverIterations,
     cameraFov: 42,
     exposure: 1.06,
+    // 描边默认开着（0.35）。这个数是**看图定的**，不是推出来的：同一冻结帧上
+    // 0.35 压暗 5.4% 的像素（= 所有轮廓与物件交界），0.7 只多到 5.8% 但每条线
+    // 深一倍 —— 币堆那么密，再粗就开始糊成一团。判完 G3 的深度/法线通道之后要回看。
+    // ⚠️ 出厂值非 0 ⇒ `visual.spec` 那条恒等判据**显式**把 outlineScale 设成 0 再取基线，
+    //   不能依赖这个默认值。
+    outlineScale: 0.35,
     pixelTargetHeight: PIXEL_SCALE_DEFAULTS.targetHeight,
     pixelated: PIXEL_SCALE_DEFAULTS.pixelated,
     coinTexelScale: 2,
@@ -255,6 +270,7 @@ export class DebugTools {
     const folder = this.gui.addFolder('镜头与画面');
     folder.add(this.tuning, 'cameraFov', 24, 70, 1).name('镜头 FOV');
     folder.add(this.tuning, 'exposure', 0.6, 1.8, 0.01).name('曝光');
+    folder.add(this.tuning, 'outlineScale', 0, 1, 0.05).name('描边强度（G2）');
     folder.add(this.tuning, 'pixelTargetHeight', 120, 720, 20).name('像素目标高度');
     folder.add(this.tuning, 'pixelated').name('像素化');
     folder
