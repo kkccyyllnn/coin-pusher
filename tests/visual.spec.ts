@@ -104,6 +104,32 @@ function diffSummary(a: PNG, b: PNG): string {
     : `差异 ${count} 像素，包围盒 x[${minX}..${maxX}] y[${minY}..${maxY}]（画布 ${a.width}x${a.height}）`;
 }
 
+/**
+ * 以 `ref` 为基线，统计「被压暗 > 8」的像素占比与这些像素上的平均压暗量。
+ *
+ * 8 是刻意选的：三个通道合计 8（≈每通道 2.7）在 8 位图上是明显的抖动级，
+ * 只有真正的压暗才会稳定越过它。
+ */
+function darkenStats(ref: PNG, shot: PNG) {
+  const lum = (data: Uint8Array, o: number) =>
+    0.2126 * data[o] + 0.7152 * data[o + 1] + 0.0722 * data[o + 2];
+  let covered = 0;
+  let sum = 0;
+  let brightened = 0;
+  const total = ref.width * ref.height;
+  for (let pixel = 0; pixel < total; pixel++) {
+    const offset = pixel * 4;
+    const drop = lum(ref.data, offset) - lum(shot.data, offset);
+    if (drop > 8) {
+      covered++;
+      sum += drop;
+    } else if (-drop > 8) {
+      brightened++;
+    }
+  }
+  return { coverage: covered / total, meanDrop: covered ? sum / covered : 0, brightened };
+}
+
 async function table(page: Page) {
   return page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.table?.() ?? null);
 }
@@ -463,6 +489,108 @@ test.describe('币塔街机机台', () => {
     await waitFrames(page, 3);
     const offAfter = await shot();
     expect(Buffer.compare(off.data, offAfter.data), 'outlineScale 归零必须逐像素回到基线').toBe(0);
+  });
+
+  /**
+   * ★ 描边强度的**硬判据**（把「0.35 是看图定的」这件事变成可失败的检查）。
+   *
+   * ## 为什么不能只断言「强度 == 0.35」
+   *
+   * 那是把审美写死成常量：谁都不会去改它，但它也**永远不会**因为效果真的坏了而红。
+   * 强度真正对应的两件事是可测的：
+   *
+   * - **覆盖率**（有多少像素被描上线）—— 机制是否在工作。ID / 深度通道任一失效，
+   *   它会塌向 0；阈值设得太松或噪声进来了，它会涨向两位数。
+   * - **线深**（那些像素平均被压暗多少）—— 看不看得见、有没有把画面压死。
+   *
+   * ## 带是**量出来**的，不是拍的
+   *
+   * 同一冻结状态、同一固定机位，三次独立页面加载：桌面覆盖率 7.19 / 7.20 / 7.20 %、
+   * 线深 28.3 / 28.3 / 28.4 ⇒ 重复性约 0.01 个百分点，带不是被噪声限制的。
+   *
+   * ★ 但**只有线深是视口无关的量**：移动 390×664 上线深 28.0（与桌面 28.3 同），
+   *   覆盖率却是 13.75 %（桌面 7.20 %）—— 线宽按 CSS 像素恒定，窄视口里同样的线
+   *   自然占更高比例。所以硬带只立在线深上（12 ~ 45），覆盖率只立下界；
+   *   「描到噪声」那类失效交给 perf 里直接读附件的两条判据，不在这里重复。
+   *
+   * ## 噪声底**在同一测试里现测**
+   *
+   * 「判据要离噪声远」不能只写在注释里：先拍两张 `outlineScale = 0` 的帧算出噪声底，
+   * 再要求信号至少是它的 20 倍。webkit 的画布取回会抖（见上一条测试为什么只跑 desktop），
+   * 这里不靠 skip 回避，而是把抖动量本身测进来当基准。
+   */
+  test('描边强度落在硬带内：覆盖率与线深都量化可查，且随强度单调', async ({ page }) => {
+    await page.goto('/');
+    await page.evaluate(async () => {
+      const hooks = window.__THREE_GAME_TEST_HOOKS__;
+      await hooks?.setReducedMotion?.(true);
+      hooks?.setState?.('ready');
+      hooks?.setQuality?.('high');
+    });
+    // 机位由测试自己钉死，**不用 autoFit**：否则窗口大小与取景时序会改变覆盖率，
+    // 判据就变成了在测相机而不是在测描边。
+    await page.evaluate(() =>
+      window.__THREE_GAME_TEST_HOOKS__?.setCameraRig?.({
+        autoFit: false,
+        distance: 1.7,
+        yawDeg: 10,
+        pitchDeg: 18,
+        targetX: 0,
+        targetY: 0.45,
+        targetZ: 0.5,
+      }),
+    );
+    await page.waitForTimeout(1400);
+    await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setPausedForScreenshot?.(true));
+    await page.waitForTimeout(300);
+
+    const shot = async () => PNG.sync.read(await page.locator('#game-canvas').screenshot());
+    const at = async (scale: number) => {
+      await page.evaluate((v) => window.__THREE_GAME_TEST_HOOKS__?.setTuning?.({ outlineScale: v }), scale);
+      await page.waitForTimeout(320);
+      return shot();
+    };
+
+    // 出厂默认从**诊断快照**读，不在测试里抄第二份：抄了之后改默认值的人不会记得改这里，
+    // 判据就会去审一个已经不存在的强度。
+    const shipped = (await diagnostics(page))?.renderer?.outline?.scale ?? -1;
+    expect(shipped, '诊断快照要交出描边强度').toBeGreaterThanOrEqual(0);
+
+    const zero = await at(0);
+    const noiseFloor = darkenStats(zero, await at(0)).coverage;
+    const def = await at(shipped);
+    const stats = darkenStats(zero, def);
+
+    console.log(
+      `  [描边强度] 默认 ${shipped}：覆盖率 ${(stats.coverage * 100).toFixed(2)}%、` +
+        `线深 ${stats.meanDrop.toFixed(1)}；同设置连拍的噪声底 ${(noiseFloor * 100).toFixed(4)}%`,
+    );
+
+    // ① 信号必须远离噪声：覆盖率至少是「同设置连拍」抖动的 20 倍。
+    expect(stats.coverage, '覆盖率必须远大于同设置连拍的噪声底').toBeGreaterThan(
+      Math.max(0.001, noiseFloor * 20),
+    );
+    // ② 机制在工作：一条线都没描出来就是通道塌了。
+    expect(stats.coverage, '覆盖率低于 3% ⇒ 通道像在失效').toBeGreaterThanOrEqual(0.03);
+    // ★ 这里**刻意不设覆盖率上界**，是量出来的结论而不是偷懒：同一份描边代码，
+    //   桌面 1280×720 实测 7.20 %、移动 390×664 实测 13.75 % —— 线宽按 CSS 像素恒定
+    //  （见 `glsl/outline.glsl.ts` 那条 ★），视口越窄，同样长的线占的像素比例就越高。
+    //   所以上界测的是取景，不是对错。「描到噪声」那类失效由 perf 的
+    //   `belowThreshold` / `idBlindButDepthSees` 两条直接读附件的判据负责，不在这里重复。
+    // ③ 线深是**视口无关**的那一半（实测 28.3 与 28.0），所以硬带立在这里：
+    //   低于 12 基本看不见，高于 45 整幅开始糊成一团。
+    expect(stats.meanDrop, '线深低于 12 就基本看不见').toBeGreaterThanOrEqual(12);
+    expect(stats.meanDrop, '线深高于 45 画面开始糊成一团').toBeLessThanOrEqual(45);
+    // ④ 强度真的是在驱动这条线：单调，且没有中途饱和/被夹住。
+    const low = darkenStats(zero, await at(0.15)).meanDrop;
+    const high = darkenStats(zero, await at(0.7)).meanDrop;
+    expect(low, '0.15 档应当明显弱于默认档').toBeLessThan(stats.meanDrop);
+    expect(high, '0.7 档应当明显强于默认档').toBeGreaterThan(stats.meanDrop);
+    // ⑤ 描边只该压暗：不该出现成片的提亮（那是 mask 串到别处去了）。
+    expect(
+      stats.brightened / (def.width * def.height),
+      '不应出现成片提亮',
+    ).toBeLessThan(0.001);
   });
 
   test('画质分档只改渲染参数，不改盘面与返值规则', async ({ page }) => {

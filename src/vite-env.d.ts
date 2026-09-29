@@ -258,6 +258,8 @@ interface ThreeGameDiagnostics {
     triangles: number;
     geometries: number;
     textures: number;
+    /** 描边的当前生效值（强度 + 两条阈值）。判据读的就是这一份。 */
+    outline: { scale: number; id: number; depth: number; grazing: number };
   };
   canvas: {
     clientWidth: number;

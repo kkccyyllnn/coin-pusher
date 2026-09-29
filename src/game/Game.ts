@@ -4028,6 +4028,17 @@ export class Game {
         triangles: this.frameTriangles,
         geometries: info.memory.geometries,
         textures: info.memory.textures,
+        /**
+         * 描边的**当前生效值**（不是出厂值、不是调参表的镜像）。
+         *
+         * 立硬判据的前提是「判据读得到被审的那个数」：强度现在由 `tuning` 驱动
+         *（面板与测试都能改），如果快照里只有物理那几项，判据就只能自己抄一份默认值 ——
+         * 那就是第二份真源，改默认的人不会记得改它（与 `detailEnabled` 同一条理由）。
+         */
+        outline: {
+          scale: this.tuning.outlineScale,
+          ...this.finalPass.outlineThresholds,
+        },
       },
       canvas: {
         clientWidth: canvas.clientWidth,
