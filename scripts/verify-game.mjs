@@ -137,7 +137,15 @@ async function openGame(browser) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
   const page = await context.newPage();
   const errors = [];
-  page.on('pageerror', (error) => errors.push(error.message));
+  // ★ 页内错误**立刻**走 stderr：批若在几十局后崩在 Rapier 的「recursive use」上，真凶是
+  //   更早被吞掉的那次抛错（`errors` 要到批尾的「运行期无控制台/页面错误」才打印）。
+  //   stdout 必须保持干净给解算器读，所以这条只打 stderr。
+  page.on('pageerror', (error) => {
+    errors.push(error.message);
+    console.error(
+      `[pageerror] ${new Date().toISOString()}\n${error.stack ?? error.message}`
+    );
+  });
   page.on('console', (message) => {
     if (message.type() === 'error') errors.push(message.text());
   });
@@ -166,6 +174,33 @@ async function openGame(browser) {
 }
 
 const readState = (page) => page.evaluate(() => window.__THREE_GAME_DIAGNOSTICS__);
+
+/**
+ * 落体预算（米/秒）：币在这台机器上**只靠重力**能达到的最大速度。
+ * 两处判据吃的都是它（推板一轮后、⑥ 冷），差别只在要不要把喷泉那一截算进来。
+ *
+ * 收成一份派生式的原因：`:668` 原来写死 `6.3`、⑥ 冷原来写死
+ * `√(2·13·(1.45+0.08+0.186))`，两个都是 `constants.ts:176/:193` 推导的抄本 ——
+ * `gravity` 一旦调（R4 就在调接触相关的参数），两处会各自漂，判据自己变成第二份真源。
+ *
+ * - `gravity` 从诊断现读（`physics.tuning.gravity`，符号是负的 ⇒ 取绝对值），
+ *   读不到时兜回 13（`PHYSICS.gravity`）；**不能兜 0**，那会让 `NaN/Inf` 比较恒假。
+ * - 1.45（落币口高度）与 0.08（出币托盘深度）页面没暴露，按 `constants.ts:176` 具名并标出处。
+ * - 喷泉那一截按 `vy²/(2g)` 折成顶高，`2.2` 的出处是 `ShowDirector.ts:770` 的设计约束
+ *   `vy ≤ 2.2`；**不许再另外加一次 `2.2²`** —— 上抛动能已经换算成这一截顶高，
+ *   两项都算等于给同一份能量记两遍账（第一版实测 7.03 就是这么来的）。
+ */
+const DROP_HEIGHT_M = 1.45;
+const TRAY_DEPTH_M = 0.08;
+const FALLBACK_GRAVITY_MPS2 = 13;
+const FOUNTAIN_UPWARD_MPS = 2.2;
+
+function fallBudgetMps({ gravity, fountainUpwardMps = 0 } = {}) {
+  const g = Math.abs(gravity) || FALLBACK_GRAVITY_MPS2;
+  const extra = (fountainUpwardMps * fountainUpwardMps) / (2 * g);
+  return Math.sqrt(2 * g * (DROP_HEIGHT_M + TRAY_DEPTH_M + extra));
+}
+
 const readTable = (page) =>
   page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.table?.() ?? null).catch(() => null);
 const readCoins = (page) =>
@@ -663,10 +698,13 @@ async function runProbe(page) {
    * 一旦冒出 12、15 这种数，即使币被围板挡住、`anomalies` 依旧为 0，这条也会红。
    */
   const afterPusher = await readState(page);
+  // 这一段**不逼喷泉**，所以预算不含上抛那一截（`fountainUpwardMps` 缺省 0）。
+  const freeFallBudget = fallBudgetMps({ gravity: afterPusher?.physics?.tuning?.gravity });
   check(
     '推板走一轮后没有超出物理上限的能量注入',
-    (afterPusher?.peakSpikeSpeed ?? 99) <= 6.3,
-    `压速 ${afterPusher?.spikeClamps} 次，峰值 ${afterPusher?.peakSpikeSpeed} 米/秒（自由落体上限 6.3）`,
+    (afterPusher?.peakSpikeSpeed ?? 99) <= freeFallBudget,
+    `压速 ${afterPusher?.spikeClamps} 次，峰值 ${afterPusher?.peakSpikeSpeed} 米/秒` +
+      `（自由落体上限 ${freeFallBudget.toFixed(2)}）`,
   );
   return timeline;
 }
@@ -1077,7 +1115,10 @@ async function runPhysics(page) {
    *   两项都算就等于给同一份能量记两遍账（我第一版就这么写错，读出 7.03）。
    *   超过预算才说明「币的能量不是重力给的」，正是要抓的形态。
    */
-  const fallBudget = Math.sqrt(2 * 13 * (1.45 + 0.08 + 0.186));
+  const fallBudget = fallBudgetMps({
+    gravity: cold?.physics?.tuning?.gravity,
+    fountainUpwardMps: FOUNTAIN_UPWARD_MPS,
+  });
   check(
     `⑥ 冷：默认阈值 3 下护栏只许个位数、且截断前峰值 ≤ 落体预算 ${fallBudget.toFixed(2)} 米/秒`,
     coldDelivered &&
@@ -1105,7 +1146,8 @@ async function runPhysics(page) {
    * `peakSpikeSpeed` 记的正是这个返回值 ⇒ 它读的是「这枚币进护栏之前有多快」，
    * **不是**「律把币顶到了多快」。强制阈值 0.5 之后实测峰值 **6.671 米/秒**，
    * 而这个数恰好在这台机器自己的能量预算内：喷泉把币以 `vy ≤ 2.2` 向上抛出，
-   * 币从更高处落回出币线 ≈ √(2.2² + 2·13·1.72) ≈ **6.7 米/秒** ——
+   * 币从更高处落回出币线 ≈ √(2.2² + 2·13·**1.53**) ≈ **6.68 米/秒**（1.53 = 落币口 1.45 + 托盘 0.08；
+   * 这一式与 `fallBudgetMps` 的 `√(2g(1.45+0.08+2.2²/2g))` **代数恒等**，不是第三个预算）——
    * 也就是说 6.671 是「合法落速」，不是求解器造出来的能量。
    * 判据写错会把一条正常的读数变成假红，所以这里只保留**量得住的两项**：
    * 异常必须为 0、币必须一枚不少（喷泉给了 10 枚，所以只许升不许降）。
@@ -1124,7 +1166,8 @@ async function runPhysics(page) {
       (hot?.activeCoins ?? 0) + (settledHot - settledCold) >= (cold?.activeCoins ?? Infinity),
     `异常 ${hot?.anomalies}，活跃币 ${cold?.activeCoins}→${hot?.activeCoins}，` +
       `期间越线 ${settledHot - settledCold} 枚，截断前峰值 ${hot?.peakSpikeSpeed} 米/秒` +
-      `（对照：自由落体 6.3 / 含喷泉上抛回落 6.68 / 横向护栏 8。` +
+      `（对照：自由落体 ${fallBudgetMps({ gravity: hot?.physics?.tuning?.gravity }).toFixed(2)}` +
+      ` / 含喷泉上抛回落 ${fallBudget.toFixed(2)} / 横向护栏 8。` +
       `热分支的截断前峰值在 3.8~8.8 之间抖，四次观测里有一次 8.81 超出落体预算 ⇒ 逼热之后` +
       `横向护栏偶尔真会被等上；原因未查，这条**只作记录、不当判据**）`,
   );
@@ -1705,8 +1748,16 @@ async function runEconomy(page) {
     const after = await readStateFresh(page);
     const ledger = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
     const cashOutPostQuit = ledger?.cashOut ?? 0;
-    const { scoreEvents, cycles } = await readTelemetry(page);
+    const { scoreEvents, cycles, xixiEvents } = await readTelemetry(page);
     const crossed = cycles.length ? cycles[cycles.length - 1].coins : 0;
+    /* 摇奖与罚金按「每投」归一化才可比：R6② 把 win 拆成 3 同 / 4 同之后，
+       大奖次数与罚金次数都得除掉局长。`Telemetry.reset()` 在 `startRun()` 里调用
+       （`Game.ts:1778`）⇒ 这个数组本来就是每局清零的，直接取本局的、不用差分。
+       ⚠️ 只做**读数**不做判据：spin 事件在沉降中被 `shows.abort()` 作废时，
+       这里与 `diagnostics.endless.fines` 会差（`Game.ts:1666-1670`）。 */
+    const slotEvents = xixiEvents ?? [];
+    const spins = slotEvents.filter((event) => event.phase === 'spin').length;
+    const slotFines = slotEvents.reduce((sum, event) => sum + (event.fined ?? 0), 0);
 
     for (const event of scoreEvents) {
       crossingSamples.push({ kind: event.kind, combo: event.combo, hot: event.hot });
@@ -1732,6 +1783,8 @@ async function runEconomy(page) {
       wallet: after?.wallet ?? 0,
       cashOut: cashOutAtQuit,
       cashOutPostQuit,
+      spins,
+      slotFines,
       ledgerOk: ledgerOk(after),
     });
     console.log(
@@ -1740,7 +1793,9 @@ async function runEconomy(page) {
         `买入 ${runs[index].buyIn} + 赚进 ${runs[index].earned} + 跪求 ${runs[index].begged} ` +
         `− 消耗 ${runs[index].spent} = ${runs[index].chips} 筹码，` +
         `回存 ${runs[index].cashOut}（收工后活读 ${runs[index].cashOutPostQuit}），` +
-        `钱包 ${runs[index].wallet}`,
+        `钱包 ${runs[index].wallet} ` +
+        `摇奖 ${runs[index].spins}（${(runs[index].spins / Math.max(1, runs[index].drops)).toFixed(3)}/投）` +
+        `· 罚金 ${runs[index].slotFines}`,
     );
   }
 
@@ -1844,6 +1899,33 @@ async function runEconomy(page) {
     console.log(
       `  ${row.label}：单次越线期望 ${row.perCrossing.toFixed(3)} 筹码，` +
         `每枚筹码回收 ${row.unit.toFixed(3)}（成本 ${row.chips}）`,
+    );
+  }
+
+  // 逐种 / 逐连子的越线占比：**只加打印，不加判据**（计划步骤 2.5）。
+  // 为什么要在这一批量：返值表的整数档位能不能表示标定倍率，取决于 kind 的分布，
+  // 而这个分布除了这里没有第二个来源 —— `crossingSamples` 每条本来就带 kind 与 combo。
+  if (crossingSamples.length > 0) {
+    const byKind = new Map();
+    const byCombo = new Map();
+    for (const s of crossingSamples) {
+      byKind.set(s.kind, (byKind.get(s.kind) ?? 0) + 1);
+      byCombo.set(s.combo, (byCombo.get(s.combo) ?? 0) + 1);
+    }
+    const share = (n) => `${n}（${((n / crossingSamples.length) * 100).toFixed(1)}%）`;
+    console.log(
+      '  逐种越线占比：' +
+        [...byKind.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([kind, n]) => `${kind} ${share(n)}`)
+          .join('，'),
+    );
+    console.log(
+      '  逐连子越线占比：' +
+        [...byCombo.entries()]
+          .sort((a, b) => Number(a[0]) - Number(b[0]))
+          .map(([combo, n]) => `${combo} 连 ${share(n)}`)
+          .join('，'),
     );
   }
 
