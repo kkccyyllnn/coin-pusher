@@ -1046,15 +1046,39 @@ async function runPhysics(page) {
   const resting = bedCoins.filter((_, index) => !inDrain[index]);
   const draining = bedCoins.length - resting.length;
   const bedLowest = resting.reduce((min, coin) => Math.min(min, coin.y), Infinity);
-  // 平躺在地板上的币心高度 = 币半厚；留 2 毫米的求解器穿透余量。★ S13 起派生。
-  const FLAT_REST_Y = geo().halfThickness - 0.002;
+  /*
+   * 平躺在地板上的币心高度 = 币半厚（★ S13 起从 `coinGeometry()` 派生），
+   * 减去**与 ④ 同源**的静态穿透余量。
+   *
+   * 这里的余量原先写死 2 毫米，而 2 毫米**正好等于实测的静态穿透**
+   * （`constants.ts` 的 erp × 迭代标定表：erp 0.8 + 迭代 8 ⇒ 币↔机台 2.0 毫米）
+   * ⇒ 阈值贴在读数上、余量为零，红绿由 float64 的表示误差决定。×1.1 档实测：
+   * 最低币心 `0.00899999999999999932`，下限 `0.0090000000000000010547`，
+   * **相差 1.7e-18 米（1.7 阿米）**；「沉入最深」打印出来是 `0.0000 毫米`。
+   * pred 0.002 与 0.10 两臂读到的是**同一个 float64** ⇒ 与求解器参数无关，纯粹是这张彩票。
+   *
+   * 所以病因不是「绝对毫米没派生」（半厚早就派生了），而是**余量选在了读数上**——
+   * 乘 `COIN_SCALE` 只会把 ulp 彩票换个档位继续买，不是修法。
+   *
+   * 改成引用 ④ 的 `COIN_STATIC_LIMIT`：⑤ 量「币心比理想平躺位低多少」，
+   * ④ 量「币↔机台接触穿透多深」——**同一个物理量的两种读法**，不该由两套上限各说各话。
+   * 4 毫米对 2.0 毫米实测穿透留出一倍余量，且**不开盲区**：
+   * 这条判据要抓的原始缺陷是「整堆沉进地板」（币心掉到地板顶面以下 ⇒ 沉入 ≥ 一个半厚 11 毫米），
+   * 4 毫米仍留 7 毫米；任何超过 4 毫米的穿透 ④ 自己就会红。
+   * ⚠️ 这里是**引用** ④ 的常量，不是把 ④ 也派生化——④ 明确不乘 `COIN_SCALE`
+   * （理由见它上面那段「刻意是绝对米数」的注释）。
+   */
+  const FLAT_REST_Y = geo().halfThickness - COIN_STATIC_LIMIT;
   const sunkCount = resting.filter((coin) => coin.y < FLAT_REST_Y).length;
+  // 正数 = 最低币心还在下限之上（余量）；负数 = 已经沉到下限之下（沉入深度）。
+  const restMargin = bedLowest - FLAT_REST_Y;
   check(
     '⑤ 币床的币坐在台面上（没有整堆沉进地板）',
     resting.length > 0 && sunkCount === 0,
     `币床 ${bedCoins.length} 枚（其中 ${draining} 枚在排水口里，已排除），` +
       `沉入地板 ${sunkCount} 枚，` +
-      `最低币心 ${bedLowest.toFixed(4)} 米（下限 ${FLAT_REST_Y}）`,
+      `最低币心 ${bedLowest.toFixed(4)} 米（下限 ${FLAT_REST_Y}，` +
+      `离下限 ${(restMargin * 1000).toFixed(2)} 毫米）`,
   );
 
   // ── ⑥ R4-P3 的泄流律：既得**冷得下来**，也得**热得起来** ──

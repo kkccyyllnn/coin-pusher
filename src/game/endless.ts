@@ -79,7 +79,20 @@ const BED_BACK_ROWS = BED_ROWS - BED_FRONT_ROWS;
 const BED_BACK_Z_MAX = BED_Z_MIN + (BED_BACK_ROWS - 1) * BED_STEP_Z;
 const BED_FRONT_Z_MIN = BED_Z_MIN + BED_BACK_ROWS * BED_STEP_Z;
 
-const DECK_Z_MIN = -1.1;
+/**
+ * 上层币床的后界（最后一排的 z）。
+ *
+ * ★ **必须是派生量**。这条关系的两个自变量里，背板 `TABLE.backZ` 是机柜的物理事实，
+ * 而「贴着背板的那一排」的**实际后缘**随币半径与抖动走（两者都随 `?coin=` 档位变）：
+ * 币越大，同一排的中心就要越往前挪。原来这里写死 `−1.1`（= 在 ×1.2 档解出来的那个数），
+ * 于是**换档当场炸启动** —— 2026-09-30 把默认档位从 ×1.2 改到 ×1.1 时，
+ * `assertWallMeetsDeck` 立刻报「差 6.5 毫米」，机台直接起不来。
+ * 这正是本项目最贵的那一类缺陷：**手抄一个派生量的某一档取值**。
+ *
+ * 派生之后「末排贴着背板」在任何档位都恒成立，下面的守卫①退化成
+ * 「有人把这里改回字面量」的绊线（仍然留着，因为那是会发生的）。
+ */
+const DECK_Z_MIN = TABLE.backZ + MAX_JITTER + COIN.radius;
 const DECK_Z_MAX = -0.28;
 
 const BED_BACK = {
