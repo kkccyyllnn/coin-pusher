@@ -113,8 +113,9 @@ export class MarqueeScreen {
     const probeCtx = probe.getContext('2d', { willReadFrequently: true });
     if (!probeCtx) throw new Error('无法创建 2D 画布：颜色探针需要一张 1×1 离屏层');
     this.probeCtx = probeCtx;
-    // 字体在构造时定一次：`isWide()` 用 `measureText` 量宽度，
-    // 而量宽必须在**画之前**——字体留在 paint 里设的话，第一帧量的是 10px 默认字体。
+    // 字体在构造时定一次，之后**不**在 paint 里设：绘制层（`drawCrispLine`）只设
+    // 颜色与基线，字号由这里给。留在绘制里设的话，第一帧量到的是 10px 默认字体，
+    // 而 `distinctColors` 那条判据会照实报出一个「看起来正常」的值 —— 查不到。
     ctx.font = FONT;
     scratchCtx.font = FONT;
     this.texture = new THREE.CanvasTexture(canvas);
@@ -151,7 +152,7 @@ export class MarqueeScreen {
     this.canvas.width = next;
     // ⚠️ 改 canvas 尺寸会**重置该 2D 上下文的全部状态**（含 font），所以两张画布都要
     // 重新设字体。漏掉的话 `?model` 一拖檐板，屏上的字就会退回 10px 默认字体 ——
-    // 零报错，只是字变小、量宽也跟着错（`isWide()` 于是永远判错）。
+    // 零报错，只是字变小，而 `distinctColors` 那条判据照样是干净的个位数。
     this.scratch.width = next;
     this.scratch.height = H;
     this.ctx.font = FONT;
@@ -198,12 +199,21 @@ export class MarqueeScreen {
     }
     const line2 = this.subtitleLeft > 0 ? this.subtitleText : attract;
 
-    // 字幕超出一屏时滚动：offset 平移，不重画。
-    if (this.isWide(line2)) {
-      this.texture.offset.x = (this.texture.offset.x + delta * SCROLL_SPEED) % 1;
-    } else if (this.texture.offset.x !== 0) {
-      this.texture.offset.x = 0;
-    }
+    // 循环滚动（E）：**一直滚**，不再只在「放不下」时才滚。
+    //
+    // 理由是遮挡，不是好看。实测默认游玩机位下，DOM 覆盖层压掉了这块屏的
+    // **约 48%**（`#earned-block` 38.8% + 暂停/图鉴两个按钮各 4.6%），
+    // 而且这个比例随视口变（移动 390×664 又是另一套）。把内容「挪到没被挡的一边」
+    // 要跟着视口算，循环滚动不用 —— 内容自己会走到可见区。
+    //
+    // 代价说清楚：**会动的数字比静止的难读**。所以速度保持慢
+    //（0.07 圈/秒 ⇒ 一圈约 14 秒，账本行在可见区里停留的时间远大于扫过的时间）。
+    // 如果以后觉得账本行不该动，正确的改法是「账本行静止 + 只有字幕滚动」——
+    // 那需要把两行拆成两张贴片（多一个 draw call），不是在这里加个 if 就完事。
+    //
+    // 滚动仍然是 `offset.x` 平移采样窗口，**不重画纹理**（代价一个 uniform），
+    // 所以 `wrapS` 必须是 `RepeatWrapping`。
+    this.texture.offset.x = (this.texture.offset.x + delta * SCROLL_SPEED) % 1;
 
     this.repaintLeft -= delta;
     if (!this.dirty || this.repaintLeft > 0) return;
@@ -220,10 +230,6 @@ export class MarqueeScreen {
   /** 第一行：钱包 / 本段赚进。数字用千分位以外的一致性格式——点阵上逗号会糊。 */
   private line1(): string {
     return `钱包 ${this.ledger.wallet}  本局 +${this.ledger.earned}`;
-  }
-
-  private isWide(text: string): boolean {
-    return this.ctx.measureText(text).width > this.width - 8;
   }
 
   /**

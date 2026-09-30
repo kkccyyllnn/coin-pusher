@@ -5587,6 +5587,31 @@ async function runCabinet(page, context) {
     `单行=${singleLine} 两行=${twoLines}`,
   );
 
+  // ★ E（循环滚动）的守卫：内容必须**真的在动**。
+  //
+  // 为什么这条值得钉：遮挡是按视口算出来的（桌面约 48% 被 DOM 覆盖层压住），
+  // 而循环滚动的整个理由就是「不跟视口较劲，让内容自己走到可见区」。
+  // 一旦有人把 `tick()` 里那行改回「只在放不下时才滚」，账本行就会**永远停在被挡住的位置**，
+  // 而截图上完全看不出问题（看得见的那半截本来就是对的）—— 只有时间维度能抓到。
+  //
+  // 断言取「两次采样之间 offset.x 变了」+「始终在 [0,1) 内回绕」。
+  // 不钉具体速度：那是审美参数，钉死只会让人不敢调。
+  const scrollA = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.marqueeReport?.()?.offsetX ?? -1,
+  );
+  await page.waitForTimeout(700);
+  const scrollB = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.marqueeReport?.()?.offsetX ?? -1,
+  );
+  check(
+    '招牌屏在循环滚动（内容会自己走到没被遮挡的区域）',
+    scrollA >= 0 &&
+      scrollB >= 0 &&
+      scrollB < 1 &&
+      Math.abs(scrollB - scrollA) > 1e-4,
+    `offsetX ${scrollA} → ${scrollB}（700 ms）`,
+  );
+
   // ⑦ 「它还长得像一台机柜吗」两条量纲级断言
   const fatWalls = truth.parts.filter((part) => {
     if (!part.startsWith('sideWall')) return false;
