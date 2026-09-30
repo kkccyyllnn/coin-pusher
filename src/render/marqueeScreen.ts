@@ -7,7 +7,7 @@ import * as THREE from 'three';
  *
  * 招牌画布是 1024×512。往它上面每帧写一次数字 = 每帧重传 ≈2 MB 纹理，
  * 而 `perf` 闸门的预算里没有这笔带宽（帧时间会被一次纹理上传吃掉半帧）。
- * 所以静态构图烘焙一次，会变的数字单独一块 256×64 的 LED 小屏，
+ * 所以静态构图烘焙一次，会变的数字单独一块 LED 小屏（高 64 纹素、宽按面板比例算），
  * 贴在檐板正前 2 mm —— 更新代价 ≈64 KB，而且只在**内容真的变了**的时候传。
  *
  * ## 刷新是事件驱动 + 节流的
@@ -26,9 +26,23 @@ import * as THREE from 'three';
  * 自发光是必须的：三渲二的 `color × map` 里，暗底色带永远乘不出亮像素。
  */
 
-/** LED 面板的物理分辨率（256×64 都是 2 的幂 ⇒ mipmap 与 RepeatWrapping 都合法）。 */
-const W = 256;
+/**
+ * 面板的**纵向**纹素数固定，横向由 `setAspect()` 按实际面板宽高比算出来。
+ *
+ * 为什么不再是写死的 256×64：屏「做满」之后面板是 4.997:1，而纹理一直是 4:1 ⇒
+ * 字被横向白拉 **24.9 %**（实测，见 `marqueeReport()` 的 textureWidth/Height）。
+ * 只把 256 改成 320 也能对上，但对不上 `?model` —— 檐板尺寸一改，比例就又错开，
+ * 而且这次连「4:1」这个锚都没了，没人会想起来再修。所以**从几何反推**是唯一
+ * 不会过期的写法。
+ *
+ * 高度不动是有意的：字号、基线、扫描线周期全挂在纵向纹素数上，
+ * 改它会同时动三样，而拉伸这件事只需要动宽度。
+ */
 const H = 64;
+/** 宽度取到 4 的整数倍：扫描线周期是 4，非整倍会让最后一道线被截断。 */
+const WIDTH_STEP = 4;
+/** 未设比例时的兜底宽度（与改造前一致，保证旧截图可比）。 */
+const DEFAULT_WIDTH = 256;
 /** 重画节流：8 fps 封顶。 */
 const MIN_INTERVAL = 0.125;
 /** 滚动速度（`texture.offset.x` 单位/秒）。 */
@@ -49,6 +63,9 @@ export class MarqueeScreen {
   readonly texture: THREE.CanvasTexture;
 
   private readonly ctx: CanvasRenderingContext2D;
+  private readonly canvas: HTMLCanvasElement;
+  /** 当前纹素宽度（高度固定为 `H`，宽度由面板实际宽高比反推）。 */
+  private width = DEFAULT_WIDTH;
   private ledger: MarqueeLedger = { wallet: 0, earned: 0 };
   private subtitleText = '';
   private subtitleLeft = 0;
@@ -59,10 +76,11 @@ export class MarqueeScreen {
 
   constructor() {
     const canvas = document.createElement('canvas');
-    canvas.width = W;
+    canvas.width = this.width;
     canvas.height = H;
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('无法创建 2D 画布：招牌显示屏需要 CanvasRenderingContext2D');
+    this.canvas = canvas;
     this.ctx = ctx;
     // 字体在构造时定一次：`isWide()` 用 `measureText` 量宽度，
     // 而量宽必须在**画之前**——字体留在 paint 里设的话，第一帧量的是 10px 默认字体。
@@ -74,6 +92,38 @@ export class MarqueeScreen {
     // 滚动靠 offset 平移采样窗口，必须允许越界回绕。
     this.texture.wrapS = THREE.RepeatWrapping;
     this.texture.wrapT = THREE.ClampToEdgeWrapping;
+  }
+
+  /** 当前纹素尺寸，给判据比对「纹理宽高比 == 面板宽高比」。 */
+  get texels(): { width: number; height: number } {
+    return { width: this.width, height: H };
+  }
+
+  /**
+   * 按面板的实际宽高比重算纹素宽度。返回**是否真的变了**。
+   *
+   * 由 `buildMarqueeScreenMesh()` 在每次建网格时调 —— `?model` 拖檐板尺寸会重建外壳，
+   * 而这块画布是单例（见文件末尾），所以比例必须跟着走，不然拉伸会以新的比例回来。
+   *
+   * 宽度取到 `WIDTH_STEP` 的整数倍：扫描线周期是 4，非整倍会让最右一道线被截断；
+   * 由此引入的比例残差 ≤ 2/宽度 ≈ 0.6 %，肉眼与判据都当作 0 处理。
+   */
+  setAspect(aspect: number): boolean {
+    if (!(aspect > 0)) return false;
+    const next = Math.max(
+      WIDTH_STEP,
+      Math.round((H * aspect) / WIDTH_STEP) * WIDTH_STEP,
+    );
+    if (next === this.width) return false;
+    this.width = next;
+    this.canvas.width = next;
+    // 改尺寸会清空画布，而 CanvasTexture 只有 `needsUpdate` 才会重传；
+    // 两者都要，且 `painted` 必须作废 —— 否则「内容没变」这条快路径会让我们
+    // 把一张刚被清空的黑纹理留在显存上（表现：屏闪一帧全黑）。
+    this.painted = ['', ''];
+    this.dirty = true;
+    this.texture.needsUpdate = true;
+    return true;
   }
 
   /**
@@ -134,13 +184,13 @@ export class MarqueeScreen {
   }
 
   private isWide(text: string): boolean {
-    return this.ctx.measureText(text).width > W - 8;
+    return this.ctx.measureText(text).width > this.width - 8;
   }
 
   private paint(top: string, bottom: string): void {
     const ctx = this.ctx;
     ctx.fillStyle = LED_OFF;
-    ctx.fillRect(0, 0, W, H);
+    ctx.fillRect(0, 0, this.width, H);
     ctx.textBaseline = 'middle';
     // 屏现在铺满檐板 ⇒ 没有第二行时把唯一一行**垂直居中**，
     // 否则上半屏有字、下半屏一片空黑，看着像坏了一半。
@@ -163,7 +213,7 @@ export class MarqueeScreen {
   private paintScanlines(): void {
     const ctx = this.ctx;
     ctx.fillStyle = SCANLINE;
-    for (let y = 2; y < H; y += 4) ctx.fillRect(0, y, W, 1);
+    for (let y = 2; y < H; y += 4) ctx.fillRect(0, y, this.width, 1);
   }
 }
 
@@ -174,7 +224,7 @@ let singleton: MarqueeScreen | null = null;
  *
  * `?model` 模型模式每改一次参数就重建外壳（见 `disposeCabinetShell`），
  * 屏的**几何**跟着重建，但这块画布与纹理只有一份 ——
- * 否则每拖一次滑块就多一张 256×64 的常驻纹理，而且旧数字还会在
+ * 否则每拖一次滑块就多一张常驻纹理，而且旧数字还会在
  * 新网格上闪一帧。
  */
 export function marqueeScreen(): MarqueeScreen {

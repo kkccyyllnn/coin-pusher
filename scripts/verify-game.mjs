@@ -5528,22 +5528,35 @@ async function runCabinet(page, context) {
   const screen = await page.evaluate(
     () => window.__THREE_GAME_TEST_HOOKS__?.marqueeReport?.() ?? null,
   );
+  // ★ 「比例锁 4:1」这条已经作废（09-30）：屏做满之后面板比例是**几何算出来的**
+  // （`hood.topY − valanceBottomY` 与 `halfWidth`，`?model` 还能改），写死 4:1 既守不住
+  // 也测不对——真正该守的是「**纹理宽高比 == 面板宽高比**」，即拉伸为 0。
+  // 容差 2 %：宽度取整到 4 的倍数（扫描线周期）带来的残差 ≤ 2/320 ≈ 0.6 %，
+  // 而它要抓的那次失配是**同一个数**：改之前纹理 4:1、面板 4.997:1 ⇒
+  // 这里打印 −19.95 %（`纹比/面比 − 1`），换个方向说就是「字被横向拉宽 24.9 %」
+  //（`面比/纹比 − 1`）。两个口径都是同一件事，读数时别以为是两个缺陷。
+  // 离噪声远，不是离读数近。
+  const stretch =
+    screen && screen.height > 0 && screen.textureHeight > 0
+      ? (screen.textureWidth / screen.textureHeight) / (screen.width / screen.height) - 1
+      : 1;
   check(
-    '招牌屏挂在檐板正前 2 mm、居中、比例锁 4:1、map 与 emissiveMap 都是那块画布',
+    '招牌屏挂在檐板正前 2 mm、居中、纹理比例贴合面板（拉伸 < 2%）、map 与 emissiveMap 都是那块画布',
     Boolean(screen) &&
       Boolean(valance) &&
       Math.abs(screen.world[2] - (valance.max[2] + 0.002)) < 1e-3 &&
       Math.abs(screen.world[0]) < 1e-6 &&
       screen.world[1] > valance.min[1] &&
       screen.world[1] < valance.max[1] &&
-      Math.abs(screen.width / screen.height - 4) < 0.01 &&
+      Math.abs(stretch) < 0.02 &&
       screen.mapIsScreen === true &&
       screen.emissiveMapIsScreen === true &&
       screen.materialName === 'marqueeScreen',
     screen
       ? `屏 ${screen.width.toFixed(3)}×${screen.height.toFixed(3)} 米 @ z=${fmt(screen.world[2])}` +
         `（檐板前面 ${fmt(valance.max[2])} + 2 mm），map=${screen.mapIsScreen}` +
-        ` emissiveMap=${screen.emissiveMapIsScreen}`
+        ` emissiveMap=${screen.emissiveMapIsScreen}，纹理 ${screen.textureWidth}×${screen.textureHeight}` +
+        ` ⇒ 横向拉伸 ${(stretch * 100).toFixed(2)}%`
       : '缺件',
   );
 

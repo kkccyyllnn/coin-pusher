@@ -1281,8 +1281,12 @@ function buildHood(
  * 招牌显示屏的贴片（R3-U4）。
  *
  * 尺寸从檐板反推、不写死：屏**铺满檐板倒角以内的整块平坦区**（用户批注：直接做满）。
- * 早先这里锁 4:1 与 256×64 的纹理对齐，理由是「比例不对会把 LED 点阵拉成扁椭圆」——
- * 点阵已经去掉、只留扫描线之后，那个理由不再成立，剩下的只有轻微的字宽拉伸。
+ *
+ * ★ 做满之后面板是 4.997:1，而纹理一直是 4:1 ⇒ 字被横向白拉 **24.9 %**（实测）。
+ *   早先这里锁 4:1 与纹理对齐，去掉锁之后注释写的是「剩下的只有轻微的字宽拉伸」——
+ *   那个判断错了，25 % 对文字不是轻微。现在改成**把纹理宽度反过来贴合面板比例**
+ *   （`setAspect`），拉伸归零，而且 `?model` 改檐板尺寸时会自动跟上。
+ *   判据见 `verify-game.mjs` 的「纹理宽高比 == 面板宽高比」。
  *
  * 没有 `userData.role` / `userData.part`：换肤（`applyCabinetSkin`）与贴图分发
  * （`Game.applyCabinetMapTextures`）都是按这两个字段找件的，屏既不吃机柜配色
@@ -1293,6 +1297,9 @@ function buildMarqueeScreenMesh(material: LitMaterial): THREE.Mesh {
   const bevel = partBevel('hoodValance').radius;
   const height = hood.topY - hood.valanceBottomY - bevel * 2;
   const width = hood.halfWidth * 2 - bevel * 2;
+  // 先对比例、后建网格：画布尺寸一变，`PlaneGeometry` 的 UV 是 0..1，
+  // 拉伸完全由「纹理宽高比 ÷ 面板宽高比」决定，所以这一步必须与几何同源同序。
+  marqueeScreen().setAspect(width / height);
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, height), material);
 
   mesh.name = 'marqueeScreen';

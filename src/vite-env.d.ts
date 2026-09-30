@@ -671,6 +671,9 @@ interface ThreeGameTestHooks {
   marqueeReport?(): {
     width: number;
     height: number;
+    /** 纹理纹素尺寸：与 `width/height` 的比值相等才是「没被拉伸」。 */
+    textureWidth: number;
+    textureHeight: number;
     world: [number, number, number];
     materialName: string;
     mapIsScreen: boolean;

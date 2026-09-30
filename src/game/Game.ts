@@ -2903,6 +2903,10 @@ export class Game {
         return {
           width: size.width ?? 0,
           height: size.height ?? 0,
+          // 纹理自己的尺寸：判据要的是「纹理宽高比 == 面板宽高比」这条**比值相等**关系，
+          // 而不是某个写死的 4:1（做满之后面板比例是几何算出来的，会随 `?model` 变）。
+          textureWidth: marqueeScreen().texels.width,
+          textureHeight: marqueeScreen().texels.height,
           world: [world.x, world.y, world.z] as [number, number, number],
           materialName: material.name,
           mapIsScreen: material.map === texture,
