@@ -164,6 +164,11 @@ interface ThreeGameDiagnostics {
     offset: number;
     phase: string;
     running: boolean;
+    /**
+     * 演出期「停在回收位」的闸门是否合上。
+     * 判据要它才能分清「推板没在推」的两种原因：这局没在打，还是大奖动画正按着它。
+     */
+    parked: boolean;
     cycles: number;
     frontFaceZ: number;
   };

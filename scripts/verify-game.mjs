@@ -3204,7 +3204,38 @@ async function runShow(page) {
     `busy=${registeredState?.shows?.busy}，币 ${registeredState?.activeCoins}（请求前 ${before?.activeCoins}）`,
   );
 
-  const towerDone = await waitNextCompleted(0);
+  /*
+   * ★ P3 / P4 的两条演出期实测。**必须在演出进行中采样**：两条都是过程量，
+   * 演出一结束「按住」这个读数就归位了（尖峰是累计量，还能事后差值）。
+   *
+   * 这里顺手把推板开起来再判：`park` 的语义是「正在跑，但这一会儿不许往前推」，
+   * 而 `show` 模式默认推板是停的 —— 不开的话「行程一直是 0」在推板根本没跑的时候
+   * 什么都没说，判据退化成恒真式。演出结束后按回停止，把状态还给后面的判据。
+   */
+  const spikeBeforeTower = registeredState?.spikeClamps ?? -1;
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setPusherRunning?.(true));
+  let busySamples = 0;
+  let parkedSamples = 0;
+  let maxOffsetWhileBusy = 0;
+  const completedBase = completedCount((await readTelemetry(page))?.showEvents);
+  const towerDeadline = Date.now() + 20_000;
+  let towerDone = null;
+  for (;;) {
+    const s = await readState(page);
+    if (s?.shows?.busy) {
+      busySamples += 1;
+      if (s.pusher?.parked) parkedSamples += 1;
+      if ((s.pusher?.offset ?? 0) > maxOffsetWhileBusy) maxOffsetWhileBusy = s.pusher.offset;
+    }
+    const completed = ((await readTelemetry(page))?.showEvents ?? []).filter((e) => e.phase === 'completed');
+    if (completed.length > completedBase) {
+      towerDone = completed.at(-1);
+      break;
+    }
+    if (Date.now() >= towerDeadline) break;
+    await page.waitForTimeout(60);
+  }
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setPusherRunning?.(false));
   const afterTower = await readStateFresh(page);
   const scoreDelta = ((await readTelemetry(page))?.scoreEvents?.length ?? 0) - scoreBefore;
   const activeDelta = (afterTower?.activeCoins ?? 0) - (before?.activeCoins ?? 0);
@@ -3215,6 +3246,39 @@ async function runShow(page) {
     towerDone?.spawned === towerSpec && activeDelta + scoreDelta + drainedDelta === towerSpec,
     `事件 spawned=${towerDone?.spawned}，活跃差 ${activeDelta} + 结算差 ${scoreDelta} + ` +
       `流失差 ${drainedDelta}（应 = ${towerSpec}）`,
+  );
+
+  /*
+   * ★ P3：演出**不许向币堆注入超出物理预算的能量**。
+   *
+   * 判据读的是引擎自己的速度护栏计数器（`Coin.clampSpeed` 每压一次记一笔），
+   * 所以它量的不是「看起来有没有飞」，而是「求解器实际造出的速度有没有超过
+   * 这台机器自己够得着的自由落体上限」——与 `probe` 用的是**同一个派生量**
+   * （`fallBudgetMps`），不是另立一个魔数。
+   *
+   * ⚠️ 阈值刻意**不取 0**。四遍改后实测：护栏触发 **0 / 0 / 0 / 1 次**，
+   * 那一次是柱顶把一枚币从盘缝里挤出来、截断前 3.16 米/秒（阈值 3.0）——
+   * 「拱起币床」这件事本身就会偶尔挤出一点速度，那是设计内的推挤而不是爆炸。
+   * 判据取「≤ 3 次 且 峰值 ≤ 落体预算」：与噪声之间留 3 倍余量（计数）
+   * 与 2 倍余量（峰值），而改前/变异的读数是 **10 / 16~17 / 39 次、峰值 7.5~19.1**，
+   * 两边离阈值都远，红与绿都不是擦边。
+   */
+  const spikeAfterTower = afterTower?.spikeClamps ?? -1;
+  const towerSpikes = spikeAfterTower - spikeBeforeTower;
+  const towerBudget = fallBudgetMps({ gravity: afterTower?.physics?.tuning?.gravity });
+  check(
+    '塔演出注入不超物理预算：演出窗口内护栏 ≤3 次、截断前峰值 ≤ 落体预算（P3）',
+    spikeBeforeTower >= 0 && towerSpikes <= 3 && (afterTower?.peakSpikeSpeed ?? 99) <= towerBudget,
+    `护栏 +${towerSpikes} 次（≤3），峰值 ${afterTower?.peakSpikeSpeed} 米/秒` +
+      `（落体预算 ${towerBudget.toFixed(2)}）；改前同一条读数 10~39 次 / 7.5~19.1 米/秒`,
+  );
+  // ★ P4：演出期推板按在回收位。三条一起判，缺一条就是恒真式：
+  //   采样数够多（否则「一次都没赶上」也算过）、每一次 busy 都 parked、
+  //   且整个窗口里行程**一格都没走过**（>0 就说明它偷偷往前推了一程）。
+  check(
+    '大奖演出期间推板停在回收位、行程恒为 0（P4）',
+    busySamples >= 8 && parkedSamples === busySamples && maxOffsetWhileBusy === 0,
+    `演出中采样 ${busySamples} 次，按住 ${parkedSamples} 次，窗口内最大行程 ${maxOffsetWhileBusy.toFixed(4)}`,
   );
 
   // ── D：演出交付后账本恒等抽查 ──

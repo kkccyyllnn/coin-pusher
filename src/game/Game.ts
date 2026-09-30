@@ -662,6 +662,18 @@ export class Game {
     this.updateFlashes(delta);
     this.updateXixiFlash(delta);
     this.shows.update(delta);
+    // ★ 大奖演出期间推板停在回收位，动画播完再接着推（用户口径）。
+    //
+    // 除了「演出期间不该同时有两股推动」这条体验理由，实测还有第二条：
+    // 推板不按住时，它把新spawn出来的塔币往柱体上挤 —— 同一场 16 枚的塔，
+    // 速度护栏从 **0 次** 变成 **39 次、峰值 13.7 米/秒**（`show` 模式 P3 判据的读数，
+    // 变异测试时顺手量到的）。所以这条不是纯观感开关，它同时是一条**注入路径的闸门**。
+    //
+    // 每帧都调而不是只在 busy 翻转时调：`park` / `resume` 都是幂等的，
+    // 而只在翻转时调会漏掉「演出还在、中途 `startRun` 重启了推板」这条路
+    // （`start()` 会清掉 parked，若这里不重新按下去，推板就在演出里推完了整程）。
+    if (this.shows.busy) this.pusher.park();
+    else this.pusher.resume();
     this.mechanismShows.update(delta);
     // 视觉币自己积分（没有 Rapier 刚体）。放在演出之后：演出这一帧刚喷出来的币
     // 当帧就动起来，不会出现「先停一帧再飞」。
@@ -3986,6 +3998,8 @@ export class Game {
         offset: this.pusher.offset,
         phase: this.pusher.currentPhase,
         running: this.pusher.running,
+        /** 演出期「停在回收位」的闸门是否合上（判据要能分清「没在推」与「被演出按住」）。 */
+        parked: this.pusher.isParked,
         cycles: this.pusher.cyclesCompleted,
         frontFaceZ: this.pusher.frontFaceZ,
       },

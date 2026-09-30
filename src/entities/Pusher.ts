@@ -224,6 +224,12 @@ export class Pusher {
   private offsetZ = 0;
   private travelForStroke: number = TABLE.pusherTravel;
   private boostQueued = false;
+  /**
+   * 演出期「停在回收位」的闸门（见 `park` / `resume`）。
+   * 它**不是** `running` 的别名：`running=false` 是「这局还没开始/已经收工」，
+   * 而 park 是「正在跑，但这一会儿不许往前推」。
+   */
+  private parked = false;
 
   constructor(world: RAPIER.World) {
     this.body = world.createRigidBody(
@@ -297,6 +303,7 @@ export class Pusher {
   start(): void {
     if (this.running) return;
     this.running = true;
+    this.parked = false;
     this.phase = 'holdBack';
     this.phaseTime = 0;
     this.offsetZ = 0;
@@ -308,9 +315,42 @@ export class Pusher {
     this.velocityZ = 0;
   }
 
+  /**
+   * 演出期把推板**退回回收位并停在那里**（幂等，每帧调都安全）。
+   *
+   * 为什么需要：大奖动画（塔 / 宝箱 / 喷泉）播的这两三秒里，推板还在往前推，
+   * 于是「演出顶出来的币」和「推板推的币」混在一起结算，玩家分不清哪一笔是大奖给的；
+   * 而柱子本身已经在拱币床（R4-4b）——两股推动叠着，观感就是「大奖一响，币乱飞」。
+   *
+   * ⚠️ 若在 `extend` / `holdFront` 中途 park，**回撤段必须从当前位置起算**：
+   * `computeOffset()` 的回撤式是 `travelForStroke × (1 − smoothstep(t))`，
+   * 不重写 `travelForStroke` 的话，第一帧就会从「当前行程」跳到「全展行程」，
+   * 等于推板瞬移 —— 那正是 `applyTransform` 里「复位是传送不是运动」记录过的坑。
+   */
+  park(): void {
+    if (this.parked) return;
+    this.parked = true;
+    if (!this.running) return;
+    if (this.phase === 'extend' || this.phase === 'holdFront') {
+      this.travelForStroke = this.offsetZ;
+      this.phase = 'retract';
+      this.phaseTime = 0;
+    }
+  }
+
+  /** 解除 `park`：从回收位接着走下一个前推行程。 */
+  resume(): void {
+    this.parked = false;
+  }
+
+  get isParked(): boolean {
+    return this.parked;
+  }
+
   /** 复位到归位状态，用于重试与切关。**瞬时传送**，不是一次归位行程。 */
   reset(): void {
     this.running = false;
+    this.parked = false;
     this.phase = 'holdBack';
     this.phaseTime = 0;
     this.offsetZ = 0;
@@ -381,10 +421,16 @@ export class Pusher {
     this.phaseTime += delta;
     let guard = 0;
     while (this.phaseTime >= this.durations[this.phase] && guard < 4) {
+      const next = PHASE_ORDER[(PHASE_ORDER.indexOf(this.phase) + 1) % PHASE_ORDER.length];
+      if (this.parked && next === 'extend') {
+        // 停在回收位：计时钳在 `holdBack` 时长之内，恢复后下一帧就正常前推。
+        // 不钳的话 `phaseTime` 会一路累加，恢复的那一刻一次翻掉好几个相位。
+        this.phaseTime = this.durations.holdBack - 1e-3;
+        break;
+      }
       this.phaseTime -= this.durations[this.phase];
       const previous = this.phase;
-      const nextIndex = (PHASE_ORDER.indexOf(this.phase) + 1) % PHASE_ORDER.length;
-      this.phase = PHASE_ORDER[nextIndex];
+      this.phase = next;
       guard += 1;
 
       if (this.phase === 'extend') {

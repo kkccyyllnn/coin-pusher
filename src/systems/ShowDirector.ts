@@ -489,9 +489,36 @@ abstract class TimedShow implements Show {
 /**
  * 装置 A · 圆柱币塔：台底（币床中心）升起一根圆柱，分层顶出真币后回缩。
  * 层数 = promised / 4（2×2 一层），随预算弹性。
+ *
+ * ## ★ P3（2026-09-30）：碰撞体**只做平移，全程不换形状**
+ *
+ * 改前两件事叠在一起，把这台机器里唯一测得到的能量注入源造了出来
+ * （判据在 `scripts/verify-game.mjs` 的 `show` 模式，两条新判据 P3 / P4）：
+ *
+ * 1. 碰撞体按「与网格高度差 ≥ 一层」才 `setShape` 重建 ⇒ **一次跳一整层**
+ *    （普通币 28 mm、宝箱 **228 mm**）。`setShape` 是瞬时的：新出现的体积直接
+ *    把币埋在里头，Rapier 的位置修正按 `erp × 穿透 / dt = 0.8 × 穿透 × 60`
+ *    还成速度 ⇒ 228 mm 那一跳等于凭空给埋住的币 **10.9 米/秒**。
+ * 2. 分层 spawn 的高度写死在 `0.03 + (layer+1) × layerStep`，而柱顶在升起段就已经
+ *    到了 `0.03 + layers × layerStep` ⇒ **除最后一层外，每一层都生在柱子实体内部**
+ *    （4 层塔的前三层分别埋在柱里 84 / 56 / 28 mm）。
+ *
+ * 实测后果（一场 16 枚的塔，`/tmp/show-timeline.mjs` 每 100 ms 采一次）：
+ * 速度护栏触发 16~17 次、护栏**压之前**峰值 7.5~10.8 米/秒（这台机器自己的
+ * 自由落体上限是 6.3）、一枚币被顶到 y=0.94（床面以上 94 厘米）、
+ * 币↔币穿透冲到 76 mm、一枚币被压到 y=−0.048（床面以下）。
+ * 玩家看到的「顶飞」就是这几毫秒。
+ *
+ * ⇒ 现在的形状：**一次建好、只走 `setNextKinematicTranslation`**。柱顶从床面
+ * （top=0，整体埋在台面板以下）线性升到 `topHeight()`，退场时再沉回去。
+ * 升起段每帧的位移是 2.9 mm（塔）/ 5.4 mm（宝箱），对应的位置修正速度
+ * 0.14 / 0.26 米/秒 —— 与正常玩法同一量级，「柱子顶币」从一次爆炸变回一次推挤。
+ * 分层 spawn 的高度改成读**实际可站表面**（见 `stackTop()`），所以永远不会生在柱子里。
  */
 class TowerShow extends TimedShow {
   private readonly layers = Math.max(1, Math.round(this.promised / 4));
+  /** 柱体半径（米）。网格与碰撞体**共用这一个数**，见 `towerCylinderRadius`。 */
+  private readonly radius = towerCylinderRadius(this.kind);
   /**
    * 升起 0.8 秒 / 每层 0.4 秒 / 回缩 0.45 秒（P10 放大：0.6 / 0.35）。
    *
@@ -533,12 +560,16 @@ class TowerShow extends TimedShow {
       emissive: '#1a6f66',
       emissiveIntensity: 0.6,
     });
-    // 圆柱从台底向上长：几何原点放在柱体中心，靠 scale.y + position.y 模拟升起。
+    // ★ P3：几何**一次做到终高**，升起靠整根柱子平移（原来靠 `scale.y`，
+    // 而 `scale.y` 与碰撞体是两回事——那正是「网格追上碰撞体」对不上的来源）。
     // 半径见模块顶部的 `towerCylinderRadius()`（按**这个币种自己的**层占地派生）。
-    const radius = towerCylinderRadius(this.kind);
-    this.cylinder = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, 1, 20), material);
-    this.cylinder.position.set(this.x, 0, 0.3);
-    this.cylinder.scale.y = 0.001;
+    const height = this.topHeight();
+    this.cylinder = new THREE.Mesh(
+      new THREE.CylinderGeometry(this.radius, this.radius, height, 20),
+      material,
+    );
+    // 起始：柱顶正好贴在床面（y=0）上 ⇒ 整根柱体埋在台面板以下，画面上看不见。
+    this.cylinder.position.set(this.x, height / 2 - height, TowerShow.COLUMN_Z);
 
     // ★ R4b 的**与物理无关**那一半：塔基一圈发光环（计划把它和 kinematic 碰撞体分开，
     // 因为环不碰求解器，不需要等重标）。
@@ -546,7 +577,7 @@ class TowerShow extends TimedShow {
     // 为什么要有它：圆柱是从**币床底下**长出来的，升起的前 0.1 秒画面里只有「币自己在动」,
     // 看不出有东西在顶。环先亮 = 先把「这里要出事件」交代清楚，是事件的**预告**而不是装饰。
     //
-    // 尺寸全部从 `radius` 派生，不新写数字 —— 环必须**套住**柱体，
+    // 尺寸全部从柱体半径派生，不新写数字 —— 环必须**套住**柱体，
     // 而柱体半径本身已经按该币种的层占地算过一遍（写死第二个半径就是第二份真源）。
     const haloMaterial = makeToonMaterial({
       name: 'towerHalo',
@@ -556,7 +587,7 @@ class TowerShow extends TimedShow {
       emissiveIntensity: 1.1,
     });
     const halo = new THREE.Mesh(
-      new THREE.RingGeometry(radius * 1.15, radius * 1.5, 24),
+      new THREE.RingGeometry(this.radius * 1.15, this.radius * 1.5, 24),
       haloMaterial,
     );
     // ⚠️ 平躺要 `rotation.x = -π/2`：局部 +z 经 `rotation.x = θ` 映到 `(0, -sinθ, cosθ)`，
@@ -575,37 +606,26 @@ class TowerShow extends TimedShow {
     return group;
   }
 
-  /** 圆柱顶的目标高度：刚好托住最后一层。 */
+  /**
+   * 柱顶的终高（米）。
+   *
+   * ★ P3 起它的语义变了：改前是「刚好托住最后一层」，而最后一层的高度就是柱顶
+   * ⇒ 下面几层必然生在柱子实体里。现在是「柱顶停在最下面那一层的**脚下**」，
+   * 各层从柱顶之上依次出生、往上叠。
+   */
   private topHeight(): number {
     return 0.03 + this.layers * this.layerStep();
   }
 
   /**
-   * R4-4b：柱顶的**真碰撞体**。一根 kinematic 圆柱，跟着网格一起长。
+   * R4-4b：柱顶的**真碰撞体**。一根 kinematic 圆柱，**尺寸一次定死、只走平移**。
    *
    * 改前 `this.cylinder` 是纯视觉 Mesh、没有碰撞体 ⇒「塔顶开」画面上有根柱子升起来，
-   * 物理上什么都不推，币只是 spawn 在柱顶再落回原有缝隙。加了碰撞体之后柱子会真的
-   * 拱起币床——这正是计划里点名的风险（白送结算），所以配套要求见下面 `syncCollider`
-   * 的**有界重建**规则，以及验证侧的 `DRAIN` 成对判据。
+   * 物理上什么都不推。加了碰撞体之后柱子会真的拱起币床 —— 这正是计划里点名的风险
+   * （白送结算），所以配套的是 `xixi` 侧的「汇」判据：演出窗口内被拱过线的存量币
+   * 必须 ≤ 这场演出的承诺数。
    *
-   * 三个字段各管一件事，别合并：`towerBody` 是资源（必须在 dispose 里还回世界）、
-   * `towerCollider` 是形状的载体（`setShape` 只能换整块）、
-   * `colliderHalfHeight` 是**碰撞体自己的当前高度**——判据要拿「网格高度」和它比，
-   * 拿两次网格高度互相比是比不出滞后的。
-   */
-  private towerBody: RAPIER.RigidBody | null = null;
-  private towerCollider: RAPIER.Collider | null = null;
-  private colliderHalfHeight = 0;
-
-  /** 柱体的世界落点：与 `buildMeshes` 里网格的 `position.set(this.x, 0, 0.3)` 同一处。 */
-  private static readonly COLUMN_Z = 0.3;
-
-  /**
-   * 懒建 kinematic 柱体。**第一帧 `tick` 才建**，不在 `ShowDirector` 构造期建：
-   * 演出是按需的，构造期建等于每局都往世界里塞一根没人看的柱子。
-   *
-   * 三处刻意的设计：
-   * - 形状先给 `0.0005` 半高（≈看不见），随后由 `syncCollider` 立刻追上真实高度。
+   * 两处刻意的设计：
    * - `setRestitutionCombineRule` **必须自己设**：开机那次 `forEachCollider` 扫描
    *   （`PhysicsWorld.applyRestitutionCombineRule`）只覆盖扫描那一刻存在的碰撞体，
    *   演出期新建的吃不到——这是 R4-P2 就写进注释的已知边界。漏了它，币↔柱这一对
@@ -614,76 +634,94 @@ class TowerShow extends TimedShow {
    *   接触面，用同一个数才不会出现「同样是推动面，一个拖一个滑」。
    *   弹性给 0：柱子不该把币弹开，Min 规则下它同时保证了币↔柱 = 0。
    */
+  private towerBody: RAPIER.RigidBody | null = null;
+
+  /** 柱体的世界落点：与 `buildMeshes` 里网格的 x/z 同一处。 */
+  private static readonly COLUMN_Z = 0.3;
+
+  /**
+   * 懒建 kinematic 柱体。**第一帧 `tick` 才建**，不在 `ShowDirector` 构造期建：
+   * 演出是按需的，构造期建等于每局都往世界里塞一根没人看的柱子。
+   *
+   * 初值把柱顶摆在床面（y=0）上 ⇒ 整根埋在台面板以下，看不见也碰不着。
+   */
   private ensureCollider(): void {
     if (this.towerBody) return;
-    const radius = towerCylinderRadius(this.kind);
+    const half = this.topHeight() / 2;
     this.towerBody = this.deps.world.createRigidBody(
       RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(
         this.x,
-        0,
+        -half,
         TowerShow.COLUMN_Z,
       ),
     );
-    this.towerCollider = this.deps.world.createCollider(
-      RAPIER.ColliderDesc.cylinder(0.0005, radius)
+    this.deps.world.createCollider(
+      RAPIER.ColliderDesc.cylinder(half, this.radius)
         .setFriction(0.35)
         .setRestitution(0)
         .setRestitutionCombineRule(RESTITUTION_COMBINE_RULE),
       this.towerBody,
     );
-    this.colliderHalfHeight = 0.0005;
   }
 
   /**
-   * 把碰撞体追上网格高度：位置每帧跟、**形状按有界规则重建**。
+   * 把柱顶搬到 `topY`。**位置每帧跟、形状一动不动。**
    *
-   * Rapier 不能热改碰撞体尺寸，只能 `setShape` 换一块 ⇒ 逐帧换会把 `perf` 的
-   * 帧率判据打崩。但「只在层边界重建」也不够：`tick()` 是**逐帧**改高度的
-   * （升起段线性长、`hold` 之后线性缩），而 `spawnedLayers` 只在层边界自增，
-   * 跟着层走的话**回缩段会让碰撞体停在旧高度继续顶币**——那是「没有理由地把币
-   * 拱过得分线」，比升起段滞后危险得多。
-   *
-   * ⇒ 采用「网格高度与碰撞体当前高度差 ≥ 一层 `layerStep()` 就重建」：
-   *   每层最多两次（边界一次 + 回缩穿越一次），滞后被压在一层以内，且**回缩段同样覆盖**。
-   *
-   * 位置走 `setNextKinematicTranslation` 而不是直接改 collider 的相对平移：
+   * 走 `setNextKinematicTranslation` 而不是直接改 collider 的相对平移：
    * kinematic 刚体的速度是 Rapier 从「下一位置 − 当前位置」推出来的，只有走这条口
    * 柱子才是「以某个速度顶上去」；直接改 collider 平移等于瞬移，求解器会按穿透处理，
    * 每一帧都注一次能量（`anomalies` / `peakSpikeSpeed` 就是抓这个的）。
    */
-  private syncCollider(height: number): void {
-    this.ensureCollider();
-    const body = this.towerBody;
-    if (!body) return;
-    const half = Math.max(0.0005, height / 2);
-    body.setNextKinematicTranslation({ x: this.x, y: half, z: TowerShow.COLUMN_Z });
-    if (Math.abs(half - this.colliderHalfHeight) * 2 >= this.layerStep()) {
-      this.towerCollider?.setShape(new RAPIER.Cylinder(half, towerCylinderRadius(this.kind)));
-      this.colliderHalfHeight = half;
-    }
+  private moveCollider(topY: number): void {
+    this.towerBody?.setNextKinematicTranslation({
+      x: this.x,
+      y: topY - this.topHeight() / 2,
+      z: TowerShow.COLUMN_Z,
+    });
+  }
+
+  /** 柱顶在当前时刻的高度：升起段线性长出床面，发层段保持，回缩段线性沉回去。 */
+  private topAt(t: number): number {
+    const hold = this.rise + this.layers * this.perLayer;
+    if (t < this.rise) return this.topHeight() * (t / this.rise);
+    if (t < hold) return this.topHeight();
+    return this.topHeight() * Math.max(0, 1 - (t - hold) / this.retract);
+  }
+
+  /**
+   * 柱子占地内的**最高币面**（返回币心 y）。
+   *
+   * 出生高度必须由它算，不能由「第几层 × 层高」算：床面本身是起伏的存量币堆，
+   * 写死的坐标会生在币堆里（见类注释里那 84 / 56 / 28 mm 的三层埋深）。
+   */
+  private stackTop(): number {
+    const reach = this.radius + coinCircumradius(this.kind);
+    let top = 0;
+    this.deps.coins.forEachActive((coin) => {
+      const p = coin.position;
+      if (Math.hypot(p.x - this.x, p.z - TowerShow.COLUMN_Z) > reach) return;
+      if (p.y > top) top = p.y;
+    });
+    return top;
   }
 
   protected tick(t: number): void {
     if (!this.cylinder) return;
     const hold = this.rise + this.layers * this.perLayer;
-    let height: number;
-    if (t < this.rise) {
-      height = this.topHeight() * (t / this.rise);
-    } else if (t < hold) {
-      height = this.topHeight();
-      // 到一层发一层：圆柱顶着币升出床面，回缩前币已落座。
+    const topY = this.topAt(t);
+    if (t >= this.rise && t < hold) {
+      // 到一层发一层：柱顶已经到位，币在柱顶**之上**出生、落座。
       const dueLayer = Math.min(this.layers, Math.floor((t - this.rise) / this.perLayer) + 1);
       while (this.spawnedLayers < dueLayer) {
-        this.spawnLayer(this.spawnedLayers);
+        this.spawnLayer(this.spawnedLayers, topY);
         this.spawnedLayers += 1;
       }
-    } else {
-      height = this.topHeight() * Math.max(0, 1 - (t - hold) / this.retract);
     }
-    this.cylinder.scale.y = Math.max(0.001, height);
-    this.cylinder.position.y = height / 2;
-    // 碰撞体与网格**同一条派生**：都只吃这一个 `height`，不引入第二个高度来源。
-    this.syncCollider(height);
+    const centerY = topY - this.topHeight() / 2;
+    this.cylinder.position.y = centerY;
+    // 碰撞体与网格**同一条派生**：都只吃这一个 `topY`，不引入第二个高度来源。
+    this.ensureCollider();
+    this.moveCollider(topY);
     this.tickHalo(t, hold);
   }
 
@@ -699,7 +737,6 @@ class TowerShow extends TimedShow {
     if (this.towerBody) {
       this.deps.world.removeRigidBody(this.towerBody);
       this.towerBody = null;
-      this.towerCollider = null;
     }
     super.dispose();
   }
@@ -725,11 +762,24 @@ class TowerShow extends TimedShow {
     this.halo.scale.set(k, k, 1);
   }
 
-  private spawnLayer(layer: number): void {
-    // 层高走 `layerStep()`（= 这个币种碰撞体的高度 + 余量），不写死普通币的厚度。
-    const y = 0.03 + (layer + 1) * this.layerStep();
+  /**
+   * 发一层币。
+   *
+   * ★ 出生高度 = **柱顶与「柱子占地里的最高币面」之中较高的那个** + 半个币高 + 下落余量。
+   * 原来写死的 `0.03 + (layer+1) × layerStep` 是「第几层」的函数，而柱顶在升起段就已经
+   * 走到了 `0.03 + layers × layerStep` —— 除最后一层外每一枚都生在柱子实体内部
+   * （4 层塔：前三层分别埋 84 / 56 / 28 mm），位置修正把它们当穿透弹出去。
+   * 现在这个函数不吃 `layer` 的高度，只吃**当前盘面**，所以：
+   * - 生在柱顶之上 → 永远不会在柱子里；
+   * - 生在存量币堆之上 → 永远不会在币堆里；
+   * - 后一层看得见前一层的币心 → 一层压一层地落座。
+   */
+  private spawnLayer(layer: number, topY: number): void {
     const spec = coinColliderSpec(this.kind);
     const off = layerOffsets(this.kind);
+    const half = coinColliderHeight(this.kind) / 2;
+    // 12 mm 的下落余量：贴着放会一出生就是接触态，给一点点距离让它「落进去」。
+    const y = Math.max(topY, this.stackTop() + half) + half + 0.012;
 
     // ★ S16：`yaw` 对**长方体**币种必须取 0。
     //
@@ -756,7 +806,14 @@ class TowerShow extends TimedShow {
     for (const [dx, dz] of corners) {
       // 承诺数是硬上限：降级交付时最后一层可能不足 4 枚，按承诺停发。
       if (this.spawned >= this.promised) return;
-      const ok = ShowDirector.spawnOne(this.deps, this.kind, this.x + dx, y, 0.3 + dz, yaw);
+      const ok = ShowDirector.spawnOne(
+        this.deps,
+        this.kind,
+        this.x + dx,
+        y,
+        TowerShow.COLUMN_Z + dz,
+        yaw,
+      );
       if (ok) this.spawned += 1;
     }
   }
