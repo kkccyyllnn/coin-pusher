@@ -80,6 +80,8 @@ export class MarqueeScreen {
    */
   private readonly scratch: HTMLCanvasElement;
   private readonly scratchCtx: CanvasRenderingContext2D;
+  /** 1×1 探针画布：只用来问「这个 CSS 颜色会被写成哪三个整数」。 */
+  private readonly probeCtx: CanvasRenderingContext2D;
   /** 当前纹素宽度（高度固定为 `H`，宽度由面板实际宽高比反推）。 */
   private width = DEFAULT_WIDTH;
   private ledger: MarqueeLedger = { wallet: 0, earned: 0 };
@@ -105,6 +107,12 @@ export class MarqueeScreen {
     if (!scratchCtx) throw new Error('无法创建 2D 画布：招牌文字二值化需要一张离屏层');
     this.scratch = scratch;
     this.scratchCtx = scratchCtx;
+    const probe = document.createElement('canvas');
+    probe.width = 1;
+    probe.height = 1;
+    const probeCtx = probe.getContext('2d', { willReadFrequently: true });
+    if (!probeCtx) throw new Error('无法创建 2D 画布：颜色探针需要一张 1×1 离屏层');
+    this.probeCtx = probeCtx;
     // 字体在构造时定一次：`isWide()` 用 `measureText` 量宽度，
     // 而量宽必须在**画之前**——字体留在 paint 里设的话，第一帧量的是 10px 默认字体。
     ctx.font = FONT;
@@ -245,6 +253,32 @@ export class MarqueeScreen {
   }
 
   /**
+   * 把 CSS 颜色解析成**浏览器真正会写进画布**的整数 RGB（缓存）。
+   *
+   * 为什么不自己解析 `#rrggbb`：我们要的是「画出来的那个值」，而不是「我以为的值」——
+   * 颜色字符串以后若改成 `rgb()`、命名色或带 alpha，手写解析就悄悄错了。
+   * 1×1 画布问一次是最省事且永远正确的做法。
+   *
+   * ★ 探针必须是**独立的一张**，不能借 scratch：`save()/restore()` 只回滚上下文状态，
+   *   **不回滚像素**，借用的话会在左上角留下一个 1×1 杂点（表现：屏角多一颗常亮 LED）。
+   */
+  private readonly rgbCache = new Map<string, [number, number, number]>();
+
+  private exactRGB(color: string): [number, number, number] {
+    const cached = this.rgbCache.get(color);
+    if (cached) return cached;
+    const ctx = this.probeCtx;
+    ctx.globalCompositeOperation = 'copy';
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, 1, 1);
+    const data = ctx.getImageData(0, 0, 1, 1).data;
+    ctx.clearRect(0, 0, 1, 1);
+    const rgb: [number, number, number] = [data[0], data[1], data[2]];
+    this.rgbCache.set(color, rgb);
+    return rgb;
+  }
+
+  /**
    * 画一行**硬边**文字（B）。
    *
    * 先画进离屏层 → 按 alpha 阈值二值化 → 合成回主画布。中间灰度全被抹掉，
@@ -252,6 +286,12 @@ export class MarqueeScreen {
    *
    * 为什么不在主画布上直接阈值整张图：那会连底噪、扫描线的半透明叠加一起量化，
    * 等于顺手改了别的层的效果；只处理文字层，改动面正好是被审的那一件事。
+   *
+   * ★ 保留下来的像素**连 RGB 一起钉成填充色**（不只是 alpha 二值化）：
+   * 光栅化器在高覆盖率（≥ 阈值）的边上仍会给出与填充色差 ±1~2 的 RGB，
+   * 只处理 alpha 的话这些像素会带着各自的色值留在画布里 ——
+   * 实测那样画布上是 **9** 种颜色而不是 3 种。一层只有一个填充色，
+   * 那就让它只有那一个颜色，`distinctColors` 也因此变成真正可断言的数。
    */
   private drawCrispLine(text: string, color: string, y: number): void {
     const scratch = this.scratchCtx;
@@ -259,10 +299,18 @@ export class MarqueeScreen {
     scratch.fillStyle = color;
     scratch.textBaseline = 'middle';
     scratch.fillText(text, 8, y);
+    const [r, g, b] = this.exactRGB(color);
     const image = scratch.getImageData(0, 0, this.width, H);
     const data = image.data;
     for (let i = 0; i < data.length; i += 4) {
-      data[i + 3] = data[i + 3] >= CRISP_ALPHA ? 255 : 0;
+      if (data[i + 3] >= CRISP_ALPHA) {
+        data[i] = r;
+        data[i + 1] = g;
+        data[i + 2] = b;
+        data[i + 3] = 255;
+      } else {
+        data[i + 3] = 0;
+      }
     }
     scratch.putImageData(image, 0, 0);
     this.ctx.drawImage(this.scratch, 0, 0);
@@ -273,6 +321,16 @@ export class MarqueeScreen {
     ctx.fillStyle = LED_OFF;
     ctx.fillRect(0, 0, this.width, H);
     ctx.textBaseline = 'middle';
+    // ★ C：扫描线**先画**，文字后画盖在它上面。
+    //
+    // 原来的顺序是文字 → 扫描线，于是每 4 行有一道 35% 的暗带**横切笔画**：
+    // 在 1.36 倍放大下暗带约 1.36 像素高、周期 5.4 像素，正好把每一根竖向笔画
+    // 锯成短截 —— B 辛苦去掉的灰边，被这一刀换成了「断续」。用户说的
+    // 「扫描线我也觉得很模糊」指的就是它。
+    //
+    // 换顺序不是削弱效果：扫描线表达的是**发光面板**的横纹，它本该只作用在底色上 ——
+    // LED 点亮的时候不会被自己面板的扫描线切掉。所以这一改同时修掉观感与物理含义。
+    this.paintScanlines();
     // 屏现在铺满檐板 ⇒ 没有第二行时把唯一一行**垂直居中**，
     // 否则上半屏有字、下半屏一片空黑，看着像坏了一半。
     this.drawCrispLine(top, BRASS, bottom ? 18 : H / 2);
@@ -280,7 +338,6 @@ export class MarqueeScreen {
     // 不再画压圈边框：屏已经铺满檐板的平坦区，檐板自己的倒角就是它的框。
     // （原先那条 2px 实线还被点阵缝隙横穿、切成了一段段的「虚线框」——
     //  缝隙去掉后它顶多变成实线，而实线也不是想要的。）
-    this.paintScanlines();
     this.measurePalette();
     this.painted = [top, bottom];
     this.dirty = false;

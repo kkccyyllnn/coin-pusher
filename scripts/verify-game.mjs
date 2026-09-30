@@ -5560,17 +5560,31 @@ async function runCabinet(page, context) {
       : '缺件',
   );
 
-  // ★ B（文字硬边化）的守卫：这块屏是 LED 面板，画布上**本该只有个位数种颜色**
-  //（底色、扫描线暗底、字色，以及它们各自的组合）。字体抗锯齿每多一档灰边，
-  // 这个数就往上翻 —— 实测：二值化之前 **183** 种，之后 **13** 种
-  //（剩下的 13 全是「扫描线压在笔画上」的混合色，那正是 C 要消掉的东西）。
+  // ★ B（文字硬边化）+ C（扫描线移到文字之下）的守卫：这块屏是 LED 面板，
+  // 画布上**本该只有个位数种颜色**（底色、扫描线暗底、字色，两行时再多一种）。
+  // 字体抗锯齿每多一档灰边，这个数就往上翻 —— 实测：二值化之前 **183** 种，
+  // 只处理 alpha 是 **9** 种（高覆盖率的边上光栅化器仍给出 ±1~2 的 RGB 偏差），
+  // 把保留像素的 RGB 也钉成填充色之后：单行 **3**、两行 **4**，正好等于调色板大小。
+  //
   // 为什么用颜色数而不是「截图看起来清不清晰」：灰边在 3D 里还要再过一次
   // MSAA + ACES + 1.36 倍放大，屏幕像素上根本量不出「有没有灰边」，
   // 而在**纹理这一层**它是可精确计数的。
+  //
+  // 两行态要主动触发才测得到（原本只有老虎机开奖会走那条路），所以这里
+  // 用 `marqueeSubtitle` 进那个状态再读一次 —— 否则判据只覆盖了单行。
+  const singleLine = screen?.distinctColors ?? -1;
+  await page.evaluate(() =>
+    window.__THREE_GAME_TEST_HOOKS__?.marqueeSubtitle?.('投币点亮四槽，集齐摇老虎机'),
+  );
+  await page.waitForTimeout(600);
+  const twoLines =
+    (await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.marqueeReport?.() ?? null))
+      ?.distinctColors ?? -1;
+  console.log(`  [招牌屏调色板] 单行 ${singleLine} 种颜色 / 两行 ${twoLines} 种（二值化前 183）`);
   check(
-    '招牌屏画布是硬边的（出现过的颜色数 ≤ 16；抗锯齿灰边会把它推到几百）',
-    (screen?.distinctColors ?? 9999) <= 16,
-    `distinctColors=${screen?.distinctColors}（二值化前 183）`,
+    '招牌屏画布是硬边的（单行 ≤ 3、两行 ≤ 4 种颜色；抗锯齿灰边会把它推到几百）',
+    singleLine >= 0 && singleLine <= 3 && twoLines >= 0 && twoLines <= 4,
+    `单行=${singleLine} 两行=${twoLines}`,
   );
 
   // ⑦ 「它还长得像一台机柜吗」两条量纲级断言
