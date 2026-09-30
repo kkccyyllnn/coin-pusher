@@ -5560,6 +5560,19 @@ async function runCabinet(page, context) {
       : '缺件',
   );
 
+  // ★ B（文字硬边化）的守卫：这块屏是 LED 面板，画布上**本该只有个位数种颜色**
+  //（底色、扫描线暗底、字色，以及它们各自的组合）。字体抗锯齿每多一档灰边，
+  // 这个数就往上翻 —— 实测：二值化之前 **183** 种，之后 **13** 种
+  //（剩下的 13 全是「扫描线压在笔画上」的混合色，那正是 C 要消掉的东西）。
+  // 为什么用颜色数而不是「截图看起来清不清晰」：灰边在 3D 里还要再过一次
+  // MSAA + ACES + 1.36 倍放大，屏幕像素上根本量不出「有没有灰边」，
+  // 而在**纹理这一层**它是可精确计数的。
+  check(
+    '招牌屏画布是硬边的（出现过的颜色数 ≤ 16；抗锯齿灰边会把它推到几百）',
+    (screen?.distinctColors ?? 9999) <= 16,
+    `distinctColors=${screen?.distinctColors}（二值化前 183）`,
+  );
+
   // ⑦ 「它还长得像一台机柜吗」两条量纲级断言
   const fatWalls = truth.parts.filter((part) => {
     if (!part.startsWith('sideWall')) return false;

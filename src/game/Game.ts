@@ -2907,6 +2907,8 @@ export class Game {
           // 而不是某个写死的 4:1（做满之后面板比例是几何算出来的，会随 `?model` 变）。
           textureWidth: marqueeScreen().texels.width,
           textureHeight: marqueeScreen().texels.height,
+          // 画布上出现过的不同颜色数：LED 面板本该是个位数，抗锯齿灰边会把它推到几百。
+          distinctColors: marqueeScreen().distinctColors,
           world: [world.x, world.y, world.z] as [number, number, number],
           materialName: material.name,
           mapIsScreen: material.map === texture,

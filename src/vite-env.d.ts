@@ -674,6 +674,8 @@ interface ThreeGameTestHooks {
     /** 纹理纹素尺寸：与 `width/height` 的比值相等才是「没被拉伸」。 */
     textureWidth: number;
     textureHeight: number;
+    /** 画布上出现过的不同颜色数（LED 面板本该是个位数；灰边会把它推高）。 */
+    distinctColors: number;
     world: [number, number, number];
     materialName: string;
     mapIsScreen: boolean;

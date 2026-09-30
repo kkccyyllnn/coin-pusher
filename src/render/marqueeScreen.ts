@@ -51,6 +51,12 @@ const SCROLL_SPEED = 0.07;
 const SUBTITLE_SECONDS = 6;
 
 const FONT = 'bold 20px "Courier New", monospace';
+/**
+ * 文字二值化的 alpha 阈值（0~255）。取 **128 = 覆盖率过半**：
+ * 20px 粗体的笔画只有 2~3 纹素宽，再高会断笔（尤其「钱包」的细钩），再低等于没做。
+ * 调它只需要看一个数：`marqueeReport().distinctColors` 是否仍是调色板那么大。
+ */
+const CRISP_ALPHA = 128;
 const LED_OFF = '#05090a';
 /** 扫描线：只压暗横行，**不画纵缝**（纵横都压就是网格）。 */
 const SCANLINE = 'rgba(0, 0, 0, 0.35)';
@@ -64,6 +70,16 @@ export class MarqueeScreen {
 
   private readonly ctx: CanvasRenderingContext2D;
   private readonly canvas: HTMLCanvasElement;
+  /**
+   * 文字专用的离屏层（B：硬边化）。
+   *
+   * 直接 `fillText` 到主画布上，浏览器会按灰度抗锯齿画边；这块屏最终被**放大 1.36 倍**
+   * 显示，灰边就被 Nearest 采样拉成 1~2 像素的软块 —— 用户看到的「糊」有一半是这个。
+   * 所以文字先画进这张透明层，按 alpha 阈值二值化（非 0 即 255）再合成：
+   * 每个纹素只有「亮 / 灭」两态，正是 LED 点阵该有的样子。
+   */
+  private readonly scratch: HTMLCanvasElement;
+  private readonly scratchCtx: CanvasRenderingContext2D;
   /** 当前纹素宽度（高度固定为 `H`，宽度由面板实际宽高比反推）。 */
   private width = DEFAULT_WIDTH;
   private ledger: MarqueeLedger = { wallet: 0, earned: 0 };
@@ -82,9 +98,17 @@ export class MarqueeScreen {
     if (!ctx) throw new Error('无法创建 2D 画布：招牌显示屏需要 CanvasRenderingContext2D');
     this.canvas = canvas;
     this.ctx = ctx;
+    const scratch = document.createElement('canvas');
+    scratch.width = this.width;
+    scratch.height = H;
+    const scratchCtx = scratch.getContext('2d');
+    if (!scratchCtx) throw new Error('无法创建 2D 画布：招牌文字二值化需要一张离屏层');
+    this.scratch = scratch;
+    this.scratchCtx = scratchCtx;
     // 字体在构造时定一次：`isWide()` 用 `measureText` 量宽度，
     // 而量宽必须在**画之前**——字体留在 paint 里设的话，第一帧量的是 10px 默认字体。
     ctx.font = FONT;
+    scratchCtx.font = FONT;
     this.texture = new THREE.CanvasTexture(canvas);
     this.texture.colorSpace = THREE.SRGBColorSpace;
     this.texture.magFilter = THREE.NearestFilter;
@@ -117,6 +141,13 @@ export class MarqueeScreen {
     if (next === this.width) return false;
     this.width = next;
     this.canvas.width = next;
+    // ⚠️ 改 canvas 尺寸会**重置该 2D 上下文的全部状态**（含 font），所以两张画布都要
+    // 重新设字体。漏掉的话 `?model` 一拖檐板，屏上的字就会退回 10px 默认字体 ——
+    // 零报错，只是字变小、量宽也跟着错（`isWide()` 于是永远判错）。
+    this.scratch.width = next;
+    this.scratch.height = H;
+    this.ctx.font = FONT;
+    this.scratchCtx.font = FONT;
     // 改尺寸会清空画布，而 CanvasTexture 只有 `needsUpdate` 才会重传；
     // 两者都要，且 `painted` 必须作废 —— 否则「内容没变」这条快路径会让我们
     // 把一张刚被清空的黑纹理留在显存上（表现：屏闪一帧全黑）。
@@ -187,6 +218,56 @@ export class MarqueeScreen {
     return this.ctx.measureText(text).width > this.width - 8;
   }
 
+  /**
+   * 上一次重画之后，画布里**出现过的不同颜色数**。
+   *
+   * 这是「字为什么糊」的直接度量：一块只有开关两态的 LED 面板，颜色数应该等于
+   * 调色板大小（底色、扫描线暗底、字色…个位数）。字体抗锯齿每多一档灰边，
+   * 这个数就往上翻 —— 所以它能在肉眼看图之前先告诉我们「有没有中间灰」。
+   */
+  get distinctColors(): number {
+    return this.paletteSize;
+  }
+
+  private paletteSize = 0;
+
+  /** 数一遍画布上的不同颜色（含 alpha 通道，所以半透的 AA 边一定会被算进去）。 */
+  private measurePalette(): void {
+    const data = this.ctx.getImageData(0, 0, this.width, H).data;
+    const seen = new Set<number>();
+    for (let i = 0; i < data.length; i += 4) {
+      seen.add(
+        (data[i] << 24) | (data[i + 1] << 16) | (data[i + 2] << 8) | data[i + 3],
+      );
+      if (seen.size > 4096) break; // 只需要知道「已经爆了」，不必数完
+    }
+    this.paletteSize = seen.size;
+  }
+
+  /**
+   * 画一行**硬边**文字（B）。
+   *
+   * 先画进离屏层 → 按 alpha 阈值二值化 → 合成回主画布。中间灰度全被抹掉，
+   * 于是放大 1.36 倍之后每个纹素非亮即灭，不再有一圈被拉成块的软边。
+   *
+   * 为什么不在主画布上直接阈值整张图：那会连底噪、扫描线的半透明叠加一起量化，
+   * 等于顺手改了别的层的效果；只处理文字层，改动面正好是被审的那一件事。
+   */
+  private drawCrispLine(text: string, color: string, y: number): void {
+    const scratch = this.scratchCtx;
+    scratch.clearRect(0, 0, this.width, H);
+    scratch.fillStyle = color;
+    scratch.textBaseline = 'middle';
+    scratch.fillText(text, 8, y);
+    const image = scratch.getImageData(0, 0, this.width, H);
+    const data = image.data;
+    for (let i = 0; i < data.length; i += 4) {
+      data[i + 3] = data[i + 3] >= CRISP_ALPHA ? 255 : 0;
+    }
+    scratch.putImageData(image, 0, 0);
+    this.ctx.drawImage(this.scratch, 0, 0);
+  }
+
   private paint(top: string, bottom: string): void {
     const ctx = this.ctx;
     ctx.fillStyle = LED_OFF;
@@ -194,16 +275,13 @@ export class MarqueeScreen {
     ctx.textBaseline = 'middle';
     // 屏现在铺满檐板 ⇒ 没有第二行时把唯一一行**垂直居中**，
     // 否则上半屏有字、下半屏一片空黑，看着像坏了一半。
-    ctx.fillStyle = BRASS;
-    ctx.fillText(top, 8, bottom ? 18 : H / 2);
-    if (bottom) {
-      ctx.fillStyle = DIM;
-      ctx.fillText(bottom, 8, 44);
-    }
+    this.drawCrispLine(top, BRASS, bottom ? 18 : H / 2);
+    if (bottom) this.drawCrispLine(bottom, DIM, 44);
     // 不再画压圈边框：屏已经铺满檐板的平坦区，檐板自己的倒角就是它的框。
     // （原先那条 2px 实线还被点阵缝隙横穿、切成了一段段的「虚线框」——
     //  缝隙去掉后它顶多变成实线，而实线也不是想要的。）
     this.paintScanlines();
+    this.measurePalette();
     this.painted = [top, bottom];
     this.dirty = false;
     this.texture.needsUpdate = true;
