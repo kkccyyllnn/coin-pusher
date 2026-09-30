@@ -3620,6 +3620,7 @@ export class Game {
       gravity: this.tuning.gravity,
       solverIterations: this.tuning.solverIterations,
       erp: this.tuning.erp,
+      predictionDistance: this.tuning.predictionDistance,
     });
     // 每枚币的额外迭代次数：这是**币自己的属性**（走 RigidBody 而不是世界参数），
     // 所以要在币池上逐个施加。默认 0——见 `Coin` 构造函数的注释。

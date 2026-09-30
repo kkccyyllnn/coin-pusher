@@ -22,6 +22,11 @@ export type GameTuning = {
   solverIterations: number;
   /** 位置修正比（ERP）。 */
   erp: number;
+  /**
+   * 预测接触距离（米）。落币「蹦一下」的开关——见 `PHYSICS.predictionDistance` 的实测记录。
+   * 它是**全局**窄相参数，改它同时改推板与币的接触生成距离，所以带 `WARN`。
+   */
+  predictionDistance: number;
   /** 每枚币额外追加的求解器迭代次数。 */
   coinSolverIterations: number;
   cameraFov: number;
@@ -93,6 +98,7 @@ export function createDefaultTuning(): GameTuning {
     gravity: PHYSICS.gravity,
     solverIterations: PHYSICS.solverIterations,
     erp: PHYSICS.erp,
+    predictionDistance: PHYSICS.predictionDistance,
     coinSolverIterations: COIN.additionalSolverIterations,
     cameraFov: 42,
     exposure: 1.06,
@@ -239,11 +245,16 @@ export class DebugTools {
     // 不需要逐个挂 `.onChange`：root 上的 `gui.onChange` + 对象守卫已覆盖全部控件。
     folder.add(this.tuning, 'solverIterations', 2, 16, 1).name('求解器迭代' + WARN);
     folder.add(this.tuning, 'erp', 0.05, 0.9, 0.05).name('位置修正 ERP' + WARN);
+    // 步长 0.002 是刻意选的：Rapier 默认 0.002 与本项目采用的 0.10 都落在格点上，
+    // 这条滑杆因此可以直接做「落币蹦不蹦」的同会话 A/B 换臂。
+    folder.add(this.tuning, 'predictionDistance', 0, 0.15, 0.002).name('预测接触距离' + WARN);
     folder.add(this.tuning, 'coinSolverIterations', 0, 4, 1).name('币额外迭代' + WARN);
     this.appendNote(
       folder,
       '⚠ ERP 调低会让整堆币沉进地板（0.2 时 318 枚里 299 枚币心在地板下）；' +
-        '币额外迭代设成 1 会让整堆沉 24~34mm 后睡着。改完请重跑 pace / economy。',
+        '币额外迭代设成 1 会让整堆沉 24~34mm 后睡着。改完请重跑 pace / economy。' +
+        '⚠ 预测接触距离调回 Rapier 默认 0.002 会让落币随机蹦起（实测中位 2mm 但 max 333mm）；' +
+        '0.10 以上跳起归零。它是全局窄相参数，改完同样要重跑 pace。',
     );
   }
 
@@ -523,6 +534,7 @@ export class DebugTools {
               gravity: defaults.gravity,
               solverIterations: defaults.solverIterations,
               erp: defaults.erp,
+              predictionDistance: defaults.predictionDistance,
               coinSolverIterations: defaults.coinSolverIterations,
               conveyorSpeed: defaults.conveyorSpeed,
               pusherTravel: defaults.pusherTravel,

@@ -58,6 +58,7 @@ export class PhysicsWorld {
       gravity: PHYSICS.gravity,
       solverIterations: PHYSICS.solverIterations,
       erp: PHYSICS.erp,
+      predictionDistance: PHYSICS.predictionDistance,
     });
     return instance;
   }
@@ -69,7 +70,12 @@ export class PhysicsWorld {
    * 「载荷 ↔ 位置修正 ↔ 迭代次数」三者的平衡，只有能在同一条盘面上逐个改、
    * 立刻重新量，才知道是哪一项在起作用。改完不需要重建世界，下一帧就生效。
    */
-  applyTuning(patch: { gravity?: number; solverIterations?: number; erp?: number }): void {
+  applyTuning(patch: {
+    gravity?: number;
+    solverIterations?: number;
+    erp?: number;
+    predictionDistance?: number;
+  }): void {
     if (patch.gravity !== undefined) {
       this.world.gravity = { x: 0, y: patch.gravity, z: 0 };
     }
@@ -80,15 +86,24 @@ export class PhysicsWorld {
     if (patch.erp !== undefined) {
       params.erp = Math.min(1, Math.max(0.01, patch.erp));
     }
+    if (patch.predictionDistance !== undefined) {
+      params.predictionDistance = Math.min(0.25, Math.max(0, patch.predictionDistance));
+    }
   }
 
   /** 当前物理旋钮，供诊断与验证脚本记录「这一跑用的是哪组值」。 */
-  get tuning(): { gravity: number; solverIterations: number; erp: number } {
+  get tuning(): {
+    gravity: number;
+    solverIterations: number;
+    erp: number;
+    predictionDistance: number;
+  } {
     const params = this.world.integrationParameters;
     return {
       gravity: this.world.gravity.y,
       solverIterations: params.numSolverIterations,
       erp: params.erp,
+      predictionDistance: params.predictionDistance,
     };
   }
 

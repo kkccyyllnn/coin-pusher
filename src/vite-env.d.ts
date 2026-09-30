@@ -186,6 +186,7 @@ interface ThreeGameDiagnostics {
       gravity: number;
       solverIterations: number;
       erp: number;
+      predictionDistance: number;
       coinSolverIterations: number;
       coin: {
         density: number;
