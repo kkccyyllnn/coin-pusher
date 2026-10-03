@@ -306,13 +306,27 @@ test.describe('币塔街机机台', () => {
     );
     expect(mid?.phase).toBe('playing');
 
+    const beforeRestart = await diagnostics(page);
     await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.startRun?.());
     await waitFrames(page, 3);
     const state = await diagnostics(page);
     expect(state?.earned).toBe(0);
-    // 钱包够的话，重开一局的入场筹码和上一局一样（buyIn = min(20, 钱包)）。
-    expect(state?.chips).toBe(initialChips);
-    expect(state?.buyIn).toBe(initialChips);
+    /*
+     * ★ S4 合并账户：这两行原来断的是「重开后的筹码 = 最初的入场额」（都等于 `initialChips`），
+     *   因为旧模型每次 `startRun` 都从钱包扣 20 买入 ⇒ 重开必然把桌上重置成入场额。
+     *   合并之后**重开不花一分钱** ⇒ 余额延续上一段的值（实测比 `initialChips` 多几枚，
+     *   就是那 30 帧里盘面越线的净返值）。⇒ 这不是回归，是这条用例的**指称物变了**。
+     *
+     * 新的断法比旧的更硬，也更贴近 S4 想保证的事：
+     *   `initial === chips`（新段的基准就等于账户余额，没有任何"入场费"抬高或压低它）
+     *   + `spent / earned / loaned` 全归零（新段的账是干净的）。
+     * 和重开前那一刻比而不是和 `initialChips` 比：中间仍有帧会结算越线，
+     * 拿 `initialChips` 当基准就把一个时间差写成了常数（`spent === 1` 那段注释是同一个教训）。
+     */
+    expect(state?.chips).toBe(beforeRestart?.chips);
+    expect(state?.initial).toBe(beforeRestart?.chips);
+    expect(state?.spent).toBe(0);
+    expect(state?.loaned).toBe(0);
     expect(state?.phase).toBe('ready');
     expect(state?.pusher.running).toBe(false);
     expect(state?.pusher.cycles).toBe(0);
@@ -432,6 +446,14 @@ test.describe('币塔街机机台', () => {
     // 「整幅微微变暗」了 —— 宁可只在能证的地方证。
     // 待办：谁定位到 webkit 那条抖动（怀疑是 preserveDrawingBuffer:false 下的
     // 合成器重采样），就把这个 skip 摘掉。
+    // ★ 10-01 定性结案：**这条 skip 是判据形式的固有约束，不是待修的缺陷。**
+    // 「逐像素全等」要成立，前提是同一帧能被确定性取回；上面已经量出取回路径本身
+    // 在 playwright×webkit 下会差 55529 个像素，而我们的代码没有那个变量。
+    // 放宽成比例阈值能过，但就抓不到 G1 那类「整幅微微变暗」——所以恒等版只留在
+    // 能证的 desktop-chrome。**webkit 上的覆盖没有丢**：同文件后面那条分布判据
+    // （「把抖动量本身测进来当基准，再要求信号至少是它的 20 倍」）在两个 project
+    // 都跑，它才是跨浏览器的描边判据。⇒ 摘 skip 的唯一条件是「webkit 取回变确定」，
+    // 而那要改的是 playwright，不是这里。
     test.skip(
       test.info().project.name !== 'desktop-chrome',
       '逐字节恒等判据依赖帧缓冲可确定性取回；webkit 上不可（见注释）',
@@ -519,6 +541,72 @@ test.describe('币塔街机机台', () => {
    * 再要求信号至少是它的 20 倍。webkit 的画布取回会抖（见上一条测试为什么只跑 desktop），
    * 这里不靠 skip 回避，而是把抖动量本身测进来当基准。
    */
+  test('暗部分级：amount=0 逐字节回到起点、开着量得出成片变化（#60 的恒等门 + 调试通道）', async ({ page }) => {
+    // 与描边那条恒等判据同一个约束：逐字节比较只在 `desktop-chrome` 上做
+    //（webkit 的画布取回路径本身会抖，见上面 G2 那条的结案注释）。
+    test.skip(
+      test.info().project.name !== 'desktop-chrome',
+      '逐字节恒等判据依赖帧缓冲可确定性取回；webkit 上不可（与描边那条同因）',
+    );
+    await page.goto('/');
+    await page.evaluate(async () => {
+      const hooks = window.__THREE_GAME_TEST_HOOKS__;
+      hooks?.seed?.(20260921);
+      hooks?.setState?.('ready');
+      await hooks?.setReducedMotion?.(true);
+      hooks?.setQuality?.('high');
+    });
+    // 静置到币堆落定再冻结：庚案之后沉降仍会持续一会儿，不静置量到的是动画不是分级。
+    await page.waitForTimeout(6000);
+    await page.evaluate(async () => {
+      const hooks = window.__THREE_GAME_TEST_HOOKS__;
+      await hooks?.setPausedForScreenshot?.(true);
+      // ★ 显式归零，**不依赖出厂默认**（默认档以后会随判图调整，依赖它等于把判据寄在别人的值上）。
+      hooks?.setTuning?.({ shadowGrade: 0 });
+    });
+    await waitFrames(page, 30);
+
+    const shot = async () => PNG.sync.read(await page.locator('#game-canvas').screenshot());
+    const zero = await shot();
+    const zeroAgain = await shot();
+    // 先证明「冻结 + 同一设置」确实可确定性取回，否则后面所有比较都没有意义。
+    expect(Buffer.compare(zero.data, zeroAgain.data), diffSummary(zero, zeroAgain)).toBe(0);
+
+    const changedAgainst = async (other: { data: Uint8Array; width: number; height: number }) => {
+      let changed = 0;
+      for (let pixel = 0; pixel < zero.width * zero.height; pixel++) {
+        const offset = pixel * 4;
+        const d =
+          Math.abs(zero.data[offset] - other.data[offset]) +
+          Math.abs(zero.data[offset + 1] - other.data[offset + 1]) +
+          Math.abs(zero.data[offset + 2] - other.data[offset + 2]);
+        if (d > 4) changed++;
+      }
+      return changed;
+    };
+
+    await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setTuning?.({ shadowGrade: 0.12 }));
+    await waitFrames(page, 3);
+    const graded = await shot();
+    const gradedChanged = await changedAgainst(graded);
+    const gradedRatio = gradedChanged / (zero.width * zero.height);
+    console.log(
+      `[暗部分级] 0 → 0.12：有变化的像素 ${gradedChanged} 个（${(gradedRatio * 100).toFixed(2)}% 全画面）`,
+    );
+    // 分级是**滤色**（screen），所以这里不断言方向（变亮是设计），只断言"它真的作用到大片像素"。
+    expect(gradedRatio, '分级开着必须有成片作用；接近 0 说明旋钮或权重接错了线').toBeGreaterThan(0.01);
+
+    // ★ 恒等门：回到 amount=0 必须与起点**逐字节相同** —— `screen(base, 0)` 在 IEEE 上是恒等，
+    //   所以任何残差都意味着实现坏了（这条就是 #60 欠的那个"留调试通道 + 能证明关掉即原样"）。
+    await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setTuning?.({ shadowGrade: 0 }));
+    await waitFrames(page, 3);
+    const backToZero = await shot();
+    expect(
+      Buffer.compare(zero.data, backToZero.data),
+      `回到 amount=0 后与起点仍有差：${diffSummary(zero, backToZero)}`,
+    ).toBe(0);
+  });
+
   test('描边强度落在硬带内：覆盖率与线深都量化可查，且随强度单调', async ({ page }) => {
     await page.goto('/');
     await page.evaluate(async () => {
@@ -610,39 +698,109 @@ test.describe('币塔街机机台', () => {
     expect(after?.earned).toBe(0);
   });
 
-  test('破产弹窗 → 收工 → 再来一局：整条闭环复位', async ({ page }) => {
+  test('触底 → 贷款续玩（本局延续、不重开）→ 收工 → 再来一局：整条闭环复位', async ({ page }) => {
     await page.goto('/');
     await waitForFrame(page, 5);
 
     const spec = await table(page);
     await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setState?.('ruin'));
 
-    // 破产弹窗是核心产出，不是失败页；数字全部是筹码口径，不能再出现「分数」。
+    // ★ S3 去局感：非总结态的标题是「续玩报价」而不是「破产」——触底是岔口，不是终点。
+    //   这里**刻意按文案断言**：这条用例的职责之一就是「叙事不许悄悄退回旧版」。
+    //   （DOM id 仍叫 `#ruin-*`，那是刻意不改名——`endless.ruinVisible` 与一片判据挂在上面。）
     await expect(page.locator('#ruin-panel')).toBeVisible();
-    await expect(page.locator('#ruin-title')).toHaveText('破产');
+    await expect(page.locator('#ruin-title')).toHaveText('续玩报价');
+    // 三个真选择都在位，且**贷款排在跪求之前**——DOM 顺序就是玩家看到的按钮顺序。
+    await expect(page.locator('#loan-button')).toBeVisible();
     await expect(page.locator('#beg-button')).toBeVisible();
+    // 数字全部是筹码口径，不能再出现「分数」。
     await expect(page.locator('#ruin-stats')).toContainText('本局赚进');
     await expect(page.locator('#ruin-stats')).not.toContainText('分数');
 
-    // 收工 → 总结卡片（同一张面板，换标题、隐藏跪求、显示回存）。
+    /*
+     * ★ S3 的新正文：断言的是**什么都没被重置**。走真实按钮点击而不是钩子——
+     *   钩子只证明函数对，按钮才证明玩家能用的那条路对
+     *   （`bindRuinActions` 的第三个回调、以及「到顶就藏按钮」的 gating 都挂在这条上）。
+     *
+     * ⚠️ 判别量的形状是**变异测出来才改对的**，两段弯路都留在原地，免得下次重踩：
+     *   ① 第一版比「枚数相等」⇒ 变异（贷款路径里塞一句 `startRun()`）时**照样过**，
+     *      因为重开会摆回同一套预置布局，枚数当然相同。比数量只证明「没少」，不证明「没重置」。
+     *   ② 改比「逐枚位置指纹」⇒ 推演后发现**这个场景里它也证明不了**：
+     *      破产态的盘面本来就是初始布局，重开摆回去还是同一套，指纹相同。
+     *      （而且贷款会把推板重新开起来，位置还会随帧动 ⇒ 那条断言甚至会假红。）
+     *   ⇒ 真正无时序依赖、又能区分「续玩」与「重开」的是**本局账目不被清零**：
+     *      `spent` 由破产前的 `spendChips` 造成（×1.1 档实测 20），`startRun()` 会把它归零，
+     *      而贷款续玩必须让它原样留着。`phase` 是同向的第二道（重开⇒'ready'，续玩⇒'playing'）。
+     */
+    const beforeLoan = await diagnostics(page);
+    await page.locator('#loan-button').click();
+    await waitFrames(page, 3);
+    const afterLoan = await diagnostics(page);
+
+    await expect(page.locator('#ruin-panel')).toBeHidden();
+    // 本局没被重开，而是从沉降里被拉回来。
+    expect(afterLoan?.phase).toBe('playing');
+    // ★ 判别量：账目延续（重开会把 spent/earned/begged 全部清零）。
+    expect(afterLoan?.spent).toBe(beforeLoan?.spent);
+    expect(afterLoan?.earned).toBe(beforeLoan?.earned);
+    expect(afterLoan?.begged).toBe(beforeLoan?.begged);
+    expect(afterLoan?.activeCoins).toBe(beforeLoan?.activeCoins);
+    /*
+     * 贷来的钱记进 `loaned`，余额同时 +20。
+     * ★ S4 之前这里断的是「`buyIn` 与 `chips` 同时加同一个数」；合并账户之后没有买入可言，
+     *   贷款就是一笔**单独的进账项** ⇒ 恒等式右边多了 `loaned` 一项，
+     *   而 `initial`（本段开始时的余额）**必须一动不动** —— 两件事一起断才封住
+     *   「把贷款记成初始余额」这种会把整段基准偷偷抬高的写法。
+     */
+    expect(afterLoan?.loaned).toBe((beforeLoan?.loaned ?? 0) + 20);
+    expect(afterLoan?.initial).toBe(beforeLoan?.initial);
+    expect(afterLoan?.chips).toBe((beforeLoan?.chips ?? 0) + 20);
+    expect(afterLoan?.chips).toBeGreaterThan(0);
+    // S0a 之后账平与否由**引擎自己判**；欠款那行小字必须真的出现在 HUD 上。
+    expect(afterLoan?.balanced).toBe(true);
+    await expect(page.locator('#debt-line')).toBeVisible();
+    await expect(page.locator('#debt-note')).toContainText('欠款 20 / 100');
+
+    // ── 再触底 → 收工 → 总结卡片 ──
+    await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setState?.('ruin'));
     await page.locator('#quit-button').click();
     await expect(page.locator('#ruin-panel')).toBeVisible();
     await expect(page.locator('#ruin-title')).toHaveText('本局结束');
     await expect(page.locator('#beg-button')).toBeHidden();
-    await expect(page.locator('#ruin-stats')).toContainText('回存钱包');
+    // 总结卡片上**不该有贷款按钮**：本局已经结束，借钱没有对象。
+    // 刻意用 toBeHidden 而不是不检查——「藏掉而不是留着可点」是这条的设计决定。
+    await expect(page.locator('#loan-button')).toBeHidden();
+    await expect(page.locator('#ruin-stats')).toContainText('余额');
 
-    // 再来一局 → 面板收起、盘面与筹码复位。
+    /*
+     * ── 再来一局 ──
+     * ★ S4 合并账户改变了这一段的正确答案，而且改得对：
+     *   旧模型里「再来一局」总得到一个干净新局，因为钱包与桌上筹码是两只口袋，
+     *   而 `setState('ruin')` 这个夹具只能抽干「桌上」那一只 ⇒ 钱包还剩得多，
+     *   重开必然买到 20 筹码。合并之后只剩一只账户，夹具抽干的就是**全部余额** ⇒
+     *   重开时余额 0 ⇒ `startRun` 的「开局即见底」分支立刻再次弹出报价面板。
+     *   这正是「触底不是终点」应有的样子：没钱就当场被问「要不要贷一笔」，
+     *   而不是白送一局新局（旧行为其实是个漏洞：抽干桌子不影响那只富着的钱包）。
+     * ⇒ 所以这里断的是**面板重新可见、贷款按钮可点、盘面一个子都没少**，
+     *   而不是旧版的「面板收起 + 余额 < 200」（后者现在恒真到没有信息量）。
+     */
     await page.locator('#quit-button').click();
-    await expect(page.locator('#ruin-panel')).toBeHidden();
     await waitFrames(page, 3);
+    await expect(page.locator('#ruin-panel')).toBeVisible();
+    await expect(page.locator('#ruin-title')).toHaveText('续玩报价');
+    await expect(page.locator('#loan-button')).toBeVisible();
 
-    const state = await diagnostics(page);
-    expect(state?.earned).toBe(0);
-    expect(state?.phase).toBe('ready');
-    expect(state?.pusher.running).toBe(false);
-    expect(state?.activeCoins).toBe(spec?.coins);
-    expect(state?.endless.ruinVisible).toBe(false);
-    // 破产那一局一枚都没赚回来，所以回存 0；钱包只剩两次买入扣掉的部分。
-    expect(state?.wallet).toBeLessThan(200);
+    const broke = await diagnostics(page);
+    expect(broke?.balance).toBe(0);
+    expect(broke?.chips).toBe(0);
+    // 「开局即见底」走的是既有沉降分支：`beginPlay()` + `enterRuinSettle()` ⇒ 阶段是 `drainOut`
+    // 而不是 `ready`（旧模型里这一步几乎不会触发，因为钱包总在另一只口袋里剩着）。
+    expect(broke?.phase).toBe('drainOut');
+    expect(broke?.pusher.running).toBe(false);
+    // 报价/贷款这条路径不重开盘面（S3 定的那条恒等式），见底也不例外。
+    expect(broke?.activeCoins).toBe(spec?.coins);
+    expect(broke?.endless.ruinVisible).toBe(true);
+    // 余额归零这一段账本仍然平（恒等式不因余额为 0 而失效）。
+    expect(broke?.balanced).toBe(true);
   });
 });

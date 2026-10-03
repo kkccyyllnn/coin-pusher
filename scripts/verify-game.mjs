@@ -10,7 +10,7 @@
  *   layout     无尽台面配置摘要（含币池预算余量告警）
  *   physics    满盘静置 10 秒 / 推板 10 循环节拍 / 上层留存
  *   endless    无尽核心：开局态 / 大赏币 / 热度倍率 / 破产 / 跪求 / 收工 / 热区 / 加注
- *   economy    三账本恒等式 / 钱包守恒 / 跪求不可回存 / 单位期望与庄家优势
+ *   economy    账本恒等式 / 余额守恒（全局终身账）/ 脏钱不可换永久进度 / 单位期望与庄家优势
  *   xixi       XIXI 集章与背板老虎机（P5 起替换三路集章）
  *   mechanisms 三个机关：扫板 / 抓斗 / 后装填
  *   sweep      推板行程参数扫描（默认两端 0.8/1.16，可用 SWEEP=0.8,1.0,1.16 分批覆盖）
@@ -50,6 +50,16 @@ const BASE = (() => {
   return `${url}${url.includes('?') ? '&' : '?'}${COIN_PARAM}`;
 })();
 const MODE = process.argv[2] ?? 'probe';
+
+/**
+ * 每局投币上限（协议常量，也是 economy 的截断量）。
+ *
+ * ★ 为什么要具名：它原先只是 playRun 的默认参数值，而 ⑥ 的『局长不崩溃』上界写在另一处
+ *   （CRASH_LENGTH，历史值 300）。于是**上界永远够不到**——协议先在 240 截断，判据再宽也不会红
+ *   ⇒ 『右尾变厚』这件事在 10-01 之前没有任何一条门在守（段 1 实测：所有 timeout 局停在 239~240 投）。
+ *   两处写同一个数就是第二份真源 ⇒ 判据从本常量派生，playRun 也引用它。
+ */
+const ECON_RUN_DROPS_CAP = 240;
 
 /**
  * 虚拟时钟泵（只有 ECON_CLOCK=1 才开，默认关）。
@@ -271,25 +281,33 @@ async function playerCoin(page) {
  * 开一局新的。state 取 ready / playing / drain / ruin / settled。
  * 每次都重新打开遥测：开发服务器整页刷新会重建 Game 实例，
  * 只在一开始打开一次的话，刷新之后遥测就静默关闭了。
+ *
+ * `stake` 是**补足的目标余额**（默认 200）——见下面那段「为什么开局前要补钱」。
+ * `economy` 批会把它压到标准注额，理由见 `runEconomy` 里的 `STAKE`。
  */
-async function startRun(page, state = 'ready') {
+async function startRun(page, state = 'ready', stake = 200) {
   await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.seed?.(20260921));
-  // **先补满钱包再开局。**
+  // **先把余额补到 `stake` 再开局。**
   //
-  // 每次 `startRun` 都从钱包扣 20，而只有收工（`endRun` → `showEndlessSummary`）
-  // 才回存。脚本在同一个会话里跑十几条用例就会把钱包掏空，于是 `buyIn` 变 0 ——
+  // 合并账户（S4）之前这条写作「每次 `startRun` 都从钱包扣 20，只有收工才回存」：
+  // 脚本在同一个会话里跑十几条用例就会把钱包掏空，于是 `buyIn` 变 0 ——
   // 而引擎现在会正确地以「开局即破产」响应（见 `Game.startRun` 的零筹码分支）：
   // 弹破产窗、进沉降、`playRun` 的循环立刻 break，下游全部读成 0 投 0 入账。
   //
-  // 这些用例测的是玩法，不是破产。破产那条路径有专门的用例（见 `runEndless` 的
-  // 「钱包见底」检查），它自己会把钱包清零。所以这里先补满。
+  // ★ 合并之后**没有「买入」这笔转账了**，但这件事没有消失，只是换了成因：
+  //   一局就是把余额投到见底为止，所以上一局破产时余额已经是 0 ⇒ 不补就开下一局，
+  //   第一条币都投不出去，下游照样全部读成 0。结论与修法都不变。
   //
-  // 充值额记进 `SaveStore.refilled`，钱包守恒算式（`runEndless` 的 ②）把它算进去。
-  await page.evaluate(() => {
+  // 这些用例测的是玩法，不是破产。破产那条路径有专门的用例（见 `runEndless` 的
+  // 「余额见底」检查与 `runEconomy` 的 ⑤′），它们自己会把余额清零。所以这里先补满。
+  //
+  // 充值额记进 `SaveStore` 的 `totals.refill`（旧名 `refilled`），
+  // 余额守恒算式（`runEndless` 与 `runEconomy` 的 ②）把它算进去。
+  await page.evaluate((target) => {
     const hooks = window.__THREE_GAME_TEST_HOOKS__;
-    const wallet = hooks?.run?.()?.wallet ?? 0;
-    if (wallet < 200) hooks?.refillWallet?.(200 - wallet);
-  });
+    const balance = hooks?.run?.()?.balance ?? 0;
+    if (balance < target) hooks?.refillWallet?.(target - balance);
+  }, stake);
   await page.evaluate((name) => window.__THREE_GAME_TEST_HOOKS__?.setState?.(name), state);
   await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.enableTelemetry?.());
 }
@@ -437,8 +455,8 @@ async function waitForRunEnd(page, timeoutMs = 150_000) {
  * `drops` 只是防死循环的上限；`waitEnd: false` 用于只需要一段推进数据的模式
  * （sweep / pace），它们不关心收尾。
  */
-async function playRun(page, { drops = 240, lanes, waitEnd = true } = {}) {
-  await startRun(page, 'playing');
+async function playRun(page, { drops = ECON_RUN_DROPS_CAP, lanes, waitEnd = true, stake, loanOnRuin = false } = {}) {
+  await startRun(page, 'playing', stake);
   /* 本局长度的零点必须取在 `startRun` **之后**。
      `Game.ts:1739` 每次开局把 `elapsed` 归零，所以它是「本局自己的钟」而不是会话钟：
      在开局前取零点就会跨局相减，实测把 193 投的一局读成 `仿真 0s`
@@ -449,9 +467,29 @@ async function playRun(page, { drops = 240, lanes, waitEnd = true } = {}) {
   // 冷启动兜底：首投必须**真的被接受**（见 `primeFirstDrop` 的说明）。
   await primeFirstDrop(page, pickLanes[0]);
   let lastCycle = (await readState(page))?.pusher.cycles ?? 0;
+  /** 本局**就地贷款续玩**的次数（只在 `loanOnRuin` 下非 0）。 */
+  let loans = 0;
   for (let index = 1; index < drops; index += 1) {
     const state = await readState(page);
-    if (state?.endless?.ruinVisible === true || state?.phase === 'settled') break;
+    if (state?.endless?.ruinVisible === true || state?.phase === 'settled') {
+      /*
+       * `loanOnRuin`：**在破产态就地贷款续玩，而不是收工重开**。
+       * 存在的理由只有一条：S2 的欠债-分流机制要能被量到，账户必须先被借过。
+       * 默认关（`ECON_LOAN` 未设）⇒ 判据走的还是「一局投到底」这条老路，与既有标定可比。
+       * 开的时候这条循环变成「借到借不动为止」，一局可以横跨多次报价 ⇒ 读数是**稳态口径**，
+       * 不能再和默认批的局长/timeout 占比逐位比。
+       */
+      const rescued = loanOnRuin
+        ? await page.evaluate(
+            () => window.__THREE_GAME_TEST_HOOKS__?.loanToContinue?.()?.applied ?? 0,
+          )
+        : 0;
+      if (rescued > 0) {
+        loans += 1;
+        continue;
+      }
+      break;
+    }
     if (state?.phase !== 'drainOut') {
       // 这个 20 秒是**死循环兜底**，不是局长来源：每圈都以「推板多走一个循环」为进度条件，
       // 所以投币节奏本身已经是仿真对齐的。局长口径只在 `waitForRunEnd` 里定。
@@ -468,6 +506,7 @@ async function playRun(page, { drops = 240, lanes, waitEnd = true } = {}) {
     return {
       ...capped,
       end: 'cap',
+      loans,
       runSeconds: Math.max(0, (capped?.elapsed ?? runStart) - runStart),
     };
   }
@@ -476,6 +515,7 @@ async function playRun(page, { drops = 240, lanes, waitEnd = true } = {}) {
     ...state,
     boostResolved,
     end,
+    loans,
     runSeconds: Math.max(0, (state?.elapsed ?? runStart) - runStart),
   };
 }
@@ -527,20 +567,39 @@ async function readAllowedGains(hooks) {
 }
 
 /**
- * 三账本恒等式：`chips === buyIn + earned + begged − spent`。
+ * 账本恒等式：`balance === initial + earned + begged + loaned − spent`（S4 合并账户之后）。
  * 任何一条收尾路径、任何一帧都不能破——这是 P1 的核心验收。
  */
 function ledgerOk(state) {
   if (!state) return false;
-  return (
-    state.chips === (state.buyIn ?? 0) + (state.earned ?? 0) + (state.begged ?? 0) - (state.spent ?? 0)
-  );
+  // ★ 恒等式由**引擎自己判**：`Game.ts` 的 `ledger().balanced` ← `economy.ledgerBalances`。
+  // 这里原先手抄了同一个算式（`chips === buyIn + earned + begged − spent`），
+  // 于是 `Ledger` 加一项就要同步两处，漏一边就是「src 绿、spec 红」的假回归对。
+  // ⚠️ **缺字段一律判不平**（而不是 fallback 自己算）：`balanced === undefined` 只可能是
+  // 钩子那条路没把字段带上来，那正是「判据失效却显示绿」的形态 ⇒ 必须当场红给我看。
+  // 本函数有 23 处调用点，全部跟着这一条语义走。
+  return state.balanced === true;
 }
 
 function ledgerText(state) {
   return (
-    `筹码 ${state?.chips} = 买入 ${state?.buyIn} + 赚进 ${state?.earned} + ` +
-    `跪求 ${state?.begged} − 消耗 ${state?.spent}`
+    `余额 ${state?.balance} = 起始 ${state?.initial} + 赚进 ${state?.earned} + ` +
+    `跪求 ${state?.begged} + 贷款 ${state?.loaned} − 花费 ${state?.spent}` +
+    // ★ 判据改成读引擎的 `balanced` 之后，这一行**必须自己带上结论**：
+    // 否则一条红的判据会打印出一串看着成立的等式（变异测试时就出现过
+    // 「FAIL 但文本写着 20 = 20 + 0 + 0 − 0」），读日志的人查不出为什么红。
+    // 差额用现成的 `ledgerDeltaOf` 的口径，不在这里再造式子。
+    `（引擎判账本${state?.balanced === undefined ? '字段缺失' : state?.balanced ? '平' : '不平'}，` +
+    `差额 ${ledgerDeltaOf(state)}）`
+  );
+}
+
+/** 与 `economy.ledgerDelta` 同一个口径；只用于打印，不参与判据。 */
+function ledgerDeltaOf(state) {
+  if (!state) return null;
+  return (
+    state.balance -
+    ((state.initial ?? 0) + (state.earned ?? 0) + (state.begged ?? 0) + (state.loaned ?? 0) - (state.spent ?? 0))
   );
 }
 
@@ -640,12 +699,13 @@ async function runProbe(page) {
    * （S13 实测 1.565 枚/循环，见 PLAN-v4）。所以这里改成量**机制**，不再量行程：
    *
    *   ① 币确实**落下来停稳**了（y 在末段不再变）—— 抓「卡在落币走廊里 / 悬空 / 抖动」；
-   *   ② 推板一个循环给它**正的净前进量**。
+   *   ② 推板一个循环**不偷给币净前进量**（对称行程 ⇒ 每循环净漂移 ≈ 0）。
    *
-   * ② 直接编码 S13 的核心不变式：**对称行程下净输送精确为 0**
-   * （库仑摩擦与对称 smoothstep 都满足时间反演对称）。所以谁把
-   * `PUSHER_CYCLE.retract` 改回等于 `extend`，这条立刻红 —— 它比原来那条
-   * 「12 秒走完台面」更贴近要守的东西，也不会被「台面铺多满」影响。
+   * ② 直接编码 S23 的核心不变式：**`extend == retract` 的对称行程下净输送精确为 0**
+   * （库仑摩擦与对称 smoothstep 都满足时间反演对称）。★ 出厂态**就是**对称的
+   * （现读 `PUSHER_CYCLE`：extend 0.9 / retract 0.9 / holdFront 0.3 / holdBack 0.3），
+   * 所以谁把 `retract` 改得**不等于** `extend` —— S13 曾把它改成 0.45 ⇒ 实测净输送比本上限高一个数量级 ——
+   * 这条立刻红。它比原来那条「12 秒走完台面」更贴近要守的东西，也不会被「台面铺多满」影响。
    */
   const tail = timeline.filter((row) => row.coin).slice(-5).map((row) => row.coin.y);
   const ySwing = tail.length >= 2 ? Math.max(...tail) - Math.min(...tail) : 9;
@@ -676,13 +736,22 @@ async function runProbe(page) {
     await page.waitForTimeout(60);
   }
   const netDrift = phaseZs.length >= 2 ? phaseZs[phaseZs.length - 1] - phaseZs[0] : null;
+  const perCycle = netDrift !== null ? netDrift / (phaseZs.length - 1) : null;
+  // 上限取层高/10（×1.1 档 = 2.32 毫米/循环）：已观测读数在 0~0.5 毫米/循环之间，留 4.6 倍余量。
+  // ⚠️ 这个上限是 **probe 默认盘面（预置 382 枚）的属性**，不是普适常数：S1a 实测薄床
+  //    （clearBedTo(120)）时同一枚币能走 3.2 毫米/循环 ⇒ 换盘面要重推。
+  //    ⇒ 读数里必须把台面枚数一起打出来，场景一变当场可见。
+  const driftLimit = geo().layerStep / 10;
+  const stateAtSample = await readState(page);
+  const deckAtSample = stateAtSample?.deckCoins ?? -1;
+  const activeAtSample = stateAtSample?.activeCoins ?? -1;
   check(
-    '单枚币在台面上被净向前输送（每个循环净前进 > 0）',
-    netDrift !== null && netDrift > 0,
-    phaseZs.length >= 2
-      ? `z ${phaseZs[0].toFixed(3)} → ${phaseZs[phaseZs.length - 1].toFixed(3)}，` +
-        `净前进 ${(netDrift * 1000).toFixed(0)} 毫米 / ${phaseZs.length - 1} 个循环`
-      : `只采到 ${phaseZs.length} 个循环（币已离场或超时）`,
+    '单枚币不被偷偷赋予净输送（对称行程 ⇒ 每循环 |净漂移| <= 层高/10）',
+    perCycle !== null && Math.abs(perCycle) <= driftLimit,
+    perCycle === null
+      ? `只采到 ${phaseZs.length} 个循环（币已离场或超时）`
+      : `每循环净漂移 ${(perCycle * 1000).toFixed(2)} 毫米（上限 ${(driftLimit * 1000).toFixed(2)} 毫米 = 层高/10）` +
+        `，采样时台面 ${deckAtSample} 枚 / 活跃 ${activeAtSample} 枚（上限按默认预置盘面标定，换盘面须重推）`,
   );
 
   /*
@@ -1260,18 +1329,39 @@ async function runEndless(page) {
     `固定值 ${FIXED_VALUES.join('/')} 筹码，已按 2 币种 × 2 热区 × 3 档加注 × 4 段连落逐组重算`,
   );
 
-  await startRun(page, 'ready');
+  /*
+   * ★ S4 之后「一局 = 全部余额」，而这套判据写于「一局 = 20 枚买入」的年代 ⇒ 入场额要钉回标准注额。
+   *
+   * 不钉的代价今天实测到了（四连红，全是同一条根因的级联）：200 枚的局在 `playRun`
+   * 的 240 投预算里**不会破产** ⇒ 「跪求续命」这条路走不到（`累计跪求 0`）、
+   * 收工之后余额已经是 0 ⇒ 「再来一局」开出一局 0 筹码（`起始 0 筹码（余额 0）`）、
+   * 于是后面的「加注扣 2 枚」读成 `筹码 0→0`、「热区」读成 `0 枚在热区内越线`。
+   * ⇒ 与 economy 同一个理由：**这是测量协议，不是产品决策**；
+   *   「玩家的局该多长 / `walletStart` 该不该改」归 S6 与用户（任务 #52）。
+   */
+  const STAKE = (await readStateFresh(page))?.endless?.referenceStake ?? 20;
+  /*
+   * ★ 光靠 `startRun` 的"不足才补"钉不住入场额：清档之后余额是 `walletStart`（200），
+   *   `200 < 20` 为假 ⇒ 不补，于是本局起始还是 200（10-01 实测：`投出 320 枚后达到上限，筹码 265（起始 200）`）。
+   *   所以必须像 economy 那样**先置位再开局**。差额记进 `totals.refill` ⇒ ② 依然精确。
+   */
+  await hooks((v) => window.__THREE_GAME_TEST_HOOKS__?.setWallet?.(v), STAKE);
+  await startRun(page, 'ready', STAKE);
   const start = await readStateFresh(page);
   const table = await readTable(page);
-  const walletStart = (await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.run?.()))?.wallet ?? 0;
+  const balanceStart = (await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.run?.()))?.balance ?? 0;
+  // ★ S4：这条判据原先写作「筹码 = 从钱包**买入**的额度」，并断言 `initial === Math.min(20, 钱包)`。
+  //   合并账户之后**没有买入这笔转账**：起始就是开局那一刻的余额本身。
+  //   `chips === initial` 因此不再是「转账成功」的证据，而是「开局到现在一分没花」——
+  //   反过来它也就顺带守住了「有人把买入加回来」这条回头路（那样 initial 会比余额多一个买入额）。
   check(
-    '开局即满盘：筹码 = 从钱包买入的额度、无目标分、无星级',
-    start?.chips === start?.buyIn &&
-      start?.buyIn === Math.min(20, walletStart) &&
+    '开局即满盘：本局起始 = 开局那一刻的余额（无买入转账）、无目标分、无星级',
+    start?.chips === start?.initial &&
+      start?.initial === balanceStart &&
       start?.phase === 'ready' &&
       start?.activeCoins === table?.coins &&
       start?.pusher.running === false,
-    `买入 ${start?.buyIn} 筹码（钱包 ${walletStart}），盘面 ${start?.activeCoins} 枚，阶段 ${start?.phase}`,
+    `起始 ${start?.initial} 筹码（余额 ${balanceStart}），盘面 ${start?.activeCoins} 枚，阶段 ${start?.phase}`,
   );
   check('开局账本平', ledgerOk(start), ledgerText(start));
 
@@ -1346,8 +1436,8 @@ async function runEndless(page) {
     '筹码归零并沉降完 → 破产弹窗',
     first.state?.endless?.ruinVisible === true &&
       (first.state?.chips ?? -1) >= 0 &&
-      (first.state?.chips ?? 0) < (first.state?.buyIn ?? 0),
-    `投出 ${first.drops} 枚后${first.reason}，筹码 ${first.state?.chips}（买入 ${first.state?.buyIn}）`,
+      (first.state?.chips ?? 0) < (first.state?.initial ?? 0),
+    `投出 ${first.drops} 枚后${first.reason}，筹码 ${first.state?.chips}（起始 ${first.state?.initial}）`,
   );
   check('破产是筹码耗尽收尾（唯一收尾原因）', first.state?.settleReason === 'exhausted');
   check('破产时账本平', ledgerOk(first.state), ledgerText(first.state));
@@ -1497,13 +1587,15 @@ async function runEndless(page) {
     await page.waitForTimeout(400);
   }
 
-  const walletBeforeCashOut = (await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.run?.()))?.wallet ?? 0;
-  const ledgerBeforeCashOut = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
+  const ledgerBeforeQuit = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
   // 成绩单记录的是**收工那一刻**的赚进，之后盘面在途币仍可能迟到越线（账本照记），
   // 实时 `earned` 会继续涨——所以基准要取收工前，而不是拿收工后的实时值去比
   // （XIXI 演出让收尾期在途币更多，这条从「偶尔」变常态）。
-  const earnedBeforeCashOut = (await readStateFresh(page))?.earned ?? 0;
+  const earnedBeforeCashOut = ledgerBeforeQuit?.earned ?? 0;
   await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.quitRun?.());
+  // ★ 这份读数必须**紧贴** `quitRun`，中间不许隔任何仿真等待：
+  //   下面那条判据断言的是「收工这一步本身不动账」，多等一秒就多一秒的合法越线进来。
+  const ledgerAtQuit = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
   await page.waitForTimeout(400);
   const summary = await readStateFresh(page);
   check(
@@ -1513,15 +1605,35 @@ async function runEndless(page) {
       summary?.endless?.ruinVisible === true,
     `历史最高赚进 ${summary?.endless?.bestEarned}（收工时 ${earnedBeforeCashOut}），累计跪求 ${summary?.endless?.totalBegs}`,
   );
-  // 钱包守恒：收工回存的额度必须**正好**是 cashOut，一分不多一分不少。
-  const walletAfterCashOut = summary?.wallet ?? -1;
+  /*
+   * ★ S4：这条判据原来写作「**钱包增量 = cashOut**」——回存的额度必须正好是扣掉脏钱之后的那一笔。
+   * 合并账户之后收工**不动钱**，于是它换成一个更强的形式：**收工不许产生任何账外转账**，
+   * 也就是「恒等式的差额在收工前后一模一样」。
+   *
+   * 为什么这个写法对竞态免疫：一枚在途币迟到越线会**同时**推 `earned` 和 `balance`
+   * （两者都出自 `RunState.gainChips`），差额不动；而「偷偷把桌上的钱搬回口袋」那种回归
+   * 只推 `balance`（走 `creditBalance` 并不会写 `run.earned`），差额当场变。
+   * ⇒ 拿「Δ余额 == Δ赚进」写反而不更灵敏，还会把合法迟到算成违规。
+   *
+   * 差额口径复用 S0a 立好的 `ledgerDeltaOf`，判据里不出现第二份算式。
+   * 脏钱那一半也被它盖住了：跪来的钱若被收工洗成干净钱，同样是只动 `balance` 的账外转账，
+   * 所以这里只把 `spendable` 当**读数**打印，不另立式子。
+   */
   check(
-    '收工回存钱包：钱包增量 = cashOut（跪求来的脏钱不可回存）',
-    walletAfterCashOut - walletBeforeCashOut === (ledgerBeforeCashOut?.cashOut ?? -1),
-    `钱包 ${walletBeforeCashOut}→${walletAfterCashOut}，cashOut ${ledgerBeforeCashOut?.cashOut}`,
+    '收工不动账：恒等式差额在收工前后一模一样（合并账户后「回存」这一步整个消失）',
+    !!ledgerBeforeQuit &&
+      !!ledgerAtQuit &&
+      ledgerDeltaOf(ledgerAtQuit) === ledgerDeltaOf(ledgerBeforeQuit),
+    `余额 ${ledgerBeforeQuit?.balance}→${ledgerAtQuit?.balance}（赚进 ${earnedBeforeCashOut}→${ledgerAtQuit?.earned}），` +
+      `差额 ${ledgerDeltaOf(ledgerBeforeQuit)}→${ledgerDeltaOf(ledgerAtQuit)}，` +
+      `可花 ${ledgerBeforeQuit?.spendable}→${ledgerAtQuit?.spendable}`,
   );
 
   // 再来一局：面板收起、盘面与筹码复位。
+  // ★ 先给下一局备好入场额：合并账户之后「一局」就是把余额投完，而上面那一局已经投到底
+  //   （余额 0）⇒ 不补的话这里开出来的新局是 0 筹码，下面三条（重开复位 / 加注 / 热区）
+  //   会全部读成「筹码 0→0」——那是**没有钱可投**，不是复位坏了（10-01 实测的级联红）。
+  await hooks((v) => window.__THREE_GAME_TEST_HOOKS__?.setWallet?.(v), STAKE);
   await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.quitRun?.());
 
   // （临时诊断已撤）重开之后只看两个读数：刚摆完的、以及落定后的。
@@ -1537,12 +1649,12 @@ async function runEndless(page) {
   check(
     '总结页再点一次即开新局：盘面与筹码复位（且开局不丢币）',
     restarted?.endless?.ruinVisible === false &&
-      restarted?.chips === restarted?.buyIn &&
+      restarted?.chips === restarted?.initial &&
       restarted?.phase === 'ready' &&
       restarted?.earned === 0 &&
       restarted?.activeCoins === table?.coins &&
       (restarted?.anomalies ?? -1) === 0,
-    `买入 ${restarted?.buyIn} 筹码（钱包 ${summary?.wallet}），盘面 ${restarted?.activeCoins} 枚，` +
+    `起始 ${restarted?.initial} 筹码（余额 ${ledgerAtQuit?.balance}），盘面 ${restarted?.activeCoins} 枚，` +
       `阶段 ${restarted?.phase}（刚重开时 ${restartedEarly?.activeCoins} 枚，预置 ${table?.coins} 枚）；` +
       `开局异常 ${restarted?.anomalies} 次` +
       (restartAnomalies.length
@@ -1555,11 +1667,11 @@ async function runEndless(page) {
   check(
     '总结页再点一次即开新局：盘面与筹码复位',
     restarted?.endless?.ruinVisible === false &&
-      restarted?.chips === restarted?.buyIn &&
+      restarted?.chips === restarted?.initial &&
       restarted?.phase === 'ready' &&
       restarted?.earned === 0 &&
       restarted?.activeCoins === table?.coins,
-    `买入 ${restarted?.buyIn} 筹码（钱包 ${summary?.wallet}），盘面 ${restarted?.activeCoins} 枚，` +
+    `起始 ${restarted?.initial} 筹码（余额 ${ledgerAtQuit?.balance}），盘面 ${restarted?.activeCoins} 枚，` +
       `阶段 ${restarted?.phase}（刚重开时 ${restartedEarly?.activeCoins} 枚，预置 ${table?.coins} 枚）`,
   );
 
@@ -1659,30 +1771,30 @@ async function runEndless(page) {
       `（本局为此投了 ${hotDrops} 枚、越线共 ${hotCrossed} 枚、推板 ${hotPusherRunning}）`,
   );
 
-  // ── 钱包见底：开局即破产，跪求后能继续（死锁回归判据） ──
+  // ── 余额见底：开局即破产，跪求后能继续（死锁回归判据） ──
   //
   // 这是「开局没有起始筹码」那个反馈的回归判据。症状**不是「没发筹码」**，
   // 而是整局卡死：`chips=0` 时 `acceptingDrops` 为假 → 阶段升不到 `playing`
   // → 沉降分支要求 `phase==='playing'` 永不触发 → 破产弹窗不弹
   // → 跪求按钮（挂在弹窗里）永远点不到。玩家既不能投币也不能跪求。
   //
-  // 判据写**绝对数**而不是增量：买入 0、筹码 0、破产窗已弹、沉降原因 exhausted。
+  // 判据写**绝对数**而不是增量：起始 0、筹码 0、破产窗已弹、沉降原因 exhausted。
   // 放在本模式最后跑，因为它会把本局推成破产态。
   //
-  // 注意这里**不能走 `startRun` 辅助函数** —— 它会在开局前把钱包补满，
-  // 而这条判据要的恰恰是「钱包是空的」。所以直接调钩子。
+  // 注意这里**不能走 `startRun` 辅助函数** —— 它会在开局前把余额补满，
+  // 而这条判据要的恰恰是「余额是空的」。所以直接调钩子。
   await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.seed?.(20260921));
   await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.setWallet?.(0));
   await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.setState?.('ready'));
   const broke = await readStateFresh(page);
   check(
-    '钱包见底：开局买入 0 筹码，直接进破产弹窗（不是静默卡死）',
-    broke?.buyIn === 0 &&
+    '余额见底：开局起始 0 筹码，直接进破产弹窗（不是静默卡死）',
+    broke?.initial === 0 &&
       broke?.chips === 0 &&
       broke?.endless?.ruinVisible === true &&
       broke?.settleReason === 'exhausted' &&
       ledgerOk(broke),
-    `买入 ${broke?.buyIn}，筹码 ${broke?.chips}，阶段 ${broke?.phase}，` +
+    `起始 ${broke?.initial}，筹码 ${broke?.chips}，阶段 ${broke?.phase}，` +
       `沉降原因 ${broke?.settleReason}，破产窗 ${broke?.endless?.ruinVisible}`,
   );
   // 跪求必须真的能把本局拉回可玩：`grantBeg` 内部走 `revive()`，
@@ -1692,7 +1804,7 @@ async function runEndless(page) {
   const revived = await readStateFresh(page);
   const dropFromZero = await dropUntilAccepted(page, 0);
   check(
-    '钱包见底后跪求：赏赐到账、本局被拉回 playing、能真的投出币',
+    '余额见底后跪求：赏赐到账、本局被拉回 playing、能真的投出币',
     begFromZero === true &&
       (revived?.chips ?? 0) > 0 &&
       revived?.endless?.ruinVisible === false &&
@@ -1702,18 +1814,18 @@ async function runEndless(page) {
     `跪求 ${begFromZero}，筹码 ${revived?.chips}，阶段 ${revived?.phase}，` +
       `破产窗 ${revived?.endless?.ruinVisible}，投币被接受 ${dropFromZero}`,
   );
-  // 收尾复位：把钱包补回起始值，让后续模式（`all`）看到的是干净状态。
+  // 收尾复位：把余额补回起始值，让后续模式（`all`）看到的是干净状态。
   // 这里**不调 `quitRun`** —— 跪求之后破产窗已经关了，`endRun` 会因为
   // `!ruinVisible && !summaryVisible` 直接 return，什么也不做。
   await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.setWallet?.(200));
 }
 
 /**
- * 经济模式：三账本 / 跪求不可回存 / 单位期望与净流出。
+ * 经济模式：账本恒等式 / 终身余额守恒 / 单位期望与净流出。
  *
  * 两条腿分工明确：
  *
- * · **真物理**（跑几局）验证账本恒等式与钱包守恒——这些只在真实越线时才被触发，
+ * · **真物理**（跑几局）验证账本恒等式与余额守恒——这些只在真实越线时才被触发，
  *   纯函数测不出来。
  * · **纯函数蒙特卡洛**验证「庄家终赢」——200 局真物理要跑几个小时，而
  *   `crossingReturn` 不持有状态、随机数由调用方传入，所以把**实测的越线构成**
@@ -1725,27 +1837,79 @@ async function runEndless(page) {
  *
  * 用 ECON_RUNS 覆盖真物理局数（默认 2，每局最长 150 秒）。
  */
+/**
+ * #66A②「中奖被拒收（加力存满 ⇒ 引擎改派一场小型补货演出）」的**唯一谓词**。
+ *
+ * economy 的批级计数与 accept 的阳性对照都吃这一个函数 —— 写两份就会造出
+ * 「计数器与对照各自自洽、谁也不报错」的假象（本项目吃过多次）。
+ * ⚠️ 不能只数 `granted === false`：`miss`（`SlotMachine.ts:377`）与 `fine`（`:397`）恒带 false，
+ *    那样会把"没中奖"算成"存满被拒"。发射点在 `SlotMachine.ts:487-498`（`outcome:'win'` + `granted:false`）。
+ */
+const isRefusedWin = (event) => event?.outcome === 'win' && event?.granted === false;
+
 async function runEconomy(page) {
-  console.log('\n── 模式：economy（三账本 / 单位期望 / 净流出） ──');
+  console.log('\n── 模式：economy（账本 / 单位期望 / 净流出） ──');
   const hooks = (fn, ...args) => page.evaluate(fn, ...args);
   const RUNS = Number(process.env.ECON_RUNS ?? 2);
+  /*
+   * ★★ `STAKE` 是合并账户带出来的**新旋钮**，不是可有可无的糖。
+   *
+   * 旧模型里「一局」= 从钱包买入 `ENDLESS.buyIn`（20 枚），所以局长自然落在
+   * 30~220 投这个实测带上；合并之后一局的入场额变成**全部余额**，而 `startRun`
+   * 默认把余额补到 200 ⇒ 同一台机器、同一张返值表，一局要投到 200+ 枚才见底。
+   * ⚠️ 下面这句是**读码推演**，不是实测（2026-10-01 那次 200 入场的批跑了 5 分钟
+   *   没跑完第 1 局就被中止，没拿到终态读数）：`playRun` 的投币上限是 240 枚，
+   *   而 150 **仿真秒**的局长上限只在 `waitForRunEnd` 里查 ⇒ 200 入场时先撞到
+   *   240 投这一侧 ⇒ ⑤ 的 timeout 占比、⑥ 的硬界（★ 10-01 起上界不再是常数 300，而是从 `ECON_RUN_DROPS_CAP` 派生 = 现读 240）、设计带 60~90 投、
+   *   以及 ⑤′ 的「账户真的见底过」**全部失去意义**（它们都是在 20 入场下标的）。
+   *   ⇒ 本批换 STAKE=20 之后这几条的读数就是这段推演的验证；若仍全是 timeout，
+   *     说明瓶颈不在入场额，回查 `playRun` 的投币上限。
+   *
+   * 所以 economy 批默认把入场额压回标准注额，**保持与既有标定同口径**；
+   * 「玩家现在一局就是 200 余额、局长该怎么重新定标」是**设计问题**，
+   * 归 S6 那唯一一次重标（并要用户定夺 `walletStart` 与局长目标），不在这里偷偷改判据。
+   * 要量现在的真实形态：`ECON_STAKE=200` 跑一遍，读数会自己讲。
+   */
+  const referenceStake = (await readStateFresh(page))?.endless?.referenceStake ?? 20;
+  const STAKE = Number(process.env.ECON_STAKE ?? referenceStake);
+  /*
+   * `ECON_LOAN=1`：破产时**就地贷款续玩**，而不是收工重开。
+   * 只有开了这一档，S2 的「欠债 → 产出按 `debt/(debt+balance)` 分流抵债」才会真的发生，
+   * 上面那条 `repaid/gross` 的稳态读数才有内容（默认批里 debt 恒为 0，分流率必然读 0 ——
+   * 那是**协议**造成的 0，不是机器造成的 0，所以默认批不许拿它当结论）。
+   * ⚠️ 这一档改的是**局长口径**（一局横跨多次报价），读数不能与默认批逐位比。
+   */
+  const LOAN_ON_RUIN = process.env.ECON_LOAN === '1';
+  // 账本读数一律走这一个口子：`ledger()` 一次 evaluate 带回 balance / 六项局账 /
+  // `balanced` / `totals`，比「这里读 diagnostics 那里读钩子」少一种拿到不一致快照的可能。
+  const ledgerOf = () => hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
 
   await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.clearSave?.());
-  const walletStart = (await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.run?.()))?.wallet ?? 0;
-  // Σ充值的基准：脚本会在每次开局前补满钱包（见 `startRun` 辅助函数），
-  // 守恒式要用**增量**而不是累计值。
-  const refilledStart = (await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.run?.()))?.refilled ?? 0;
-  console.log(`  起始钱包 ${walletStart}，真物理 ${RUNS} 局`);
+  /*
+   * ★ 基准必须取在 `clearSave()` **之后**。`clear()` 重置余额但不记进出账
+   *   （见 `SaveStore.clear` 的警告），所以它只能待在测量窗口之外。
+   *   终身表 `totals` 不被 `clear()` 清零 ⇒ 守恒式全部用**增量**，与旧 `refilled` 同规格。
+   */
+  const start = await ledgerOf();
+  const balanceStart = start?.balance ?? 0;
+  const totalsStart = start?.totals ?? null;
+  // ★ #52 甲（10-02 用户拍板）：**一局 = 把余额投到见底**是产品语义，而 60~90 投那条设计带
+  //   量的其实是「每 `referenceStake` 注额的一段」——本批开局前把入场额钉在 STAKE，
+  //   所以下面每行「第 N 局」读的是一段，不是一命。这里把单位写在批头，是为了让
+  //   引用这批数的人不会把"局"当成玩家意义上的那一局（HUD 里的"本局"仍是玩家真实经历的那一局，
+  //   那是产品事实，不该跟着计量单位改词）。
+  console.log(
+    `  起始余额 ${balanceStart}｜入场额 ${STAKE}（标准注额 ${referenceStake}）｜真物理 ${RUNS} 局` +
+      `｜**计量单位 = 每 ${STAKE} 注额一段**（#52 甲：设计带 60~90 投按段读，不按"一命"读）`,
+  );
 
-  // ── ① 真物理：账本恒等式 + 钱包守恒 + 越线构成采样 ──
+  // ── ① 真物理：账本恒等式 + 终身余额守恒 + 越线构成采样 ──
   const runs = [];
   const crossingSamples = [];
   let totalCrossings = 0;
   let totalDrops = 0;
   let spentTotal = 0;
   let earnedTotal = 0;
-  let buyInTotal = 0;
-  let cashOutTotal = 0;
 
   for (let index = 0; index < RUNS; index += 1) {
     // 本局的**仿真秒**要打印出来：它是局长口径的自变量。
@@ -1754,24 +1918,28 @@ async function runEconomy(page) {
     // 这一列就是那条上限是否真的生效的直接证据。
     // 长度由 `playRun` 在**本局内**取零点算出来（`runSeconds`）；这里不能再跨局相减，
     // `elapsed` 每局开局归零（`Game.ts:1739`），跨局减法会读出 0 或负数。
-    const final = await playRun(page);
+    /*
+     * ★ 先把余额**钉死**在标准注额，再开局。
+     * `startRun` 的补钱只在「不足」时触发，而合并账户之后批首余额是 `walletStart`（200）——
+     * 不钉死的话**第 1 局会拿 200 当入场额**（实测踩到：批跑了 5 分钟没走完第 1 局），
+     * 后面几局才被破产把余额打回 20 附近，等于同一批里混了两种局长口径。
+     * `setWallet` 的差额记进 `totals.refill`（可以是负数）⇒ ② 的守恒式依然精确，
+     * 这里不是「偷偷改钱包」——那种事正是 ② 存在的理由。
+     */
+    await hooks((v) => window.__THREE_GAME_TEST_HOOKS__?.setWallet?.(v), STAKE);
+    const final = await playRun(page, { stake: STAKE, loanOnRuin: LOAN_ON_RUIN });
     const simSeconds = final?.runSeconds ?? 0;
-    // 破产弹窗里本局还没结束，必须先收工才会回存——钱包守恒要按「完整一局」量。
-    //
-    // ★ `cashOut` 取**收工之前**的读数（与 endless 模式 `:1418` 那个
-    // `ledgerBeforeCashOut` 同一个口径）。`ledger()` 是活 getter：收工之后再去读，
-    // 读到的是「此刻这一局能回存多少」，不是本局实际入账的那一笔。
-    // 两笔都留着打印出来，差值就是任务 #14（② 钱包守恒差 26）的判据。
-    let cashOutAtQuit = 0;
+    /*
+     * 破产（现在是「续玩报价」）弹窗里本局还没走完，收工一下才会进总结态。
+     * ★ S4 之前这里还有一件事：「必须先收工才会**回存**，钱包守恒要按完整一局量」。
+     *   回存这个动作已经不存在了，收工现在只是为了让下一局从干净状态开局；
+     *   守恒式改读终身账（② 那段），不再依赖「本局有没有收工」。
+     */
     if (final?.end === 'ruin') {
-      cashOutAtQuit =
-        (await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.()))?.cashOut ?? 0;
       await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.quitRun?.());
       await simTick(page, 400);
     }
-    const after = await readStateFresh(page);
-    const ledger = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
-    const cashOutPostQuit = ledger?.cashOut ?? 0;
+    const ledger = await ledgerOf();
     const { scoreEvents, cycles, xixiEvents } = await readTelemetry(page);
     const crossed = cycles.length ? cycles[cycles.length - 1].coins : 0;
     /* 摇奖与罚金按「每投」归一化才可比：R6② 把 win 拆成 3 同 / 4 同之后，
@@ -1782,6 +1950,18 @@ async function runEconomy(page) {
     const slotEvents = xixiEvents ?? [];
     const spins = slotEvents.filter((event) => event.phase === 'spin').length;
     const slotFines = slotEvents.reduce((sum, event) => sum + (event.fined ?? 0), 0);
+    /* #66A 的两个批级读数（**只打印、不进判据**，定档要另攒够 n）：
+       ① 「名义 vs 实扣」不在这里写 6 —— 面值真源是 `xixi.ts` 的 `SLOT_PENALTY_CHIPS`，
+          抄第二份就是「同一几何写两份」那个老坑。名义取本局**最大单笔** `fined + debtAdded`
+          （没被欠款上限截断的那笔就是面值；全被截断时会**低估** ⇒ 这一列只当方向读数）。
+       ② `granted === false` 在 `miss`（`SlotMachine.ts:377`）与 `fine`（`:397`）上恒为 false，
+          直接数它会把「没中奖」算成「存满被拒」⇒ 只数 `outcome === 'win'` 里 granted=false 的那批。 */
+    const fineEvents = slotEvents.filter((event) => event.outcome === 'fine');
+    const penaltyFaceSeen = fineEvents.reduce(
+      (max, event) => Math.max(max, (event.fined ?? 0) + (event.debtAdded ?? 0)),
+      0,
+    );
+    const winEvents = slotEvents.filter((event) => event.outcome === 'win');
 
     for (const event of scoreEvents) {
       crossingSamples.push({ kind: event.kind, combo: event.combo, hot: event.hot });
@@ -1789,98 +1969,163 @@ async function runEconomy(page) {
 
     totalCrossings += crossed;
     totalDrops += final?.endless?.drops ?? 0;
-    spentTotal += after?.spent ?? 0;
-    earnedTotal += after?.earned ?? 0;
-    buyInTotal += after?.buyIn ?? 0;
-    cashOutTotal += cashOutAtQuit;
+    /*
+     * ⚠️ 这两个求和只用于**打印回收率读数**，不参与判据，所以它们允许有一个小残差：
+     * 本局样本取在收工之后，收尾期在途币的迟到越线记在**这一局**的账上、却发生在这一次
+     * 读数之后，而下一局开局会把局账整个重新快照 ⇒ 那一笔既不在本局求和里、也不在下一局里。
+     * 判据不吃这个残差，是因为 ② 改读终身账（`totals`），那正是终身账存在的理由。
+     */
+    spentTotal += ledger?.spent ?? 0;
+    earnedTotal += ledger?.earned ?? 0;
 
     runs.push({
       end: final?.end,
       drops: final?.endless?.drops ?? 0,
       crossed,
       simSeconds,
-      chips: after?.chips ?? 0,
-      buyIn: after?.buyIn ?? 0,
-      earned: after?.earned ?? 0,
-      begged: after?.begged ?? 0,
-      spent: after?.spent ?? 0,
-      wallet: after?.wallet ?? 0,
-      cashOut: cashOutAtQuit,
-      cashOutPostQuit,
+      balance: ledger?.balance ?? 0,
+      initial: ledger?.initial ?? 0,
+      earned: ledger?.earned ?? 0,
+      begged: ledger?.begged ?? 0,
+      loaned: ledger?.loaned ?? 0,
+      spent: ledger?.spent ?? 0,
+      /**
+       * 本局产出被分流抵债的累计额（S2 甲规则）。**不进恒等式**，所以这里只当读数用：
+       * 「回收/E」这一族要的是 `gross = earned + repaid`，只看 `earned` 会把分流掉的那份读成没赚。
+       */
+      repaid: final?.repaid ?? 0,
+      /** 本局就地贷款续玩的次数（`ECON_LOAN=1` 才有意义）。 */
+      loans: final?.loans ?? 0,
       spins,
       slotFines,
-      ledgerOk: ledgerOk(after),
+      /** #66A①：本局罚金次数、转欠款额、以及从实扣反推的面值（见上方注释的低估方向）。 */
+      fineCount: fineEvents.length,
+      fineDebt: slotEvents.reduce((sum, event) => sum + (event.debtAdded ?? 0), 0),
+      penaltyFaceSeen,
+      /** #66A②：中奖里被拒收的次数（谓词 `isRefusedWin` 与 accept 的阳性对照**共用同一个**）。 */
+      wins: winEvents.length,
+      winRefused: winEvents.filter(isRefusedWin).length,
+      ledgerOk: ledgerOk(ledger),
     });
     console.log(
       `  第 ${index + 1} 局：投 ${runs[index].drops} 枚 → 越线 ${crossed} 枚，` +
         `仿真 ${simSeconds.toFixed(0)}s（${final?.end}），` +
-        `买入 ${runs[index].buyIn} + 赚进 ${runs[index].earned} + 跪求 ${runs[index].begged} ` +
-        `− 消耗 ${runs[index].spent} = ${runs[index].chips} 筹码，` +
-        `回存 ${runs[index].cashOut}（收工后活读 ${runs[index].cashOutPostQuit}），` +
-        `钱包 ${runs[index].wallet} ` +
+        `起始 ${runs[index].initial} + 赚进 ${runs[index].earned} + 跪求 ${runs[index].begged} ` +
+        `+ 贷款 ${runs[index].loaned} − 消耗 ${runs[index].spent} = 余额 ${runs[index].balance}，` +
+        `可花 ${ledger?.spendable}｜抵债 ${runs[index].repaid}｜就地贷款 ${runs[index].loans} 次 ` +
         `摇奖 ${runs[index].spins}（${(runs[index].spins / Math.max(1, runs[index].drops)).toFixed(3)}/投）` +
         `· 罚金 ${runs[index].slotFines}`,
+    );
+  }
+
+  /* #66A 的批级读数（一行汇总，不改上面那行的格式 —— 外部解析器吃的是那行）。
+     只打印、不参与判据：定档要 n 与区间，这一列先回答"这两件事到底有没有数"。 */
+  {
+    const fineCount = runs.reduce((sum, run) => sum + run.fineCount, 0);
+    const fined = runs.reduce((sum, run) => sum + run.slotFines, 0);
+    const fineDebt = runs.reduce((sum, run) => sum + run.fineDebt, 0);
+    const face = Math.max(...runs.map((run) => run.penaltyFaceSeen), 0);
+    const wins = runs.reduce((sum, run) => sum + run.wins, 0);
+    const refused = runs.reduce((sum, run) => sum + run.winRefused, 0);
+    const gamesWithFine = runs.filter((run) => run.fineCount > 0).length;
+    console.log(
+      `  [info] #66A 读数（不进判据）：罚金 ${fineCount} 次 / ${gamesWithFine} 局有罚金 ⇒ ` +
+        `实扣 ${fined}、转欠款 ${fineDebt}、反推面值 ${face || '—（全批没罚过款）'} ⇒ 实扣/名义 ` +
+        `${face ? (fined / (face * fineCount)).toFixed(3) : '—'}（面值被欠款上限截断时这一列偏低）；` +
+        `win 拒收 ${refused}/${wins} = ${wins ? (refused / wins).toFixed(3) : '—'}（兜底频率分母是中奖数，不是投币数）`,
     );
   }
 
   check(
     '① 每一局账本恒等式成立（误差 0）',
     runs.length === RUNS && runs.every((run) => run.ledgerOk),
-    runs.map((run) => (run.ledgerOk ? '平' : `差 ${run.chips - (run.buyIn + run.earned + run.begged - run.spent)}`)).join('/'),
+    runs.map((run) => (run.ledgerOk ? '平' : `差 ${ledgerDeltaOf(run)}`)).join('/'),
   );
 
-  const walletExpected = walletStart - buyInTotal + cashOutTotal;
-  const walletActual = runs.length ? runs[runs.length - 1].wallet : -1;
-  // 超时局的本局**还没结束**，那笔筹码根本没回存（`quitRun` 只在破产分支被调用），
-  // 所以 `ledger.cashOut` 在超时局上只是一个「如果现在收工能回存多少」的预测值。
-  // 把预测值算进 Σ回存会让 ② 报出假失败（实测过一次：钱包 160，算式给出 163）。
-  // 判据本身不变——只是不再把预测当入账。
-  const cashOutCredited = runs
-    .filter((run) => run.end !== 'timeout')
-    .reduce((sum, run) => sum + run.cashOut, 0);
-  // 充值项：`startRun` 每次扣 20，脚本在开局前会把钱包补满（见 `startRun` 辅助函数），
-  // 所以「Σ充值」是守恒式里**必须显式出现的一项**——不写进去，这条判据会报出假失败
-  // （钱包明明没多也没少，算式却差出一整笔充值额）。
-  const refilledTotal = (await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.run?.()))?.refilled ?? 0;
-  const refilledDelta = refilledTotal - refilledStart;
+  /*
+   * ★★ ② 在 S4 里换了一根骨头，而且是**不得不换**，不是顺手改写。
+   *
+   * 旧式子 `wallet终 = wallet起 + Σ充值 − Σ买入 + Σ（真正回存的）`：
+   * 「买入」与「回存」两个动作在合并账户时整个消失了 ⇒ 这两项没有指称物。
+   * 但真正的问题不是措辞：局级账本每次 `startRun` 都把 `initial` 重新快照成**当时的余额**，
+   * 于是「上一局收尾时那笔没记进任何局账的余额变动」会被下一局的 `initial` 吸收掉，
+   * **用局账求和永远抓不到它** —— 旧 ② 报过的那个「差 26」（任务 #14）正是这种形状。
+   *
+   * 新式子读 `SaveStore.totals`：终身累计、不按局清零、也不被 `clear()` 清零，
+   * 六个桶 = 余额的**全部合法去路**（`creditBalance` 四个来源 + `debitBalance` 两个用途）。
+   * ⇒ 谁绕过这两扇门直接动余额，这一条当场红；plan S4 ⑥ 的变异测试就打在这一点上。
+   *
+   * ★ 附带好处：这条判据**对采样时机免疫**。收尾期在途币的迟到越线会同时推
+   *   `Δ余额` 与 `Δtotals.earned`，等式两边一起动 ⇒ 不需要「等盘面静下来再取数」那种门,
+   *   也不再有「超时局的预测回存不计」那种特例（`cashOut` 这个概念已经没有了）。
+   */
+  const finish = await ledgerOf();
+  const totalsEnd = finish?.totals ?? null;
+  const d = (key) => (totalsEnd?.[key] ?? 0) - (totalsStart?.[key] ?? 0);
+  const credited = d('earned') + d('begged') + d('loaned') + d('refill');
+  const debited = d('spend') + d('skin');
+  // ★ 局账阶段的增量要在这里**定格**：下面 ③ 还会构造一次跪求（那是场景，不是这 6 局的产出），
+  //   ⑤′ 的读数如果等到那时候再算，就会把构造场景的 30 枚脏钱报成「本批跪求 30」。
+  const runPhaseTotals = { begged: d('begged'), loaned: d('loaned') };
+  const balanceActual = finish?.balance ?? -1;
   check(
-    '② 钱包守恒：wallet终 = wallet起 + Σ充值 − Σ买入 + Σ（真正回存的）',
-    walletActual === walletStart + refilledDelta - buyInTotal + cashOutCredited,
-    `钱包 ${walletActual}，应为 ${walletStart} + ${refilledDelta} − ${buyInTotal} + ${cashOutCredited} = ` +
-      `${walletStart + refilledDelta - buyInTotal + cashOutCredited}` +
-      (cashOutTotal !== cashOutCredited
-        ? `（另有 ${cashOutTotal - cashOutCredited} 是未结束局的预测回存，不计）`
-        : '') +
-      `｜不含充值的原式口径应为 ${walletExpected}`,
+    '② 余额守恒（终身账）：Δ余额 = Δ(赚进+跪求+贷款+充值) − Δ(消耗+解锁外观)',
+    !!totalsStart &&
+      !!totalsEnd &&
+      balanceActual - balanceStart === credited - debited,
+    `余额 ${balanceStart}→${balanceActual}（Δ ${balanceActual - balanceStart}）；` +
+      `进账 赚 ${d('earned')} 跪 ${d('begged')} 贷 ${d('loaned')} 充 ${d('refill')}，` +
+      `出账 耗 ${d('spend')} 图鉴 ${d('skin')}` +
+      (balanceActual - balanceStart !== credited - debited
+        ? ` ⇒ 差 ${(balanceActual - balanceStart) - (credited - debited)}：有一笔余额变动没走 credit/debit 两扇门`
+        : ''),
   );
 
-  // ── ② 跪求后回存 = 0：脏钱不能带走 ──
-  // 用确定性场景而不是真物理：破产 → 跪求一次 → 立刻收工。
-  // 真物理里「跪求后立刻收工」需要凑巧，这里直接构造，测的是规则本身。
+  /*
+   * ── ③ 脏钱约束（S4 换载体）──
+   * 用确定性场景而不是真物理：破产 → 跪求一次 → 立刻收工。
+   * 真物理里「跪求后立刻收工」需要凑巧，这里直接构造，测的是规则本身。
+   *
+   * 旧写法是「跪来的筹码**不可回存**钱包」——那条约束长在 `cashOutOf(chips, begged)` 上。
+   * 合并账户之后没有回存这一步了，同一个约束现在站在**下一个出口**上：
+   * `可花 = 余额 − 终身跪求额`（`economy.spendableOf`），而买图鉴的门槛读的正是它。
+   * ⇒ 判据对象从「回存为 0」换成「**跪求不抬高可花额度**」。
+   *
+   * ★ 为什么写成不等式而不是等式：`spendable = max(0, 余额 − 跪求累计)`，
+   *   而恒等式给出 `Δ(余额 − 跪求累计) = Δ赚进 − Δ消耗`，所以合法越线本来就**允许**
+   *   可花额度跟着涨。写成「不涨」会在泵腿假红（2026-09-28 那条老坑：泵下 400 ms 里
+   *   仍在灌仿真，在途币赚到干净筹码是正确行为）；写成「涨幅 ≤ 本段赚进」则
+   *   既不放过脏钱漏白（脏钱入账只推余额、不推 earned ⇒ 涨幅超过赚进），也不会误伤。
+   */
   await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.setState?.('ruin'));
-  const ruinLedger = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
+  const ruinLedger = await ledgerOf();
   const begOk = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.beg?.() ?? false);
-  const begLedger = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
-  const walletBeforeQuit = begLedger?.wallet ?? -1;
-  await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.quitRun?.());
-  /* 这一等必须是**仿真等**，不能是墙钟等。这条判据断言「跪来的脏钱不可回存」，
-     测的是收工那一刻账本上的现金流出；开泵之后 400 ms 真实等待里泵仍在灌仿真
-     （~1 仿真秒），期间在途的币可以正常越线赚到**干净**筹码 ⇒ `cashOut > 0` 是合法结果，
-     而判据按「立刻收工」写死，于是只在泵下报红（2026-09-28 实测：两种泵配置都红、实时绿）。
-     不开泵时 `simTick` 就是 `waitForTimeout`，实时腿读数不变。 */
-  await simTick(page, 400);
-  const quitLedger = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.ledger?.());
+  const begLedger = await ledgerOf();
   check(
-    '③ 跪求的筹码记进 begged，收工回存为 0（脏钱不可回存）',
+    '③ 跪来的钱是脏钱：记进 begged、余额到账，但可花额度的涨幅不超过本段赚进',
     begOk === true &&
       (begLedger?.begged ?? 0) > (ruinLedger?.begged ?? 0) &&
-      begLedger?.cashOut === 0 &&
-      quitLedger?.cashOut === 0 &&
-      (quitLedger?.wallet ?? -1) === walletBeforeQuit,
-    `跪求前 ${ruinLedger?.begged} → 跪求后 ${begLedger?.begged}，` +
-      `回存 ${begLedger?.cashOut}，钱包 ${walletBeforeQuit}→${quitLedger?.wallet}`,
+      (begLedger?.balance ?? 0) > (ruinLedger?.balance ?? 0) &&
+      (begLedger?.spendable ?? -1) - (ruinLedger?.spendable ?? 0) <=
+        (begLedger?.earned ?? 0) - (ruinLedger?.earned ?? 0),
+    `跪求 ${ruinLedger?.begged} → ${begLedger?.begged}，余额 ${ruinLedger?.balance}→${begLedger?.balance}，` +
+      `可花 ${ruinLedger?.spendable}→${begLedger?.spendable}（本段赚进 Δ${(begLedger?.earned ?? 0) - (ruinLedger?.earned ?? 0)}）`,
   );
-  check('③ 跪求后账本仍平', ledgerOk(await readStateFresh(page)));
+  // 收工不动账：与 endless 模式那条同一个口径（差额口径复用 `ledgerDeltaOf`，不另立式子）。
+  // ★ 紧贴 `quitRun` 取第二份读数，中间不隔仿真等待。
+  const deltaBeforeQuit = ledgerDeltaOf(begLedger);
+  await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.quitRun?.());
+  const quitLedger = await ledgerOf();
+  check(
+    '③ 收工不动账：恒等式差额与收工前一致（合并账户后「回存」这一步整个消失）',
+    ledgerDeltaOf(quitLedger) === deltaBeforeQuit,
+    `差额 ${deltaBeforeQuit} → ${ledgerDeltaOf(quitLedger)}，余额 ${begLedger?.balance}→${quitLedger?.balance}`,
+  );
+  /* 这一等必须是**仿真等**，不能是墙钟等：下面这条要读的是「跪求+收工走完之后的账」，
+     开泵时 400 ms 真实等待里泵仍在灌仿真（~1 仿真秒），不等完读到的是半截状态。
+     不开泵时 `simTick` 就是 `waitForTimeout`，实时腿读数不变。 */
+  await simTick(page, 400);
+  check('③ 跪求后账本仍平', ledgerOk(await ledgerOf()));
 
   // ── ③ 单位期望：把实测的越线构成喂给真实经济函数，逐档重算 ──
   const tiers = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.betTiers?.() ?? []);
@@ -1973,7 +2218,10 @@ async function runEconomy(page) {
   // 「一局在筹码归零时结束」这条规则本身就让 `赚进 − 消耗 < 0` 恒成立，
   // 所以这个数字是**读数**不是独立判据；真正的判据是上面的 ④。
   // 它值得报出来，是因为一旦经济开始透支（单位期望 ≥ 1），局就永远不会结束，
-  // 下面的 ⑤ 会立刻红——这才是这条验收真正在保护的东西。
+  // 下面的 ④ 与 ⑤ 占比会先红（★ 变异实测：⑤′ 在 n=2 时**仍然绿**，它不是第一道门）。
+  //
+  // ⚠️ 这两个求和是**局账求和**，带上面注释里说的那个迟到返值残差（每批几枚的量级），
+  //   所以它只做读数；判据级的守恒走 ② 的终身账。
   const earnedPerSpent = spentTotal > 0 ? earnedTotal / spentTotal : Number.POSITIVE_INFINITY;
   const netPerRun = (earnedTotal - spentTotal) / Math.max(1, runs.length);
   console.log(
@@ -1981,10 +2229,26 @@ async function runEconomy(page) {
       `单局净流出 ${(-netPerRun).toFixed(1)} 筹码 → 200 局 ${(-netPerRun * 200).toFixed(0)} 筹码`,
   );
   /*
+   * S2 甲规则的分流率（`repaid / (earned + repaid)`）——**只打印，不立判据**。
+   * 为什么现在不能立：带还没实测出来（plan 里那条「③ 补 S2 欠的那轮稳态批」要的就是这个数），
+   * 而按「阈值要离噪声远」那条纪律，没有分布就拍不出门；n=2 的本批更是只能看形状。
+   * 稳态批跑完之后，这条应当升级成硬判据（并配一个能触发它的变异）。
+   */
+  const repaidTotal = runs.reduce((sum, run) => sum + run.repaid, 0);
+  const grossTotal = earnedTotal + repaidTotal;
+  const debtNow = await hooks(() => window.__THREE_GAME_TEST_HOOKS__?.debt?.());
+  console.log(
+    `[info] ⑤ S2 分流读数（仅打印，带待稳态批定档）：repaid ${repaidTotal} / gross ${grossTotal} = ` +
+      `${((repaidTotal / Math.max(1, grossTotal)) * 100).toFixed(1)}%，` +
+      `期末欠款 ${debtNow?.debt ?? '?'}/${debtNow?.ceiling ?? '?'}，累计贷出 ${debtNow?.loanedTotal ?? '?'}`,
+  );
+  /*
    * 局长分布的几组读数原先定义在下面的 ⑥ 块里；⑤ 现在也要用中位数，
    * 所以**整簇上移到这里**，⑤ 与 ⑥ 共用同一份（判据不写第二份公式）。
    */
-  const CRASH_LENGTH = [20, 300];
+  // 上界不再是一个够不到的常数：撞 cap 就是『永远不结束』的表现形式 ⇒ 由协议派生，
+  // 另加一条真正会红的门（⑥′）去盯右尾变厚。
+  const CRASH_LENGTH = [20, ECON_RUN_DROPS_CAP];
   const dropCounts = runs.map((run) => run.drops);
   const meanDrops = dropCounts.reduce((sum, count) => sum + count, 0) / Math.max(1, dropCounts.length);
   const sortedDrops = [...dropCounts].sort((a, b) => a - b);
@@ -2017,20 +2281,37 @@ async function runEconomy(page) {
     `[info] ⑤ 长尾形状（仅打印，不作判据）：中位 ${medianDrops} 投；` +
       `timeout 局投币数 ${timeoutRuns.map((run) => run.drops).sort((a, b) => a - b).join('/') || '无'}`,
   );
-  // 账本那一半**原样保留**：它管的是记账完整性，不是率。
-  // 终态只要求「停下来了」+「手里基本没筹码」。**不能要求筹码恰好为 0**：
-  // 收尾走完、破产窗弹出之后，仍可能有一枚在途币越线返值——那是被**记进账本**的
-  // 迟到返值（见 `RunState.gainChips` 的说明），不是漏记。
-  // 满盘之后收尾期越线更频繁，这条从「偶尔」变成了常态（实测出现过「破产窗 + 剩 1 筹码」）。
+  /*
+   * ★★ ⑤′：探针换了被测对象 —— 这是 plan S4 里标为「最危险的一条」。
+   *
+   * 旧判据「终局的筹码都低于本局买入」真正的身份是**回收率 < 1 的探针**：
+   * 单位期望一旦 ≥ 1，账户就触不到底，局永远走不到终态。
+   * 合并账户之后「本局买入」这个数没有了，而同一件事换了表现形式：
+   * **余额永不触底 ⇒ 续玩报价（破产终态）不再出现 ⇒ 贷款与跪求的频率趋近 0**。
+   * ⇒ 探针必须跟着换成「本批里账户确实见底过」，否则 R6 落地后会出现
+   *   「十项全绿但点火闸已失效」的静默退化。
+   *
+   * 为什么写成 `> 0` 而不是某个率的下界：在当前经济下（回收 ~0.7-0.8、每局起始 = 标准注额）
+   * 「至少一局投到底」是近乎确定的**事实**而不是形状陈述，n=20 上不会因一次抽中而红；
+   * 点火场景下它**趋近 0**（★ 但不是「恰好 0」——见下面变异测试那段，×2 的经济 n=2 仍有 1 局输光）。
+   * ⇒ **阈值离噪声远**这一点成立（正常批是 3/3、6/6 这种满值，门只在 0 上翻红），
+   *   但它的**灵敏度低于 ④**，所以这条是补充哨兵而不是主闸。
+   * ⚠️ **它抓不到反向的「经济太苛刻」**——那由 ⑥（局长硬界）与 ④（单位期望）负责。
+   *
+   * ★★ 变异测试（10-01 实测，`/tmp/r6-mutation` 把全部越线返值 ×2）的**修正**：
+   *   那一批 n=2 里 ④ 与 ⑤ 都红了，而 **⑤′ 是绿的**（破产 1/2 —— 第 2 局 106 投仍然见底）。
+   *   ⇒ 上面「点火场景把它恰好打到 0」这句**被数据否证了**：×2 的经济里照样有局会输光。
+   *   真实形态是「ruin 占比往下掉、但不是 0」，所以 **⑤′ 是补充哨兵，不是主闸**；
+   *   点火的第一道门是 ④（它直接算期望，n=2 就红，读数 1.409 / 1.327 / 0.999）。
+   *   留 ⑤′ 的理由：它抓的是**另一件事** —— 「账户不再触底」是玩法层面的失效
+   *   （续玩报价/跪求/债务整族随之失去消费者），而那件事 ④ 看不见（④只看单投期望）。
+   */
+  const ruinRuns = runs.filter((run) => run.end === 'ruin');
   check(
-    '⑤ 终局的筹码都落进「低于本局买入」的破产侧（timeout 局不参与该判据）',
-    runs.every(
-      (run) =>
-        run.end === 'timeout' ||
-        run.end === 'settled' ||
-        (run.chips >= 0 && run.chips < (run.buyIn ?? 0)),
-    ),
-    runs.map((run) => `${run.end}/剩 ${run.chips} 筹码`).join('，'),
+    '⑤′ 账户真的见底：本批出现破产终态的局数 > 0（经济点火时这一比例趋近 0 ⇒ 补充哨兵，主闸是 ④）',
+    runs.length > 0 && ruinRuns.length > 0,
+    `破产 ${ruinRuns.length}/${runs.length} 局（这 ${runs.length} 局自身的跪求 ${runPhaseTotals.begged}、贷款 ${runPhaseTotals.loaned}）；` +
+      `各局终态 ${runs.map((run) => `${run.end}:余额${run.balance}`).join(' ')}`,
   );
 
 
@@ -2044,7 +2325,7 @@ async function runEconomy(page) {
   // 所以：硬判据只守「不崩溃」的两端；设计目标改成看**均值**、且先作读数报出，
   // 均值的定案由 P8 用 `ECON_RUNS=200` 跑多局来做。
   //
-  // ★ **S11 把硬界从 35~220 放宽到 20~300 —— 这是「换一条能继续观测同一缺陷的断言」，
+  // ★ **S11 把硬界从 35~220 放宽到 20~300（★ 10-01 P2 之后上界改由 `ECON_RUN_DROPS_CAP` 派生 ⇒ 这个 300 已不是现值） —— 这是「换一条能继续观测同一缺陷的断言」，
   //   不是掩盖红灯。** 依据是 S11 三轮标定 + 基线共 **4 组 24 局**的实测分布：
   //
   //     30,34,34,35,39,41,41,42,42,43,47,47,51,54,58,58,60,60,68,71,82,154,178,216
@@ -2070,8 +2351,10 @@ async function runEconomy(page) {
   // 已上移到 ⑤ 之前（⑤ 要用中位数；判据不许写第二份公式）。
   const floorShare = dropCounts.filter((count) => count <= 28).length / Math.max(1, dropCounts.length);
   const timeoutShare = timeoutRuns.length / Math.max(1, runs.length);
+  const capHits = dropCounts.filter((count) => count >= ECON_RUN_DROPS_CAP - 1).length;
+  const capShare = capHits / Math.max(1, dropCounts.length);
   check(
-    `⑥ 单局长度不崩溃（${CRASH_LENGTH[0]}~${CRASH_LENGTH[1]} 投）—— 四数一起读：均值吃右尾、典型局看中位`,
+    `⑥ 单局长度不崩溃（${CRASH_LENGTH[0]}~${CRASH_LENGTH[1]} 投；**上界即协议截断点 ⇒ 这一半由协议保证，右尾变厚归 ⑥′；下界 >=20 仍是活的（左尾塌陷会红）**）—— 四数一起读：均值吃右尾、典型局看中位`,
     dropCounts.every((count) => count >= CRASH_LENGTH[0] && count <= CRASH_LENGTH[1]),
     `各局投币数 ${dropCounts.join('/')}，均值 ${meanDrops.toFixed(1)} / 中位数 ${medianDrops} 投` +
       `，触底(≤28 投) ${(floorShare * 100).toFixed(1)}%` +
@@ -2080,6 +2363,28 @@ async function runEconomy(page) {
       `${meanInDesign ? '均值在带内' : '均值在带外'}，但带内**不等于**典型局达标）），` +
       `越线/投币 ${perDrop.toFixed(3)}`,
   );
+
+  check(
+    `⑥′ 右尾没变厚：撞每局投币上限（${ECON_RUN_DROPS_CAP} 投）的局数占比 <= 25%`,
+    capShare <= 0.25,
+    `撞 cap ${capHits}/${dropCounts.length} 局 = ${(capShare * 100).toFixed(1)}%（点火时趋近 100%）` +
+      `；阈值依据见本块上方注释（段 1 观测 10%，n=50 的单侧 95% 上界 = 19.9%，精确算过）`,
+  );
+
+  /*
+   * ⑥′ 与 ⑤（timeout 占比 <= 30%）**互不包含**，所以两条都要留：
+   *   ⑤ 数 `end === 'timeout'`，成因有两种——撞到投币上限，或撞到**仿真秒**上限
+   *     （09-29 实测过「54 投就 timeout」，那是仿真秒到点，与 cap 无关）；
+   *   ⑥′ 数「投币数 >= cap-1」，而撞 cap 的局也可能恰好在那一刻破产（段 1 第 39 局：240 投 + ruin）。
+   * ⇒ ⑤ 看「多久没打完」，⑥′ 看「是不是靠协议截断才打完」；只留 ⑤ 会漏掉后者——
+   *   而后者正是 ⑥ 的上界够不到之后**没人守**的那一格（#67 的本体）。
+   * ⚠️ 阈值 25% 不是贴着读数定的：判据在**每段 n=50** 上求值，段 1 观测 10%，
+   *   其单侧 95% Clopper-Pearson 上界 = **19.9%**（精确算，不是估的），段 2 至今更低（池化 6.2%）。
+   *   取 20% 会贴在这个界上，取 30% 与 ⑤ 同宽但比必要宽 1.5 倍 ⇒ 25%。
+   * 🔴 变异门（必做，否则这条可能是恒绿）：把 ECON_RUN_DROPS_CAP 临时改成 60
+   *   ⇒ 大量局撞 cap ⇒ 本条必须红；同时 ⑥ 的上界也会跟着变（两处同源，正是提名的目的）。
+   *   改完必须还原并 grep 确认值回到 240。
+   */
 
 
   return runs;
@@ -2277,28 +2582,58 @@ async function runXixi(page) {
     iconsGuard.detail,
   );
 
+  /*
+   * ★★ S5a：这两条判据**去字面量化**了，而且必须先做这一步再改权重
+   *   （反过来就会造出一条假红：表改了、判据还守着 45/15/40，红的是判据不是机器）。
+   *
+   * 旧写法把「45 % 中奖 / 15 % 胡萝卜 / 40 % 杂牌」和「五个符号」抄进了测试，
+   * 于是权重表在 `xixi.ts` 与这里**各有一份**。现在：
+   *   - 期望比例 = 引擎吐回来的 `odds.weights` 自己归一化；
+   *   - 计数桶按 `Object.keys(weights)` 开 ⇒ 加一档（win4）测试自动跟上；
+   *   - 符号数读 `odds.symbolCount`，四同池成员读 `odds.tier4Symbols`。
+   * ⚠️ 容差从 ±1.5 pp 收到 **±0.2 pp**：枚举是**等距**的（`roll = i / total`），
+   *   唯一的误差源是分段边界最多少/多算一个样本 = 1/2000 = 0.05 pp，
+   *   旧的 1.5 pp 是当年照「解析解 vs 抽样」的直觉拍的，**比实际需要宽 30 倍**
+   *   —— 一条比噪声宽 30 倍的门抓不到「权重表被偷偷改掉一格」。
+   */
   const odds = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.slotOdds?.(2000) ?? null);
   const oddsTotal = odds?.samples ?? 0;
   const pct = (n) => (oddsTotal ? ((n ?? 0) / oddsTotal) * 100 : 0);
-  // 容差 ±1.5 个百分点：这是离散枚举（2000 个点），不是解析解。
-  const near = (value, want) => Math.abs(value - want) <= 1.5;
+  const near = (value, want) => Math.abs(value - want) <= 0.2;
+  const weightKeys = Object.keys(odds?.weights ?? {});
+  const shareOf = (key) => ((odds?.weights?.[key] ?? 0) / (odds?.totalWeight ?? 1)) * 100;
   check(
-    '结果表：45% 中奖 / 15% 胡萝卜 / 40% 杂牌（枚举引擎函数，不重写权重）',
+    '结果表：枚举比例 = 引擎权重表（判据不抄第二份分段；桶按表开，加一档自动跟上）',
     Boolean(odds) &&
-      near(pct(odds.counts.win), 45) &&
-      near(pct(odds.counts.fine), 15) &&
-      near(pct(odds.counts.miss), 40) &&
-      odds.counts.win + odds.counts.fine + odds.counts.miss === oddsTotal,
-    `中奖 ${pct(odds?.counts?.win).toFixed(1)}% / 胡萝卜 ${pct(odds?.counts?.fine).toFixed(1)}% / ` +
-      `杂牌 ${pct(odds?.counts?.miss).toFixed(1)}%；符号分布 ${JSON.stringify(odds?.symbols)}`,
+      weightKeys.length > 0 &&
+      weightKeys.every((key) => near(pct(odds.counts?.[key]), shareOf(key))) &&
+      weightKeys.reduce((sum, key) => sum + (odds.counts?.[key] ?? 0), 0) === oddsTotal,
+    weightKeys
+      .map((key) => `${key} 枚举 ${pct(odds.counts?.[key]).toFixed(2)}% / 表 ${shareOf(key).toFixed(2)}%`)
+      .join('，'),
   );
   // 五个奖励符号**都必须可达**：中奖分支只走某个子集是「奖励表写漏」的典型形态，
   // 而它在权重随机下要摇很多次才会暴露。枚举一遍就知道有没有死项。
   const symbolCount = Object.keys(odds?.symbols ?? {}).length;
   check(
-    '奖励表无死项：五个符号（力/泉/塔/钻/箱）在枚举里全部出现',
-    symbolCount === 5,
-    `出现 ${symbolCount} 个：${JSON.stringify(odds?.symbols)}`,
+    '奖励表无死项：引擎列出的每个符号（数量也读引擎）在枚举里全部出现',
+    (odds?.symbolCount ?? 0) > 0 && symbolCount === odds.symbolCount,
+    `出现 ${symbolCount} 个 / 表列 ${odds?.symbolCount}：${JSON.stringify(odds?.symbols)}`,
+  );
+  /*
+   * S5a 的四同池：池成员与「枚举里真的摇到过的四同符号」必须**是同一批**。
+   * 两种失效都能被这条抓住：① 池里某个符号的四同分支没接上（seen 少一个）；
+   * ② 池外的符号（泉）混进四同（seen 多一个）—— 后者尤其阴险，
+   *   它会演成三同那一档，画面上「四连了但什么大奖都没发生」。
+   */
+  const tier4Seen = Object.keys(odds?.tier4SymbolsSeen ?? {}).sort();
+  const tier4Want = [...(odds?.tier4Symbols ?? [])].sort();
+  check(
+    '四同池无死项也不越池：枚举到的四同符号集合 = 引擎声明的四同池',
+    tier4Want.length > 0 &&
+      JSON.stringify(tier4Seen) === JSON.stringify(tier4Want) &&
+      (odds?.counts?.win4 ?? 0) > 0,
+    `池 ${tier4Want.join('/')}，枚举到 ${tier4Seen.join('/') || '无'}，四同 ${odds?.counts?.win4} 次`,
   );
 
   const facesFor = (kind, symbol) =>
@@ -2325,13 +2660,16 @@ async function runXixi(page) {
   );
 
   // ── D/E：先做强制摇奖（此时一币未投，earned 必须一直是 0） ──
-  const spinAndWaitReward = async (symbol) => {
+  const spinAndWaitReward = async (symbol, tier) => {
     const before = ((await readTelemetry(page))?.xixiEvents ?? []).filter((e) => e.phase === 'reward').length;
     // 老虎机正在转时 spin 返回 null：上一场收尾前重试，不硬抢。
     let spun = null;
     const deadline = Date.now() + 5000;
     while (!spun && Date.now() < deadline) {
-      spun = await page.evaluate((s) => window.__THREE_GAME_TEST_HOOKS__?.xixiSpin?.(s), symbol);
+      spun = await page.evaluate(
+        ([s, t]) => window.__THREE_GAME_TEST_HOOKS__?.xixiSpin?.(s, t),
+        [symbol, tier ?? null],
+      );
       if (!spun) await page.waitForTimeout(200);
     }
     if (!spun) return null;
@@ -2376,6 +2714,17 @@ async function runXixi(page) {
       fallbackShow?.promised === overflow.count,
     `granted=${cappedReward?.granted} boost=${afterCap?.boostCharges}（存满上限 ${overflow.cap}）` +
       ` 兜底实发=${cappedReward?.delivered} 装置=${overflow.show} 登记承诺=${fallbackShow?.promised}`,
+  );
+  /* #66A② 的**阳性对照**。为什么必须有：economy 那一列「win 拒收 R/W」在 10-02 的 n=20 批里读到
+     **0/32**，而 0 有两种互斥解释 —— 「加力确实从没在满的状态下中的奖」与「我的谓词没接上事件形状」。
+     这一条打在**必然产生该形状**的位置（上面刚强制过一次存满拒收），
+     数的还是同一个 `isRefusedWin` ⇒ 它红就说明计数器是空的，不是机器没有兜底。 */
+  const capRewardEvents = ((await readTelemetry(page))?.xixiEvents ?? []).filter((e) => e.phase === 'reward');
+  const refusedSeen = capRewardEvents.filter(isRefusedWin).length;
+  check(
+    '#66A② 阳性对照：存满拒收要被 isRefusedWin 数到（economy 那列不是空探针）',
+    refusedSeen >= 1,
+    `reward 事件 ${capRewardEvents.length} 条，其中被数成的拒收 ${refusedSeen} 条；本次强制的那条 ${JSON.stringify(cappedReward)}`,
   );
 
   // 承诺数从引擎规模表读（S6 把塔改到阵型规模是配置变更，不是回归）。
@@ -2520,6 +2869,8 @@ async function runXixi(page) {
   // 两条一起看才完整：只看 `chips` 分不清「扣了罚款」还是「投了一枚币」。
   const beforeFine = await readStateFresh(page);
   const fineReward = await spinAndWaitReward('fine');
+  /** 罚款面值：**从满盘那一次的实扣读数取**，不写 `SLOT_PENALTY_CHIPS` 的第二份抄本。 */
+  const penaltyFace = fineReward?.fined ?? 0;
   const afterFine = await readStateFresh(page);
   const finedDelta = (afterFine?.fines ?? 0) - (beforeFine?.fines ?? 0);
   const spentDelta = (afterFine?.spent ?? 0) - (beforeFine?.spent ?? 0);
@@ -2548,6 +2899,9 @@ async function runXixi(page) {
     fineReward?.faces?.length === 4 && fineReward.faces.every((icon) => icon === 'carrot'),
     `faces=${JSON.stringify(fineReward?.faces)}`,
   );
+  // ★ S5b 的「罚不掉转欠款」场景放在**本模式最后**（见函数末尾）：它要把余额压到面值以下，
+  //   而那会让本局立刻不可投币 —— 放在中途会把后面的「落点亮槽 / 集齐触发」一起拖红
+  //   （10-01 实测踩过：那两条读 `completed=null`、事件链 `[]`，红的是级联不是缺陷）。
 
   // ── P10：杂牌（不奖不罚）──
   //
@@ -2598,7 +2952,7 @@ async function runXixi(page) {
   //
   //   ② 必须**等落床**，不能「投完立刻查」。
   //      `conveyor.speed` 归零（2026-09-24 用户拍板 0.85 → 0）之后，台面上的币
-  //      只靠推板摩擦以 **26 毫米/循环**前进（`probe`），而落点 `z` 到台面前缘
+  //      只靠推板摩擦前进（`probe`；⚠️ 注释里的 26 毫米/循环是 S13 破对称期读数，出厂态对称实测 −0.25 毫米/循环），
   //      有 **1.2 米**（落币口 2026-09-25 从 −0.72 后移到 −1.20）。
   //      ★ 实测（12 枚币，×1.2 档）：**首条离台事件在第 37 个推板循环**（≈72 秒）；
   //      落点还在 −0.72 时那个数是 16~29。原先那版每投只等 0.3~0.5 秒，
@@ -2611,20 +2965,40 @@ async function runXixi(page) {
   //   修法顺着设计语义走（跨局收集 + 等真实物理走完），**不是放宽判据**：
   //   每轮开一局新的、整批投 12 枚、再**等 55 个推板循环**让它们落床，然后查集齐。
   const lanes = [-0.85, -0.45, 0, 0.45, 0.85, -0.6, 0.6, -0.2, 0.2, -0.7, 0.7, 0.3];
-  const landingCycles = 55; // > 实测首次离台 37，留一档半余量（落点后移把行程翻倍了）
+  /* 窗按 10-02 同树实测抬到 **200 循环**（旧值 55 标在「落点 −0.72 + ×1.2 档 + 庚案前」，
+     那批实测是首条离台 +37 循环）。今天量到的是：
+       · 薄床 12 投 —— **首次落床在第 158 个循环**（`/tmp/xixi-ttp.out`：`t+421s 循环=158 最低y=0.010 点亮=2`）；
+       · 满盘臂 —— 200 循环内玩家币冻结在 z≈−0.75（`/tmp/front-reach.out`），四臂全部离台 0 条。
+     ⇒ 200 = 158 + 一档余量；周期今天实测 ~2.55 秒/循环 ⇒ 200×2.55≈510 秒，上限给 600 秒留卡顿余量。
+     ⚠️ 这不是把判据改松：**要亮的槽照样得亮**，改的是"等多久才判"，而这个数必须来自机器而不是上一版物理。
+     代价照实说：xixi 腿最坏 4 轮 × 600 秒 ≈ 40 分钟（轮与轮之间 `Telemetry.reset()`，所以 lit 计数自己累加）。 */
+  const landingCycles = 200;
+  let litEventsTotal = 0; // B 判据的证据：落床点亮事件数（跨轮累计，因为每轮 startRun 会重置遥测）
   let completedEvent = null;
   for (let round = 0; round < 4 && !completedEvent; round += 1) {
     // 一局只有 20 枚筹码、而一批要投 12 枚 ⇒ 每轮都开新局，
     // 免得「投到一半没钱了」把这一批打残（XIXI 进度跨局保留）。
     await startRun(page, 'playing');
     for (const lane of lanes) await dropUntilAccepted(page, lane, 4000);
-    // 等这一批币被推板送到前缘、掉下币床（`registerY = 0.13` 在台面之下）。
+    // 等这一批币被推板送到前缘、掉下币床。⚠️ 这里等的是「走完整个台面」：
+    // 集章门槛 `registerY = 0.13` 在上层台面（币心 ≈0.213）之下，只有从前唇掉下去才成立
+    // ⇒ 满盘后排币按实测要四位数循环（S1a）。币床的真判据是 `isOnDeckVolume`，不是这条线。
     // 超时给 170 秒：55 个循环 ≈ 107 秒（周期 1.95 秒），留出卡顿余量。
     const from = (await readState(page))?.pusher?.cycles ?? 0;
-    await waitFor(page, (s) => (s?.pusher?.cycles ?? 0) - from >= landingCycles, 170_000);
+    await waitFor(page, (s) => (s?.pusher?.cycles ?? 0) - from >= landingCycles, 600_000);
     const telemetry = await readTelemetry(page);
+    litEventsTotal += (telemetry?.xixiEvents ?? []).filter((e) => e.phase === 'lit').length;
     completedEvent = (telemetry?.xixiEvents ?? []).find((e) => e.phase === 'completed') ?? null;
   }
+  // B「落床点亮」与 C「集齐 → 老虎机」**分开立**：前者只要一枚币真的走完台面掉下去就能满足，
+  // 后者要四个不同槽各来一枚（批里实测 200 局才 48 局集齐过 ⇒ 它是"罕见"而不是"坏了"）。
+  // 把两件事写在一条判据里，红的时候分不清是登记链断了还是只是没攒够。
+  check(
+    '落床点亮：等过实测窗（200 循环/轮 × ≤4 轮）后至少有一枚玩家币跨过 registerY（B）',
+    litEventsTotal > 0,
+    `累计 lit 事件 ${litEventsTotal} 条；当前槽位 ${JSON.stringify((await readStateFresh(page))?.xixi)}` +
+      `（实测窗来自 /tmp/xixi-ttp.out：首次落床 158 循环、同一刻点亮 2 槽）`,
+  );
   check(
     '物理落点点亮并集齐四槽（completed 事件）',
     Boolean(completedEvent),
@@ -2677,6 +3051,135 @@ async function runXixi(page) {
     finalState?.anomalies === 0,
     `anomalies=${finalState?.anomalies}${anomalyDetail ? ` — ${anomalyDetail}` : ''}`,
   );
+
+  /*
+   * ── S5b：罚不掉的那一截转成欠款（放在本模式最后，理由见上面那条注释）──
+   *
+   * 前面那条满盘罚款场景里 `shortfall` 恒为 0 ⇒ 惩罚加强那半边永远不会被走到。
+   * 这里把余额压到面值以下，构造出 shortfall ≥ 1 的另一半。
+   *
+   * ★ 面值不写死：用上面满盘那一次实测到的 `fined` 当面值（满盘时 `fined == 面值`），
+   *   这样 `SLOT_PENALTY_CHIPS` 改了判据也不会假红 —— 与「注入率读 `bountyEveryDrops`」同一条纪律。
+   * ★ 压完余额**必须重开一局**（`setState('ready')`）：`initial` 是开局那一刻的余额快照，
+   *   在场外把余额从 200 改到 2 而不重开，局级恒等式就成了 `0 = 200 + 0 + 0 + 0 − 8`
+   *   —— 差额 −192 是**测试自己造的**，不是引擎的账错（10-01 实测踩过，那条判据当时就红了）。
+   *   重开之后 `initial = 2`，恒等式重新成立，`ledgerOk` 才真的在验东西。
+   * ★ 断的是**三笔的分派**：`fined + debtAdded == 面值`、`debt` 增量 == `debtAdded`、
+   *   `spent` 增量 == `fined`。任何一笔走错门（shortfall 也记进 spent、
+   *   或 debt 加了而事件里没带）都会当场红。
+   */
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setWallet?.(2));
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setState?.('ready'));
+  const debtBefore = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.debt?.());
+  const lowBefore = await readStateFresh(page);
+  const lowFine = await spinAndWaitReward('fine');
+  const lowAfter = await readStateFresh(page);
+  const debtAfter = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.debt?.());
+  check(
+    'S5b 胡萝卜四连：扣不掉的转成欠款（fined+debtAdded=面值、debt 增量=debtAdded、恒等式仍平）',
+    penaltyFace > 0 &&
+      lowFine?.outcome === 'fine' &&
+      (lowFine?.fined ?? -1) + (lowFine?.debtAdded ?? -1) === penaltyFace &&
+      (lowFine?.fined ?? 99) <= 2 &&
+      (lowFine?.debtAdded ?? 0) > 0 &&
+      (debtAfter?.debt ?? 0) - (debtBefore?.debt ?? 0) === lowFine.debtAdded &&
+      (lowAfter?.spent ?? 0) - (lowBefore?.spent ?? 0) === lowFine.fined &&
+      ledgerOk(lowAfter),
+    `面值 ${penaltyFace}：实扣 ${lowFine?.fined}（spent +${(lowAfter?.spent ?? 0) - (lowBefore?.spent ?? 0)}）` +
+      ` + 转欠款 ${lowFine?.debtAdded}（debt ${debtBefore?.debt}→${debtAfter?.debt}，上限 ${debtAfter?.ceiling}），` +
+      `余额 ${lowBefore?.chips}→${lowAfter?.chips}，${ledgerText(lowAfter)}`,
+  );
+  // ★ 欠款上限是**承重结构**（惩罚频率 15 % × 每笔都可能全额进债 ⇒ 没有上限 debt 会无界涨）。
+  // 到顶需要好几笔，这里不断言「已经到顶」，只断言不变量 `debt ≤ ceiling` 在每次罚款之后成立。
+  check(
+    'S5b 欠款不越过上限（debt ≤ ceiling；到顶时 chargeFine 按剩余额度生效）',
+    (debtAfter?.debt ?? 99) <= (debtAfter?.ceiling ?? 0),
+    `debt ${debtAfter?.debt}，ceiling ${debtAfter?.ceiling}`,
+  );
+  /*
+   * ── S5a 的四同分支判据也放在最后，理由与 S5b 同一条（而且更硬）──
+   *
+   * 塔四同会**往盘面上放 40 枚真币**（它就是走水量账的那一档）。放在中途时
+   * 下一条「杂牌：不奖不罚」立刻红：它断的是 chips/fines/boostCharges 三项不动，
+   * 而这 40 枚会在观察窗口里越线 ⇒ 三项里的 `chips` 跟着动（10-01 实测：
+   * `faces=[...]，筹码 …` 直接红）。⇒ 与 S5b 一样：**改全局状态的判据放末尾**。
+   */
+
+  /*
+   * ── S5a：四同大奖必须**走另一条分支** ──
+   *
+   * 每条都断一个可对账的读数，而不是「画面上更夸张」（那个只有人眼能判，见下面 shots 模式人工核对）。
+   * 期望值全部从引擎读（`showSpecs` 的 jackpot 上限、`boostQueue` 的发数），脚本里不抄 40 与 4。
+   *
+   * ⚠️ 四同是 1.5 % 一档，靠随机路径等它出现不叫测试 ⇒ 全部用 `xixiSpin(symbol, 4)` 指名。
+   */
+  const jackpotCeilings = {
+    tower: specs.tower?.jackpot ?? 0,
+    chest: specs.chest?.jackpot ?? 0,
+    diamond: specs.diamond?.jackpot ?? 0,
+  };
+  // 力×4：读**排到的行程发数**的增量。先记下，是因为待用发数会被别的加力累计（同一个 run）。
+  const boostQueueBefore = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.boostQueue?.() ?? null,
+  );
+  const boostJackpot = await spinAndWaitReward('boost', 4);
+  const boostQueueAfter = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.boostQueue?.() ?? null,
+  );
+  check(
+    'S5a 力四同：排 N 发连续加长行程（N 读引擎的 jackpotBoostStrokes，不走三同的 grantBoost）',
+    boostJackpot?.tier === 4 &&
+      (boostQueueBefore?.jackpotStrokes ?? 0) > 0 &&
+      (boostQueueAfter?.strokes ?? 0) - (boostQueueBefore?.strokes ?? 0) ===
+        boostQueueBefore?.jackpotStrokes &&
+      // 走的是行程而不是加力槽：`delivered` 装的是发数，不是枚数。
+      boostJackpot?.delivered === boostQueueBefore?.jackpotStrokes,
+    `事件 tier=${boostJackpot?.tier} delivered=${boostJackpot?.delivered}；` +
+      `待发行程 ${boostQueueBefore?.strokes}→${boostQueueAfter?.strokes}（每发追加 ${(
+        (boostQueueBefore?.travelBonus ?? 0) * 100
+      ).toFixed(0)}% 行程）`,
+  );
+  // 塔×4：承诺数按 jackpot 上限走，但**预算不足时如实降级** ⇒ 断的是区间而不是等号。
+  const towerJackpot = await spinAndWaitReward('tower', 4);
+  const towerJackpotRegistered = ((await readTelemetry(page))?.showEvents ?? []).filter(
+    (e) => e.id === 'tower' && e.phase === 'registered',
+  ).at(-1);
+  /*
+   * ⚠️ 这里**不断 `promised === 40`**：盘面预算（`coins.remaining`）不够时如实降级是
+   *   合法结果，而这个断言跑在 S5b 之后、盘面刚被重开过，剩余空位不是每次都一样。
+   *   于是判据写成区间 + 「要么超过三同规模、要么承认是降级」：
+   *   真把 jackpot 上限写坏（忘了抬 clamp、抬过头、或把三同也顶到 40）照样红，
+   *   而预算紧的时候不会假红。
+   */
+  check(
+    'S5a 塔四同：按 jackpot 上限请求（不少于三同规模或如实降级，且不超过表上的上限）',
+    towerJackpot?.tier === 4 &&
+      jackpotCeilings.tower > (specs.tower?.count ?? 0) &&
+      (towerJackpotRegistered?.promised ?? 0) <= jackpotCeilings.tower &&
+      ((towerJackpotRegistered?.promised ?? 0) >= (specs.tower?.count ?? 0) ||
+        towerJackpotRegistered?.downgraded === true),
+    `三同规模 ${specs.tower?.count}，四同上限 ${jackpotCeilings.tower}，本场承诺 ${towerJackpotRegistered?.promised}` +
+      `（降级=${towerJackpotRegistered?.downgraded}）`,
+  );
+  /*
+   * 钻 / 箱×4：**枚数刻意不变**（各 1 枚）。
+   * 这两档的大奖买的是稀有感与仪式，不是数值 —— 计划里明写「不许真给 4 枚」，
+   * 而宝箱那条还带着用户 09-30 拍板「不做宝箱雨」（多枚巨型宝箱同层重叠 = 求解器注入能量）。
+   * ⇒ 判据断的是「走了四同分支（tier=4）但枚数与三同一致」：
+   *   这样将来有人把四同改成多发几枚，这条会红，逼他重新过一次「加不加质量」的决定。
+   */
+  const diamondJackpot = await spinAndWaitReward('diamond', 4);
+  const chestJackpot = await spinAndWaitReward('chest', 4);
+  check(
+    'S5a 钻/箱四同：tier=4 但枚数与三同一致（大奖靠稀有感与仪式，不靠加质量）',
+    diamondJackpot?.tier === 4 &&
+      chestJackpot?.tier === 4 &&
+      diamondJackpot?.delivered === (specs.diamond?.count ?? -1) &&
+      chestJackpot?.delivered === (specs.chest?.count ?? -1),
+    `钻 ${diamondJackpot?.delivered} 枚（表 ${specs.diamond?.count}，四同上限 ${jackpotCeilings.diamond ?? '同 count'}），` +
+      `箱 ${chestJackpot?.delivered} 枚（表 ${specs.chest?.count}）`,
+  );
+
 }
 
 /** 截图：桌面与手机两种视窗，用于人工核对画面。 */
@@ -2710,6 +3213,53 @@ async function runShots(page, context) {
   }
   await page.screenshot({ path: `${outDir}/endless-playing.png` });
   console.log(`  已保存 ${outDir}/endless-playing.png`);
+
+  /*
+   * ── S5a 四同大奖的画面临时核对（计划要求「每条四同各摇一次截图人工核对」）──
+   *
+   * ★ 这些是**给人看的证据**，不是判据：判据那边已经能核「走了四同分支、排了几发、承诺几枚」，
+   *   但「看起来像不像改变命运的一摇」只有眼睛能判 —— 而眼睛读的数不能反过来当判据用。
+   * 时机：兑现发生在停格后 `REWARD_AT = 3.0` 秒，四同再多停 1.8 秒 ⇒
+   *   在 3.3 秒这一刀能同时抓到「奖励已兑现 + 还在仪式停留」。
+   *
+   * ⚠️ **每一场之前重开一局**。第一版没重开，结果四张图里后三张都压着上一场塔的四枚币，
+   *   「这一档大奖长什么样」根本判不出来（截图作为证据就废了）。重开的代价是 4 次摆盘，
+   *   换来的是每张图只有一个变量。
+   * ★ 力四同必须开推板（`playing`）：它排的是**加长行程**，而 `ready` 下推板不动 ⇒
+   *   截图只能拍到「四枚叉 + 一行字」，拍不到那四发到底有没有把币床往前拱。
+   */
+  const jackpotSymbols = ['boost', 'tower', 'diamond', 'chest'];
+  for (const symbol of jackpotSymbols) {
+    await startRun(page, symbol === 'boost' ? 'playing' : 'ready');
+    const spun = await waitFor(
+      page,
+      async () =>
+        (await page.evaluate(
+          (s) => window.__THREE_GAME_TEST_HOOKS__?.xixiSpin?.(s, 4) ?? null,
+          symbol,
+        ))?.kind === 'win',
+      8_000,
+    );
+    if (!spun) {
+      console.log(`  [warn] 四同 ${symbol} 没能强制摇出（老虎机一直在忙），跳过截图`);
+      continue;
+    }
+    await page.waitForTimeout(3_300);
+    if (symbol === 'boost') {
+      // 等第一发行程真正走出去（推板进入 extend 段），再拍。
+      await waitFor(page, (state) => (state?.pusher?.offset ?? 0) > 0.3, 6_000);
+    }
+    await page.screenshot({ path: `${outDir}/jackpot-${symbol}.png` });
+    console.log(
+      `  已保存 ${outDir}/jackpot-${symbol}.png` +
+        (symbol === 'boost'
+          ? `（推板 offset=${(await readState(page))?.pusher?.offset?.toFixed(3)}，` +
+            `待发行程 ${(await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.boostQueue?.()))?.strokes}）`
+          : ''),
+    );
+    // 等这一场的仪式与装置走完，免得下一场叠在同一个画面上。
+    await page.waitForTimeout(3_500);
+  }
 
   // 图鉴面板：清档后解锁一个外观，让面板里有已解锁项可看（截图专用，不写死定价）。
   //
@@ -2850,6 +3400,63 @@ async function runPerf(page, context) {
 
   const coinCounts = new Set(rows.map((row) => row.coins));
   check('画质分档不改盘面币数', coinCounts.size === 1, `币数集合 ${[...coinCounts].join('/')}`);
+
+  /*
+   * ── 画质锁（10-01 用户点名「不要切画质啊」）──
+   *
+   * ★ 为什么用 `feedFrames` 而不是"把机器跑卡了再看它降不降"：
+   *   后者不可复现（这台机器今天卡、明天不卡），而且会把 CPU 争用当成测量手段
+   *   —— 本项目已经吃过两次「Chromium 抢 CPU 压低读数」的亏。
+   *   `governor.sample(delta)` 是纯函数，喂 delta 就能确定性地复现
+   *   「连续两个 1 秒窗口 < 45 FPS ⇒ 降一档」这条规则本身。
+   * ⚠️ 顺序要紧：`setQuality` 钩子自己会 `freeze(true)`（截图基线要稳定），
+   *   所以测"未锁"之前必须先 `qualityLock(false)` 把它解开 ——
+   *   忘了这一步的话第一条会假绿（tier 不动是因为冻住了，不是因为规则坏了）。
+   */
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setQuality?.('high'));
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.qualityLock?.(false));
+  const unlocked = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.feedFrames?.(0.03, 3) ?? null,
+  );
+  check(
+    '画质未锁时低帧确实会自动降档（feedFrames 复现滞回规则，不靠机器真的卡）',
+    (unlocked?.changed ?? 0) >= 1 && unlocked.tier !== 'high',
+    `33 FPS × 3 个窗口 ⇒ 换档 ${unlocked?.changed} 次，档位 high → ${unlocked?.tier}`,
+  );
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setQuality?.('high'));
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.qualityLock?.(true));
+  const locked = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.feedFrames?.(0.03, 4) ?? null,
+  );
+  check(
+    '锁上之后同样的低帧不再换档（玩家的否决权真的生效）',
+    (locked?.changed ?? 1) === 0 && locked?.tier === 'high',
+    `33 FPS × 4 个窗口 ⇒ 换档 ${locked?.changed} 次，档位仍是 ${locked?.tier}`,
+  );
+  // ★ 玩家走的是**按钮**，不是钩子：只验钩子等于没验他能不能锁。
+  //   按钮在暂停面板里 ⇒ 必须先按「暂停」把它露出来（直接点会卡在 "element is not visible"，
+  //   这条今天实测踩过：整轮 perf 被一个 30 秒的 click 超时打断，后面的判据全丢）。
+  const beforeClick = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.qualityLock?.() ?? null,
+  );
+  await page.locator('#pause-button').click();
+  await page.locator('#quality-lock-button').click();
+  await page.locator('#resume-button').click();
+  const afterClick = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.qualityLock?.() ?? null,
+  );
+  const pressed = await page.locator('#quality-lock-button').getAttribute('aria-pressed');
+  check(
+    '暂停面板里的画质锁按钮是玩家的真入口（暂停→点锁→继续：状态翻转、aria-pressed 跟着翻）',
+    beforeClick?.locked === true &&
+      afterClick?.locked === false &&
+      pressed === 'false' &&
+      (await page.evaluate(() => window.__THREE_GAME_DIAGNOSTICS__?.performance?.locked)) === false,
+    `locked ${beforeClick?.locked} → ${afterClick?.locked}，aria-pressed=${pressed}，` +
+      `诊断 locked=${await page.evaluate(() => window.__THREE_GAME_DIAGNOSTICS__?.performance?.locked)}`,
+  );
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.qualityLock?.(false));
+
 
   const base = rows.find((row) => row.rate === 1 && row.tier === 'high');
   check('无降速时高档跑满（>50 FPS）', (base?.fps ?? 0) > 50, `fps=${base?.fps?.toFixed(1)}`);
@@ -3507,20 +4114,70 @@ async function runAcceptance(page, context) {
   );
 
   // 5. 币的路径连续、可解释，没有瞬移
+  /*
+   * ★ 判据形状重写（2026-10-01）。旧形式「每 200 毫秒采一次，两次距离 < 0.6 米」
+   * **量的不是瞬移，是采样相位**：币从 `drop.y = 1.45` 落到台面要 ≈0.54 秒、
+   * 末段速度 ≈5.3 米/秒 ⇒ 一个 200 毫秒的窗口**本来**就能走出 0.6~1.0 米。
+   * 所以阈值 0.6 落在「判据自己能产出的读数范围」里面 ——
+   * 现测同一棵树上四发的 maxJump 是 0.462 / 0.452 / 0.415 / 0.376 米，
+   * 而 harness 那一次读到 0.645 米（`/tmp/jump-rootcause.mjs`）。
+   * ⇒ 任何动到落地时序的改动都会把它随机翻红（本次就是：`2d1eaa6`/`6fa2358` 之后翻红，
+   *   但**逐帧实测排除了真瞬移**：最大逐帧位移 0.130 米，
+   *   且 `位移 ÷ (该帧速度 × 帧间隔)` = 0.53~0.62，**全部 ≤ 1**）。
+   *
+   * 新判据与采样间隔无关，直接问「这一帧走的距离，是不是它的速度付得起的」：
+   *   `位移 > max(绝对地板, 3 × speed × dt)` ⇒ 瞬移。
+   * 真瞬移的特征是**位置跳了而速度没跟上**（比值 → ∞），所以 3 倍这条线抓得住它；
+   * 而正常落体的比值实测 ≤0.62，离 3 有 ~5 倍余量 ⇒ 这次不再贴噪声。
+   * ⚠️ 绝对地板 0.02 米是为了第一帧：`dt` 可能极小（`speed × dt` → 0）会让比值假爆。
+   */
   await startRun(page, 'ready');
-  await dropUntilAccepted(page, 0);
-  let previous = null;
-  let maxJump = 0;
-  for (let step = 0; step < 40; step += 1) {
-    await page.waitForTimeout(200);
-    const coin = await playerCoin(page);
-    if (!coin) break;
-    if (previous) {
-      maxJump = Math.max(maxJump, Math.hypot(coin.x - previous.x, coin.y - previous.y, coin.z - previous.z));
+  const path = await page.evaluate(async () => {
+    const H = window.__THREE_GAME_TEST_HOOKS__;
+    /*
+     * 投递必须**在这一段里面**做，不能在外面先 `dropUntilAccepted`。
+     * 原因：靠「记下投递前的 slot 集合、再找不在集合里的 `playerDropped` 币」来锁定这一枚，
+     * 如果在外面投、进来之后才取集合，那枚币**已经在集合里了** ⇒ 永远匹配不到，
+     * 判据会读「逐帧样本 0 个」而红（第一次就踩了这个坑，红得干脆，不是假绿）。
+     */
+    let before = null;
+    let dropped = false;
+    for (let attempt = 0; attempt < 80 && !dropped; attempt += 1) {
+      before = new Set((H.coins() ?? []).map((c) => c.slot));
+      dropped = H.drop?.(0) === true;
+      if (!dropped) await new Promise((resolve) => setTimeout(resolve, 120));
     }
-    previous = coin;
-  }
-  check('⑤ 落币路径连续，无位置瞬移', maxJump < 0.6, `单次采样最大位移 ${maxJump.toFixed(3)} 米`);
+    let worstRatio = 0;
+    let worstJump = 0;
+    let previous = null;
+    let samples = 0;
+    let last = performance.now();
+    for (let frame = 0; dropped && frame < 200; frame += 1) {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const now = performance.now();
+      const dt = Math.max(0.001, (now - last) / 1000);
+      last = now;
+      const coin = (H.coins() ?? []).find((c) => c.playerDropped && !before.has(c.slot));
+      if (!coin) continue;
+      if (previous) {
+        const jump = Math.hypot(coin.x - previous.x, coin.y - previous.y, coin.z - previous.z);
+        const budget = Math.max(0.02, 3 * (coin.speed ?? 0) * dt);
+        worstRatio = Math.max(worstRatio, jump / budget);
+        worstJump = Math.max(worstJump, jump);
+        samples += 1;
+      }
+      previous = { x: coin.x, y: coin.y, z: coin.z };
+      // 落定就停：后面的帧是币床里的推挤，不属于「落币路径」。
+      if (coin.y < 0.24 && (coin.speed ?? 1) < 0.15) break;
+    }
+    return { dropped, worstRatio, worstJump, samples };
+  });
+  check(
+    '⑤ 落币路径连续，无位置瞬移（逐帧位移 ÷ 速度可付位移 ≤ 3）',
+    path.dropped === true && path.samples > 20 && path.worstRatio <= 3,
+    `投递成功=${path.dropped}，逐帧样本 ${path.samples} 个，` +
+      `最大比值 ${path.worstRatio.toFixed(2)}（上限 3）；最大逐帧位移 ${path.worstJump.toFixed(3)} 米`,
+  );
 
   // 6. 预置币不充能（预置币不是玩家投的，没资格点亮 XIXI）
   //
@@ -3544,18 +4201,46 @@ async function runAcceptance(page, context) {
   // 11. 暂停不推进推板循环与耗时
   await startRun(page, 'playing');
   await dropUntilAccepted(page, 0);
-  await waitFor(page, (state) => (state?.pusher.cycles ?? 0) >= 1, 20_000);
-  const beforePause = await readState(page);
+  /*
+   * ★ 第一份样必须在**暂停真的生效之后**取 —— 这条判据原来红在取样时刻，不是红在物理。
+   *
+   * 旧写法是「读一次 → 点按钮 → 等 3.2 秒 → 再读」，于是 `beforePause` 取的是**点击之前**
+   * 的状态：点击经 CDP 派发、到 `Game.togglePause()` 真正生效之间那段时间游戏是正常在跑的，
+   * 全部被算进「暂停期间推进了多少」。
+   * 铁证是基线读数（`6fa2358`，纯 HEAD、改动之前）：「耗时 0.52 → 0.93」——
+   * 0.41 秒 ≈ 25 帧，正是点击往返加首帧的量级；而引擎里 `elapsed += delta`
+   * 明明排在 `if (this.paused) { publishDiagnostics(); return; }` **之后**
+   * （`Game.ts:641` → `:645`），暂停期间它不可能涨。⇒ 红的是判据自己。
+   * ⚠️ 旧容差写的就是 `0.2` 秒 —— 那不是「留点余量」，是**给这个竞态打的补丁**；
+   *   取样时刻修对之后容差收回 0.02 秒（暂停期间 elapsed 应当一位都不动）。
+   *
+   * 判「生效」用的是引擎自己的状态：`Hud.setPaused` 里 `#pause-panel` 的 `hidden`，
+   * 不是脚本猜的时间。
+   *
+   * 顺带删掉旧代码里的 `waitFor(cycles >= 1)`：`pusher.cycles` **不随开局清零**，
+   * 上一局留下的计数让它立刻为真 —— 基线那次 `elapsed=0.52` 却已经「1 个循环」就是铁证
+   * （一个循环本该 2.4 秒）。它谁也没等到，是个恒真式。
+   */
   await page.locator('#pause-button').click();
+  let pausedShown = false;
+  for (let attempt = 0; attempt < 60 && !pausedShown; attempt += 1) {
+    pausedShown = await page.evaluate(
+      () => document.querySelector('#pause-panel')?.hidden === false,
+    );
+    if (!pausedShown) await page.waitForTimeout(100);
+  }
+  const beforePause = await readState(page);
   await page.waitForTimeout(3200);
   const duringPause = await readState(page);
   await page.locator('#pause-button').click();
   check(
     '⑪ 暂停期间推板循环与耗时都不推进',
-    duringPause?.pusher.cycles === beforePause?.pusher.cycles &&
-      Math.abs((duringPause?.elapsed ?? 0) - (beforePause?.elapsed ?? 0)) < 0.2,
-    `循环 ${beforePause?.pusher.cycles}→${duringPause?.pusher.cycles}，` +
-      `耗时 ${beforePause?.elapsed?.toFixed(2)}→${duringPause?.elapsed?.toFixed(2)}`,
+    pausedShown === true &&
+      duringPause?.pusher.cycles === beforePause?.pusher.cycles &&
+      Math.abs((duringPause?.elapsed ?? 0) - (beforePause?.elapsed ?? 0)) < 0.02,
+    `暂停面板已显示=${pausedShown}（等它显出来才取第一份样），` +
+      `循环 ${beforePause?.pusher.cycles}→${duringPause?.pusher.cycles}，` +
+      `耗时 ${(beforePause?.elapsed ?? 0).toFixed(3)}→${(duringPause?.elapsed ?? 0).toFixed(3)} 秒`,
   );
 
   // 14. 手机视窗下操作区不被遮挡
@@ -3623,16 +4308,21 @@ async function runAcceptance(page, context) {
  *
  * ★★ 2026-09-25 换口径：`conveyor` 归零的**第 4 处判据受害者**（前三处见 §11.6）。
  *   旧版是「投一枚 → 等一个推板循环 → 读离台」，在 `conveyor = 0` 下**必然读到 0 条**：
- *   台面币唯一的动力是推板的摩擦拖曳（净 26 毫米/循环），而落点 `z` 到台面前唇
+ *   台面币唯一的动力是推板的摩擦拖曳（⚠️ 这里的「净 26 毫米/循环」是 **S13 破对称**期的
+ *   读数；S23 已把 `retract` 改回 0.9 ⇒ 对称行程下净输送**精确 0**，见 `constants.ts:406`），
+ *   而落点 `z` 到台面前唇
  *   有 **1.2 米**（落币口 2026-09-25 从 −0.72 后移到 −1.20，见 `constants.ts` 的 `drop`）。
  *   实测（12 枚币，×1.2 档，2026-09-25）：首条离台事件出现在**第 37 个推板循环**，
  *   而 `conveyor = 0` 刚上线、落点还在 −0.72 时是第 16 个循环。
  *   所以这里改成「投满一批 + **按循环数**等」——**不要按秒等**，周期会变。
  *
- *   ⚠️ 顺带记一条容易看错的事实：`fallOffEvents` **只记 `playerDropped` 的币**
- *   （见 `Game.ts` 的 `wasOnDeck && !onDeck && coin.playerDropped`）。同一批实测里
- *   台面从 62 枚掉到 8 枚（54 枚预置币离台），而遥测**一条事件都没有**。
- *   拿「台面枚数在掉」当成「离台事件应该有」会得出自相矛盾的读数。
+ *   ⚠️ 这条在 S1b/#49 已变更（旧文本留着会误导下一个改判据的人）：
+ *   原先 `fallOffEvents` **只记 `playerDropped` 的币**，于是同一批实测里台面从 62 掉到 8
+ *   （54 枚预置币离台）而遥测**一条事件都没有**——那既是「容易看错的读数」，
+ *   也是 ④ 把『取样不到』读成『物理不对』的病根。
+ *   ⇒ 现在**床币也记**，事件带 `source: 'player' | 'bed'`（`Game.ts` 的离台记录块），
+ *     判据 ④a/④b 用全样本、④c 只看 player 子集。
+ *   仍然成立的告诫：拿「台面枚数在掉」直接当成「玩家币离台事件应该有」依旧会自相矛盾。
  *
  * ★★ 同时把 `spread > 0.3` 换成「行程的比例」。0.3 是按 `conveyor = 0.85` 标定的：
  *   那时币被输送带在 ~1 秒内送到前唇，落点能落在整个行程里的任意一点。
@@ -3675,26 +4365,72 @@ async function runTimingCheck(page) {
   );
 
   const fallOffEvents = telemetry?.fallOffEvents ?? [];
-  const gaps = fallOffEvents.map((event) => Math.abs(event.z - event.frontFaceZ));
-  const worstGap = gaps.length > 0 ? Math.max(...gaps) : 99;
-  const faces = fallOffEvents.map((event) => event.frontFaceZ);
-  const offsets = fallOffEvents.map((event) => event.offset);
-  const spread = faces.length > 1 ? Math.max(...faces) - Math.min(...faces) : 0;
-  const strokeSpread = spread / pusherTravel;
-  const offsetSpread = offsets.length > 1 ? Math.max(...offsets) - Math.min(...offsets) : 0;
-  const phases = [...new Set(fallOffEvents.map((event) => event.phase))].join('/');
+  // ★ 偏差/跨度只算一份，三处调用（全样本 / 玩家币子集 / 床币子集只打印）。
+  //   写第二份公式就是 #67 那条「两处写同一个数 ⇒ 第二真源」的同款病。
+  const gapStats = (events) => {
+    const faces = events.map((event) => event.frontFaceZ);
+    const offsets = events.map((event) => event.offset);
+    const spread = faces.length > 1 ? Math.max(...faces) - Math.min(...faces) : 0;
+    return {
+      count: events.length,
+      worstGap: events.length > 0
+        ? Math.max(...events.map((event) => Math.abs(event.z - event.frontFaceZ)))
+        : 99,
+      spread,
+      strokeSpread: spread / pusherTravel,
+      offsetSpread: offsets.length > 1 ? Math.max(...offsets) - Math.min(...offsets) : 0,
+      phases: [...new Set(events.map((event) => event.phase))].join('/'),
+    };
+  };
+  const all = gapStats(fallOffEvents);
+  const player = gapStats(fallOffEvents.filter((event) => event.source === 'player'));
+  const SPREAD_MIN = 0.25;
+  // ★ 最小样本数：阈值 25% 与"最大偏差"都是在 **n ≥ 10** 上标的（等离台的等待条件本身就是
+  //   「事件数 ≥ 10 或跑满 60 循环」）。实测跨子是样本量的函数：4 条事件只有行程的 11%，
+  //   18 条才有 35% ⇒ 拿 3~5 条去比 25% 是在量"这次掷到哪"，不是量物理。
+  //   ⇒ 样本不足时 ④a/④b 一律**缺席**（打一行说明，不进 check）：
+  //   写成 `条件: true` 放行是恒绿，硬判红又是把"取样窗口不够"说成"机器坏"。
+  const MIN_EVENTS = 10;
 
-  check(
-    '④ 币离开台面的位置贴合推板前缘（无隐藏落点）',
-    fallOffEvents.length >= 2 && worstGap < 0.3,
-    `${fallOffEvents.length} 次离台，最大偏差 ${worstGap.toFixed(3)} 米`,
-  );
-  check(
-    '④ 不同推板时机的落点确实不同',
-    strokeSpread >= 0.25,
-    `推币面 z 跨度 ${spread.toFixed(3)} 米 = 行程的 ${(strokeSpread * 100).toFixed(0)}%（阈值 25%）` +
-      `，行程读数跨度 ${offsetSpread.toFixed(3)} 米，相位 ${phases || '-'}`,
-  );
+  if (all.count >= MIN_EVENTS) {
+    check(
+      '④a 币离开台面的位置贴合推板前缘（全样本 ⇒ 无隐藏落点）',
+      all.count >= 2 && all.worstGap < 0.3,
+      `${all.count} 次离台（玩家币 ${player.count} / 床币 ${all.count - player.count}），` +
+        `最大偏差 ${all.worstGap.toFixed(3)} 米`,
+    );
+    check(
+      '④b 不同推板时机的落点确实不同（全样本）',
+      all.strokeSpread >= SPREAD_MIN,
+      `推币面 z 跨度 ${all.spread.toFixed(3)} 米 = 行程的 ${(all.strokeSpread * 100).toFixed(0)}%` +
+        `（阈值 ${(SPREAD_MIN * 100).toFixed(0)}%），行程读数跨度 ${all.offsetSpread.toFixed(3)} 米，` +
+        `相位 ${all.phases || '-'}`,
+    );
+
+  } else {
+    console.log(
+      `  [④a/④b 未判定] 离台事件只有 ${all.count} 条（< ${MIN_EVENTS}）⇒ 跨度阈值与『最大偏差』都是在 ` +
+        `${MIN_EVENTS} 条以上标的，这时报绿或报红都是在报样本量。等够事件是靠『跑满 60 循环』兜底的。`,
+    );
+  }
+
+  // ④c 玩家币支。⚠️ **样本不足时既不报绿也不报红**：直接 console.log 并跳过 check()。
+  //   写成 `条件: true` 的『样本为 0 就放行』是恒绿形态（本项目吃过太多次）；
+  //   而报红又是错的——S1a 已实测对称行程下单枚玩家币四位数循环才离台，
+  //   红在这里说的是『取样窗口不够』，不是『机器坏』。⇒ 让它**缺席**并在报告里说明缺席。
+  if (player.count >= 2) {
+    check(
+      '④c 玩家币自己离台时同样贴合前缘且有跨度',
+      player.worstGap < 0.3 && player.strokeSpread >= SPREAD_MIN,
+      `玩家币 ${player.count} 次离台，最大偏差 ${player.worstGap.toFixed(3)} 米，` +
+        `跨度 = 行程的 ${(player.strokeSpread * 100).toFixed(0)}%（阈值 25%）`,
+    );
+  } else {
+    console.log(
+      `  [④c 未判定] 玩家币离台样本 ${player.count} 条（<2）⇒ 这条**不参与计数**，` +
+        '缺席原因是 S1a：对称行程下单枚玩家币走完台面要四位数循环',
+    );
+  }
 }
 
 /**
