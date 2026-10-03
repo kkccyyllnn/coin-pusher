@@ -28,6 +28,9 @@
  *   model      模型模式（S24，?model）：覆盖层生效 / 面板在 DOM / 改真源→几何跟着变 / 解析盒仍自洽 / 重建不涨预算
  *   camera     摄影机机位（S22）：角度↔坐标往返恒等 / 两组自由度隔离 / 机位所有权 / `?debug` 面板端到端
  *   shots      截图
+ *   hooks      搬家守卫：M0 结构门（dispose 完整性，清单由源码派生）+ M1 读数 census（诊断字段与
+ *              钩子键逐字节基线）+ M2 发布时机门（快照每帧换身份，堵住"悄悄合帧/降频"）
+ *              基线在 `scripts/diagnostics-census.json`；重建：`CENSUS_UPDATE=1 node scripts/verify-game.mjs hooks`
  *   all        probe + endless + xixi
  */
 
@@ -7305,6 +7308,202 @@ async function runModel(page, context) {
   await modelPage.close();
 }
 
+/**
+ * ── 模式：hooks ──「搬家没改行为」的三条守卫门（10-03 计划 dawn-reef-buck 步 1）。
+ *
+ * 为什么要这三条：`src/game/Game.ts` 里 1,843 行「── 测试钩子与诊断 ──」要逐片外移。
+ * 钩子的**键名与签名**有编译期保护（`window.__THREE_GAME_TEST_HOOKS__` 是带类型的字面量赋值，
+ * 漏键或改签名当场 `tsc` 红），但**语义与时机没有任何编译期保护** ⇒ 唯一能证明"搬完一样"的办法，
+ * 是搬之前就把**引擎自己给出的**读数清单存成基线。三条门各堵一个具体的假绿形态：
+ *   M0 结构门 —— 堵「dispose 少调一件」。`Game.dispose()` 的唯一调用点是 `main.ts:13-17` 的
+ *      `import.meta.hot.dispose`（只在 Vite HMR 跑），现有 22 个模式 + 3 套用例**一条都覆盖不到**
+ *      ⇒ 不立门就是无门改动。待查清单**派生**自源码（凡"声明了 dispose() 且注册了 window 监听器"
+ *      的类、且被 Game 持有成字段），不在测试里手抄名单 —— 手抄名单就是第二真源。
+ *   M1 census —— 堵「键还在、值算错了」与「少了一个字段」。字段路径与钩子键名全部由引擎枚举。
+ *      哪些字段本就不该逐位相同（帧号/时间/FPS/在途币位置）也**不手抄**：在同一确定性状态下
+ *      隔 ~200 毫秒连拍两遍，两遍不一致的自动进不稳定名单，只比结构不比值。
+ *   M2 时机门 —— 堵「发布被悄悄合帧/降频」。`readStateFresh()` 只等 140 毫秒（`simTick(page,140)`），
+ *      降到 5 Hz 就会让它的 69 处调用读到旧帧；`tests/visual.spec.ts:147` 的 `waitFrames()` 拿
+ *      `diagnostics.frame` 增量当等待 ⇒ 降频会改掉逐字节截图门的前置时长。这条门让"频率没变"
+ *      变成一个可失败的检查，也是**唯一允许日后改发布频率时守住下限**的东西。
+ */
+const CENSUS_FILE = process.env.CENSUS_FILE ?? resolve(REPO_ROOT, 'scripts/diagnostics-census.json');
+
+async function runHooksGuard(page, context) {
+  console.log('\n── 模式：hooks（结构门 M0 + 读数 census M1 + 发布时机门 M2） ──');
+  const fs = await import('node:fs/promises');
+
+  // ── M0-a：两个 window 全局各自只有一处装配、且在 dispose 里撤销 ──
+  const gamePath = resolve(REPO_ROOT, 'src/game/Game.ts');
+  const gameSrc = await fs.readFile(gamePath, 'utf8');
+  for (const name of ['__THREE_GAME_TEST_HOOKS__', '__THREE_GAME_DIAGNOSTICS__']) {
+    const assigns = (gameSrc.match(new RegExp(`window\\.${name} = \\{`, 'g')) ?? []).length;
+    const clears = (gameSrc.match(new RegExp(`window\\.${name} = undefined`, 'g')) ?? []).length;
+    check(
+      `M0 ${name}：装配点唯一且 dispose 里撤销`,
+      assigns === 1 && clears >= 1,
+      `赋值 ${assigns} 处（要求恰好 1）、置 undefined ${clears} 处（要求 ≥1）⇒ 多出的赋值点就是第二真源`,
+    );
+  }
+
+  // ── M0-b：dispose() 必须释放每一个"会注册 window 监听器"的子系统（清单派生，不手抄）──
+  const disposeMatch = gameSrc.match(/\n {2}dispose\(\): void \{([\s\S]*?)\n {2}\}/);
+  const disposeBody = disposeMatch ? disposeMatch[1] : '';
+  const importStatements = gameSrc.match(/^import[\s\S]*?from\s+'[^']+';$/gm) ?? [];
+  const needsDispose = [];
+  for (const statement of importStatements) {
+    const spec = (statement.match(/from\s+'([^']+)'/) ?? [])[1];
+    if (!spec || !spec.startsWith('.')) continue;
+    let target = resolve(gamePath, '..', spec);
+    if (!target.endsWith('.ts')) target += '.ts';
+    let moduleSrc = null;
+    try {
+      moduleSrc = await fs.readFile(target, 'utf8');
+    } catch {
+      continue; // 目录/非模块说明符：不是子系统字段，跳过
+    }
+    const declaresDispose = /\n {2}(?:public )?dispose\(\)/.test(moduleSrc);
+    const registersWindowListener = /window\.addEventListener/.test(moduleSrc);
+    if (!declaresDispose || !registersWindowListener) continue;
+    const names = (statement.match(/\{([^}]*)\}/) ?? [null, ''])[1]
+      .split(',')
+      .map((entry) => entry.trim().split(/\s+as\s+/)[0])
+      .filter(Boolean);
+    for (const typeName of names) {
+      const fieldRe = new RegExp(`\\n {2}(?:private |readonly |protected )?([a-zA-Z]+)\\s*:\\s*${typeName}\\b`, 'g');
+      for (const found of gameSrc.matchAll(fieldRe)) {
+        const field = found[1];
+        if (!new RegExp(`this\\.${field}\\??\\.dispose\\(`).test(disposeBody)) {
+          needsDispose.push(`${field}: ${typeName}（注册了 window 监听器，dispose() 里没调用它）`);
+        }
+      }
+    }
+  }
+  check(
+    'M0 Game.dispose() 释放了每一个会注册 window 监听器的子系统（清单由源码派生）',
+    disposeBody.length > 0 && needsDispose.length === 0,
+    disposeBody.length === 0
+      ? '🔴 没找到 dispose() 方法体 ⇒ 探针失效，不是"没有泄漏"'
+      : needsDispose.length === 0
+        ? '派生出的待释放清单已全部被释放'
+        : `缺 ${needsDispose.length} 件：${needsDispose.join('；')}`,
+  );
+
+  // ── M1：读数 census（结构逐字节比；不稳定字段的值不比，名单由两遍连拍派生）──
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.clearSave?.());
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.seed?.(20260921));
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setState?.('ready'));
+  await waitFor(page, (state) => (state?.frame ?? 0) > 12, 40_000);
+
+  const capture = () =>
+    page.evaluate(() => {
+      const fields = {};
+      const walk = (value, prefix, depth) => {
+        if (value === null || typeof value !== 'object') {
+          fields[prefix] = { type: value === null ? 'null' : typeof value, value: String(value).slice(0, 24) };
+          return;
+        }
+        if (depth >= 3) {
+          fields[prefix] = { type: Array.isArray(value) ? `array(${value.length})` : 'object', value: '' };
+          return;
+        }
+        if (Array.isArray(value)) {
+          fields[prefix] = { type: `array(${value.length})`, value: String(value.length) };
+          if (value.length > 0) walk(value[0], `${prefix}[0]`, depth + 1);
+          return;
+        }
+        for (const [key, entry] of Object.entries(value)) walk(entry, `${prefix}.${key}`, depth + 1);
+      };
+      walk(window.__THREE_GAME_DIAGNOSTICS__ ?? {}, 'diag', 0);
+      return {
+        fields,
+        hookKeys: Object.keys(window.__THREE_GAME_TEST_HOOKS__ ?? {}).sort(),
+      };
+    });
+
+  const first = await capture();
+  await simTick(page, 200);
+  const second = await capture();
+  const unstable = Object.keys(first.fields).filter(
+    (p) => second.fields[p] === undefined || second.fields[p].value !== first.fields[p].value,
+  );
+  const structure = Object.keys(first.fields)
+    .sort()
+    .map((p) => `${p}:${first.fields[p].type}`);
+  const stableValues = {};
+  for (const p of Object.keys(first.fields).sort()) {
+    if (!unstable.includes(p)) stableValues[p] = first.fields[p].value;
+  }
+
+  let golden = null;
+  try {
+    golden = JSON.parse(await fs.readFile(CENSUS_FILE, 'utf8'));
+  } catch {
+    golden = null;
+  }
+  const snapshot = {
+    _comment:
+      'M1 census 基线：由 `node scripts/verify-game.mjs hooks` 在确定性态（clearSave + seed 20260921 + setState("ready")）枚举引擎自己的诊断字段路径与钩子键名。重建：CENSUS_UPDATE=1 跑同一个模式。unstable = 两遍连拍不一致的字段，只比结构不比值。',
+    generatedAt: new Date().toISOString(),
+    fieldCount: structure.length,
+    hookCount: first.hookKeys.length,
+    unstable,
+    structure,
+    hookKeys: first.hookKeys,
+    values: stableValues,
+  };
+  if (process.env.CENSUS_UPDATE === '1' || golden === null) {
+    await fs.writeFile(CENSUS_FILE, `${JSON.stringify(snapshot, null, 2)}\n`);
+    console.log(
+      `  [census] ${golden === null ? '没有基线 ⇒ 写第一份' : 'CENSUS_UPDATE=1 ⇒ 重写基线'}：` +
+        `${CENSUS_FILE}（结构 ${structure.length} 条、钩子键 ${first.hookKeys.length} 个、不稳定字段 ${unstable.length} 条）`,
+    );
+  } else {
+    const structDiff = structure.filter((p) => !golden.structure.includes(p)).concat(golden.structure.filter((p) => !structure.includes(p)));
+    const hookDiff = first.hookKeys.filter((k) => !golden.hookKeys.includes(k)).concat(golden.hookKeys.filter((k) => !first.hookKeys.includes(k)));
+    const valueDiff = Object.keys(stableValues).filter((p) => golden.values[p] !== undefined && golden.values[p] !== stableValues[p]);
+    check(
+      'M1 census：诊断字段路径集合与基线逐字节同（含值，不稳定字段除外）',
+      structDiff.length === 0 && valueDiff.length === 0,
+      `结构 ${structure.length} 条 vs 基线 ${golden.structure.length} 条；差异 ${structDiff.slice(0, 6).join(' | ') || '无'}；` +
+        `值不一致 ${valueDiff.length} 条（${valueDiff.slice(0, 4).join(' | ') || '无'}）；不稳定名单基线 ${(golden.unstable ?? []).length} 条/本次 ${unstable.length} 条`,
+    );
+    check(
+      'M1 census：钩子键集合与基线逐字节同',
+      hookDiff.length === 0,
+      `本次 ${first.hookKeys.length} 个键 vs 基线 ${golden.hookKeys.length} 个；差异 ${hookDiff.join(' | ') || '无'}`,
+    );
+  }
+
+  // ── M2：发布时机（对象身份变化次数 / rAF 心跳数）──
+  const timingPage = await context.newPage();
+  await timingPage.addInitScript(() => {
+    const w = window;
+    w.__PUB_OBS__ = { ticks: 0, publishes: 0, last: null };
+    const step = () => {
+      w.__PUB_OBS__.ticks += 1;
+      const d = w.__THREE_GAME_DIAGNOSTICS__;
+      if (d && d !== w.__PUB_OBS__.last) {
+        w.__PUB_OBS__.last = d;
+        w.__PUB_OBS__.publishes += 1;
+      }
+      w.requestAnimationFrame(step);
+    };
+    w.requestAnimationFrame(step);
+  });
+  await timingPage.goto(BASE, { waitUntil: 'domcontentloaded' });
+  await timingPage.waitForFunction(() => (window.__THREE_GAME_DIAGNOSTICS__?.frame ?? 0) > 40, null, { timeout: 60_000 });
+  const observed = await timingPage.evaluate(() => window.__PUB_OBS__);
+  await timingPage.close();
+  const ratio = observed && observed.ticks > 0 ? observed.publishes / observed.ticks : 0;
+  check(
+    'M2 发布时机：诊断快照每帧换一次对象身份（比例 ≥ 0.8 ⇒ 没被合帧/降频）',
+    observed && observed.ticks > 30 && ratio >= 0.8,
+    `rAF 心跳 ${observed?.ticks ?? 0} 次、身份变化 ${observed?.publishes ?? 0} 次 ⇒ ${ratio.toFixed(3)}。` +
+      '下限 0.8 的依据：readStateFresh 只等 140 毫秒，5 Hz（0.17）会让它读旧帧；60 fps 下 10 Hz ≈ 0.17 同样不合格',
+  );
+}
+
 async function main() {
   const browser = await chromium.launch({ channel: 'chromium' });
   const { page, context, errors } = await openGame(browser);
@@ -7341,6 +7540,8 @@ async function main() {
     //   node scripts/verify-game.mjs model
     if (MODE === 'model') await runModel(page, context);
     if (MODE === 'camera') await runCamera(page, context);
+    // 搬家守卫（10-03）：结构门 + 读数 census + 发布时机门。搬移前后各跑一次，census 逐字节同。
+    if (MODE === 'hooks') await runHooksGuard(page, context);
     if (MODE === 'refill') await runRefill(page);
     if (MODE === 'feedback') await runFeedback(page);
     check('运行期无控制台/页面错误', errors.length === 0, errors.slice(0, 3).join(' | '));
