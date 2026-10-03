@@ -2979,6 +2979,20 @@ async function runXixi(page) {
     // 一局只有 20 枚筹码、而一批要投 12 枚 ⇒ 每轮都开新局，
     // 免得「投到一半没钱了」把这一批打残（XIXI 进度跨局保留）。
     await startRun(page, 'playing');
+    /* 夹具：把币床掏薄。为什么这不是"把判据改成能过"：本段测的是**登记链**
+       （走完台面的币会点亮槽 → 四槽集齐 → 摇奖），而满盘时玩家投下的币要先在推板可达带
+       （`frontFaceZ = −0.16` + 行程 0.36 ⇒ [−0.16, +0.20]）之外排队 0.86 米。10-03 同树实测：
+       · 满盘：4 轮 × 200 循环、48 投 ⇒ **0 条 lit**（`/tmp/xixi-full-leg.out`，B/C/spin 三条因此红）；
+       · 掏薄：同一窗、12 投 ⇒ 第 **158** 循环落床并点亮（`:185` 因此绿）。
+       ⇒ "排队要多久"是 **#49 的手感取舍**（对照表在计划里），不该继续当这条腿的隐形前置。
+       掏薄之后本腿仍要求币**自己走完台面**，没有跳过任何一步物理。 */
+    const clearedBed = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.clearBedTo?.(0) ?? -1);
+    if (round === 0) {
+      console.log(
+        `  [info] 落床段夹具：clearBedTo(0) 移走 ${clearedBed} 枚床币` +
+          `（满盘排队的时长归 #49 记录，不在本判据里）`,
+      );
+    }
     for (const lane of lanes) await dropUntilAccepted(page, lane, 4000);
     // 等这一批币被推板送到前缘、掉下币床。⚠️ 这里等的是「走完整个台面」：
     // 集章门槛 `registerY = 0.13` 在上层台面（币心 ≈0.213）之下，只有从前唇掉下去才成立
