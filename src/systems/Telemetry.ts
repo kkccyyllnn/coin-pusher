@@ -25,6 +25,8 @@ export type FallOffEvent = {
   /** 同一时刻推板行程。 */
   offset: number;
   phase: string;
+  /** 离台的是玩家投入的币还是预置床币（`accept` ④ 按它分流样本；#49）。 */
+  source: 'player' | 'bed';
 };
 
 /**
@@ -120,8 +122,20 @@ export type XixiEvent = {
   /** reward：加力是否入账（存满拒收时为 false）；演出奖励则为承诺枚数。 */
   granted?: boolean;
   delivered?: number;
-  /** reward（`fine`）：**实扣**的本局筹码数（扣到 0 为止，所以可能小于罚款面值）。 */
+  /** reward（`fine`）：**实扣**的筹码数（扣到 0 为止，所以可能小于罚款面值）。 */
   fined?: number;
+  /**
+   * S5a 四同分档：`3` = 常规中奖，`4` = 大奖。只有 `win` 带它。
+   * 判据靠它核「四同真的走了另一条分支」——不看这个字段的话，
+   * 「大奖演成三同」在画面上完全看不出来（灯色一样、符号一样）。
+   */
+  tier?: 3 | 4;
+  /**
+   * reward（`fine`）：罚不掉而**转成欠款**的那一截（S5b）。
+   * 与 `fined` 分开记才对得了账：`fined + debtAdded` 在欠款到顶时会小于罚款面值，
+   * 而那正是「上限是承重结构」这件事唯一能被看见的时刻。
+   */
+  debtAdded?: number;
   t: number;
 };
 

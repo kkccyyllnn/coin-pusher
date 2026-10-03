@@ -23,7 +23,9 @@
             <span class="hud-label">本局赚进</span>
             <strong id="earned-value">0</strong>
             <span class="hud-label">最高 <strong id="best-value">0</strong></span>
-            <span class="hud-label">钱包 <strong id="wallet-value">0</strong></span>
+            <!-- ★ S4 合并账户：这里原本还有一条「钱包 <strong id="wallet-value">」。
+                 合并之后「钱包」与底部的「局内筹码」是同一个数 ⇒ 并成底部那一条。
+                 留两个读数显示同一个值，就是玩家抱怨「我的钱怎么少了 20」的源头。 -->
           </div>
 
           <div id="hud-actions">
@@ -40,6 +42,11 @@
         <div id="xixi-marks" aria-label="XIXI 集章状态">
           <span id="mark-note">投币点亮 XIXI 四槽，集齐摇老虎机</span>
         </div>
+        <!-- 欠款一行小字（S2）。刻意独立成一条而不是塞进 `mark-note`：
+             那条已经兼作「加力已就绪」的提示位，两种语义挤在一起会让 HUD 说出矛盾的话。 -->
+        <div id="debt-line" hidden aria-live="polite">
+          <span id="debt-note"></span>
+        </div>
 
         <div id="combo-toast" role="status" aria-live="polite"></div>
         <div id="drain-prompt" hidden>
@@ -50,7 +57,7 @@
 
         <footer id="hud-bottom">
           <div id="resource-readout">
-            <span class="hud-label">局内筹码</span>
+            <span class="hud-label">余额</span>
             <strong id="credits-value">0</strong>
           </div>
           <div id="action-column">
@@ -90,6 +97,8 @@
         <h2>已暂停</h2>
         <p>推板与物理都已冻结，恢复后不会补算暂停时间。</p>
         <button id="resume-button" type="button">继续</button>
+        <button id="quality-lock-button" type="button" aria-pressed="false">画质：自动（当前 高）</button>
+        <p class="pause-note">帧率偏低时画面会自动降档；锁上之后就不再自动换。</p>
       </section>
 
       <section id="collection-panel" hidden>
@@ -114,6 +123,7 @@
         <dl id="ruin-stats"></dl>
         <p id="ruin-board"></p>
         <div id="ruin-actions">
+          <button id="loan-button" type="button">贷款续玩</button>
           <button id="beg-button" type="button">跪求 xixi 大王大赏</button>
           <button id="quit-button" type="button">保留尊严，收工</button>
         </div>

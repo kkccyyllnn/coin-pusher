@@ -24,7 +24,7 @@ export class CollectionPanel {
   private readonly panel = this.el('#collection-panel');
   private readonly button = this.el<HTMLButtonElement>('#collection-button');
   private readonly closeButton = this.el<HTMLButtonElement>('#collection-close');
-  private readonly walletCount = this.el('#ticket-count');
+  private readonly balanceCount = this.el('#ticket-count');
   private readonly coinList = this.el('#coin-skin-list');
   private readonly cabinetList = this.el('#cabinet-skin-list');
 
@@ -66,7 +66,13 @@ export class CollectionPanel {
 
   /** 结算后刷新，让新到手的筹码立刻可花。 */
   refresh(): void {
-    this.walletCount.textContent = `筹码 ${this.save.wallet}`;
+    // ★ S4：这里印的是**余额**，不是 `spendable` —— 玩家得先看见自己有多少钱。
+    //   但跪来的那一份不能换成图鉴，所以有脏钱时**把可用额一并标出来**，
+    //   否则按钮灰着而数字看着够 ⇒ 那就是「静默拒绝」，玩家会以为界面坏了。
+    this.balanceCount.textContent =
+      this.save.beggedTotal > 0
+        ? `余额 ${this.save.balance}（可用 ${this.save.spendable}）`
+        : `余额 ${this.save.balance}`;
     this.renderList(this.coinList, 'coin', COIN_SKINS);
     this.renderList(this.cabinetList, 'cabinet', CABINET_SKINS);
   }
@@ -118,7 +124,7 @@ export class CollectionPanel {
         });
       } else {
         action.textContent = `解锁（${skin.cost} 筹码）`;
-        action.disabled = this.save.wallet < skin.cost;
+        action.disabled = this.save.spendable < skin.cost;
         action.addEventListener('click', (event) => {
           event.preventDefault();
           this.unlock(kind, skin.id, skin.cost);

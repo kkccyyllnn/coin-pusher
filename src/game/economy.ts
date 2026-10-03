@@ -95,36 +95,64 @@ export function crossingReturn({ kind, combo, hot, betMul, roll }: CrossingInput
 }
 
 /**
- * 收工可回存钱包的筹码。
+ * 合并账户之后**唯一那条守恒式**里「跪来的钱」那一侧的口径（S4）。
  *
- * 跪求拿到的筹码（`dirtyChips`）可以继续玩，但**不能回存**——
- * 否则「破产 → 跪求 → 立刻收工」就是无限刷筹码的循环。
- * 手里筹码低于赊账额时回存 0。
+ * ★ 这不是新规则，是把旧规则的**等价形**搬过来，而且可以证：
+ *   旧：`cashOut = max(0, chips − begged)`，而 `chips = buyIn + earned + begged − spent`
+ *       ⇒ `chips − begged = buyIn + earned − spent` —— **跪来的那一份被完全抵消，
+ *       永远进不了可回存的金额**。
+ *   新：只有一个账户，没有「回存」这一步了 ⇒ 需要保护的不再是回存，
+ *       而是**把余额换成永久进度**（买图鉴外观）。
+ *   所以约束的载体从「不能回存」搬到「**不能买图鉴**」，公式仍是同一条：
+ *       `可花 = max(0, balance − beggedTotal)`。
+ *
+ * 代入验一遍（初始 200、投币花 20、越线赚 30、跪来 25）：
+ *   `balance = 200 + 30 + 25 − 20 = 235`，`可花 = 235 − 25 = 210 = 200 + 30 − 20` ✓
+ *   与旧式的 `buyIn + earned − spent` 逐项相等。
+ *
+ * ⚠️ 不衰减、不冲抵：旧模型里 `begged` 也不随花费减少（花掉脏钱之后剩下的好钱照样
+ *   被 `chips − begged` 扣住），所以这里保持同样的严苛度，**不要"顺手"改成 FIFO** ——
+ *   那会放松一条防刷钱的约束，而放松安全约束不是重构该做的事。
+ *   贷款进来的钱**算干净**（旧模型里它记进 `buyIn`，本来就可回存），所以不在这里扣。
  */
-export function cashOutOf(chips: number, dirtyChips: number): number {
-  return Math.max(0, chips - dirtyChips);
+export function spendableOf(balance: number, beggedTotal: number): number {
+  return Math.max(0, balance - beggedTotal);
 }
 
 /**
- * 一局的三账本。
+ * 一段（session）的账本 —— S4 合并账户之后**不再有「本局」与「钱包」两个口袋**。
  *
- * 恒等式：`chips = buyIn + earned + begged − spent`。
- * 任何一笔筹码的进出都必须落在其中一项上，否则账就对不上——
- * 这条式子是 P1 的核心验收，也是后面加机关/道具时最容易写漏的地方。
+ * 恒等式：`balance = initial + earned + begged + loaned − spent`。
+ * 与旧式的区别：
+ * - 旧式里 `buyIn` 是「从钱包搬到桌上」这笔**内部转账**，两边同时动 ⇒ 恒等式只在**一个口袋内**成立。
+ *   合并之后没有这笔转账 ⇒ `buyIn` 项消失，换成 `initial`（本段开始时的余额）。
+ * - 新增 `loaned`：贷款不再是「买入」，它是**一笔真实的进账**，必须单独可查
+ *   （S5b 的惩罚转债、HUD 的欠款行、以及「贷款前后盘面不动」那条判据都读它）。
+ *
+ * ★ 这条式子在**整个代码库里只写一遍**（`ledgerBalances` / `ledgerDelta`），
+ *   下游 harness 与 Playwright 都读引擎给出的 `balanced` —— 那正是 S0a 先做的全部理由：
+ *   没有那一步，这次合并要同步改的是**四处**手抄算式。
  */
 export type Ledger = {
-  buyIn: number;
+  /** 本段开始时的余额（旧名 `buyIn` 的位置，但含义不同：它不是一笔扣款）。 */
+  initial: number;
   earned: number;
   begged: number;
+  loaned: number;
   spent: number;
-  chips: number;
+  balance: number;
 };
 
 /** 账本是否平：差额为 0 才算平（筹码是整数，不允许有容差）。 */
 export function ledgerBalances(ledger: Ledger): boolean {
-  return ledger.chips === ledger.buyIn + ledger.earned + ledger.begged - ledger.spent;
+  return (
+    ledger.balance === ledger.initial + ledger.earned + ledger.begged + ledger.loaned - ledger.spent
+  );
 }
 
 export function ledgerDelta(ledger: Ledger): number {
-  return ledger.chips - (ledger.buyIn + ledger.earned + ledger.begged - ledger.spent);
+  return (
+    ledger.balance -
+    (ledger.initial + ledger.earned + ledger.begged + ledger.loaned - ledger.spent)
+  );
 }

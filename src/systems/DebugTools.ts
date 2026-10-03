@@ -5,6 +5,7 @@ import { COIN, PHYSICS, PUSHER_CYCLE, RULES, TABLE } from '../game/constants';
 import { COIN_PHYSICS_DEFAULTS, resetCoinPhysics } from '../game/coinPhysics';
 import { COIN_SCALE, COIN_SCALE_STEPS, setCoinScale, type CoinScale } from '../game/coinScale';
 import { CAMERA_FIT, cameraRig, placeCameraRig, syncCameraRigAngles, toDeg, toRad } from '../render/cameraRig';
+import { FINAL_PASS_SHADOW_AMOUNT } from '../render/FinalPass';
 import { PIXEL_SCALE_DEFAULTS } from '../render/PixelScale';
 import { AUDIO_EVENTS, auditionEvent } from './audioCatalog';
 import { GAIN_MAX, GAIN_MIN, type AudioSystem, type SelectorKey } from './AudioSystem';
@@ -40,6 +41,16 @@ export type GameTuning = {
    *（G0 判 rim 断线时就是这么被污染过一次，最后靠 `setState('ready')` + 暂停才量准）。
    */
   outlineScale: number;
+  /**
+   * 暗部冷色分级的强度（FinalPass 的 screen 混合，出厂值 = `FINAL_PASS_SHADOW_AMOUNT`）。
+   *
+   * ★ 为什么要旋钮：V9 落地的判据是「被作用的像素变冷」，但**缺一条恒等门**——
+   *   0 必须逐字节等于没接分级。没有运行时旋钮就只能跨页面加载比，而那条路有 0.3 % 噪声底
+   *   （同代码连采也差 2793 像素）⇒ 恒等根本测不成。有了它就同会话换臂，和 outlineScale 同构。
+   * ⚠️ 命名：这一格叫 `shadowGrade`，传给 FinalPass 的参数叫 `shadowAmount`（对齐已有的
+   *   `uShadowAmount` uniform）。两个名字指同一个数，别再加第三个。
+   */
+  shadowGrade: number;
   /** 内部分辨率的目标高度上限（见 `render/PixelScale.ts`）。调低 = 倍率更大 = 更省。 */
   pixelTargetHeight: number;
   /** 放大方式：true = 最近邻（块状像素），false = 平滑。**不影响内部分辨率**。 */
@@ -108,6 +119,9 @@ export function createDefaultTuning(): GameTuning {
     // ⚠️ 出厂值非 0 ⇒ `visual.spec` 那条恒等判据**显式**把 outlineScale 设成 0 再取基线，
     //   不能依赖这个默认值。
     outlineScale: 0.35,
+    // 默认值从 FinalPass 的导出常量派生：这里再写一个 0.12 就是第二份真源，
+    // 改 FinalPass 的人不会记得回改这里（与 #67 那条「两处写同一个数」同罪）。
+    shadowGrade: FINAL_PASS_SHADOW_AMOUNT,
     pixelTargetHeight: PIXEL_SCALE_DEFAULTS.targetHeight,
     pixelated: PIXEL_SCALE_DEFAULTS.pixelated,
     coinTexelScale: 2,
@@ -136,6 +150,14 @@ export type DebugActions = {
   onRefillWallet?: () => void;
   onClearSave?: () => void;
   onCoinTexelChange?: () => void;
+  /**
+   * 玩家/调试者**手动**改了像素目标高度时调一次（10-01 画质锁）。
+   *
+   * 理由：`applyQuality()` 写的就是 `tuning.pixelTargetHeight` 这同一个字段，
+   * 于是旧行为是「手动拖回 720 ⇒ 下一次自动降档又覆盖掉，且没有任何地方说明为什么」。
+   * 手动改 = 明确的人工意图 ⇒ 顺手把自动换档锁上，让那个值真的留得住。
+   */
+  onQualityManualChange?: () => void;
   /**
    * 摄影机机位被手动改过之后调一次。
    *
@@ -282,7 +304,11 @@ export class DebugTools {
     folder.add(this.tuning, 'cameraFov', 24, 70, 1).name('镜头 FOV');
     folder.add(this.tuning, 'exposure', 0.6, 1.8, 0.01).name('曝光');
     folder.add(this.tuning, 'outlineScale', 0, 1, 0.05).name('描边强度（G2）');
-    folder.add(this.tuning, 'pixelTargetHeight', 120, 720, 20).name('像素目标高度');
+    folder.add(this.tuning, 'shadowGrade', 0, 0.4, 0.01).name('暗部分级强度（V9）');
+    folder
+      .add(this.tuning, 'pixelTargetHeight', 120, 720, 20)
+      .name('像素目标高度')
+      .onFinishChange(() => this.actions.onQualityManualChange?.());
     folder.add(this.tuning, 'pixelated').name('像素化');
     folder
       .add(this.tuning, 'coinTexelScale', [1, 2, 4])

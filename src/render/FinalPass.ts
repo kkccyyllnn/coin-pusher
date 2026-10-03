@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { BLEND_GLSL, BLEND_SCREEN } from './glsl/blend.glsl';
 import { OUTLINE_APPLY, OUTLINE_GLSL } from './glsl/outline.glsl';
 
 /**
@@ -53,6 +54,42 @@ export const FINAL_PASS_DEPTH_THRESHOLD = 0.005;
 export const FINAL_PASS_DEPTH_GRAZING = 0.02;
 
 /**
+ * V9 · 冷阴影分级的三个量（10-01，**由实测决定，不是看图调的**）。
+ *
+ * 现读依据（`/tmp/grade-read.mjs` + `/tmp/grade-delta.mjs` 打在冻结默认机位上）：
+ * 出厂画面上**暗部是偏暖的** —— 阴影带（sRGB 相对亮度 < 0.18 的绘制像素，占 39 %）
+ * 的 `R − B = +6.2`。而「色温偏暖」这句抱怨要动的就是它。
+ *
+ * ★ 算子选 **滤色（screen）**，正片叠底是被实测否掉的：
+ *   同一个权重下 multiply 把被作用像素的 `R−B` 推动 7.6（方向对），
+ *   但那些像素的亮度掉了 **35 %**（0.102 → 0.066）—— 这与 V9 的另一半「亮币床」正面对撞。
+ *   screen 是加性的：同一批像素 `R−B` 从 +1.8 推到 −20.3，亮度反而抬起来。
+ *   0.12 档的全画面读数：阴影带 `R−B` **+6.2 → −7.6**、币床区亮度 **0.3278 → 0.3451（+5.3 %）**、
+ *   中间带 `R−B` 54.9 → 47.5（被抬起来的暗像素并入中间带所致，不是把铜币调冷），
+ *   被改变的像素占全画面 11.2 %。
+ * ★ 为什么在最后一遍做，而不是改 `artDirection` 的色带：两条都试过，都不对症 ——
+ *   抬 `coin` 中段 → 币床区亮度只涨 **0.5 %**（币面大多落在第 3 段与第 0 段），
+ *   抬 `cabinet` 中段 → 阴影带反而**更暖**（+6.2 → +7.1）。
+ * ★ 为什么**不去动中间带**：中间带 `R − B = +54.9` 的暖是铜币自己的暖，
+ *   `artDirection` 里写着实测教训「色带明显偏冷会把暖 albedo 的铜币去饱和成暗红」。
+ *   所以这个分级的权重函数必须在中间调归零，而不是做成全局色温。
+ *
+ * **口径**：作用点是**色调映射之后、色彩空间编码之前**的线性值，
+ * 所以 `range` 是线性亮度（sRGB 0.18 ≈ 线性 0.027，取 0.06 让过渡柔和一点）。
+ * `blend.glsl.ts` 顶部那条「算子作用在线性域、比 Photoshop 狠」的口径差在这里成立。
+ */
+export const FINAL_PASS_SHADOW_TINT = '#4f6ea8';
+/** 线性亮度到 `range` 时权重衰减到 0（`smoothstep` 的上端）。 */
+export const FINAL_PASS_SHADOW_RANGE = 0.06;
+/**
+ * 分级强度。`0` 在**数学上**是恒等（screen 加 0 加不了任何东西），
+ * ⚠️ 但「关掉逐字节等于出厂」这一条**没有验成**：同一份代码、同机位、同冻结状态
+ * 连采两次本身就差 2793 个像素（0.3 %）⇒ 跨页面加载不可比（本项目老规矩），
+ * 要证它得给这条分级加**运行时旋钮**做同会话换臂。⇒ 记为接手项，不要引用成已验。
+ */
+export const FINAL_PASS_SHADOW_AMOUNT = 0.12;
+
+/**
  * 解析 `?view=` 的通道视图（形状照 `PixelScale.readPixelOverride`：
  * 显式、可逆、写出来就一眼看得懂在比什么）。
  *
@@ -100,6 +137,10 @@ export class FinalPass {
         uIdThreshold: { value: FINAL_PASS_ID_THRESHOLD },
         uDepthThreshold: { value: FINAL_PASS_DEPTH_THRESHOLD },
         uDepthGrazing: { value: FINAL_PASS_DEPTH_GRAZING },
+        // V9 冷阴影。`THREE.Color` 在构造时就把 sRGB 十六进制转成工作色域（线性），
+        // 与上面那段口径一致；强度单独成 uniform，是为了让「关掉 = 逐字恒等」可判。
+        uShadowTint: { value: new THREE.Color(FINAL_PASS_SHADOW_TINT) },
+        uShadowAmount: { value: FINAL_PASS_SHADOW_AMOUNT },
       },
       vertexShader: /* glsl */ `
 varying vec2 vUv;
@@ -116,6 +157,9 @@ uniform sampler2D tInfo;
 uniform float uView;
 varying vec2 vUv;
 ${OUTLINE_GLSL}
+${BLEND_GLSL}
+uniform vec3 uShadowTint;
+uniform float uShadowAmount;
 void main() {
 	vec4 scene = texture2D( tScene, vUv );
 	vec4 info = texture2D( tInfo, vUv );
@@ -159,6 +203,14 @@ void main() {
 	#if defined( TONE_MAPPING )
 		mapped = mix( scene.rgb, toneMapping( scene.rgb ), drawn );
 	#endif
+	// V9 冷阴影：**只碰暗部**的分级，走 blend.glsl.ts 的滤色算子（这是它的第一个消费者）。
+	// 为什么不是正片叠底：multiply 实测把被作用像素压暗 35 %，与「亮币床」那半句对撞。
+	// 权重用线性亮度的 smoothstep，到 range 之上恒为 0 ⇒ 铜币自己的暖（中间带）不直接被动。
+	// 与背景的关系：整条分级乘在 drawn 上，所以机台外那片**不被色调映射**的底也不会被它染。
+	float shadowWeight = 1.0 - smoothstep( 0.0, ${FINAL_PASS_SHADOW_RANGE}, dot( mapped, vec3( 0.2126, 0.7152, 0.0722 ) ) );
+	vec3 shadowBlend = mix( vec3( 0.0 ), uShadowTint, shadowWeight * uShadowAmount );
+	vec3 shaded = sdBlend( ${BLEND_SCREEN}, mapped, shadowBlend );
+	mapped = mix( mapped, shaded, drawn );
 	gl_FragColor = vec4( mapped, 1.0 );
 	#include <colorspace_fragment>
 ${OUTLINE_APPLY}
@@ -202,6 +254,7 @@ ${OUTLINE_APPLY}
       exposure: number;
       view: number;
       outlineScale: number;
+      shadowAmount: number;
       cssWidth: number;
       cssHeight: number;
     },
@@ -212,6 +265,8 @@ ${OUTLINE_APPLY}
     this.material.uniforms.uView.value = params.view;
     this.material.uniforms.toneMappingExposure.value = params.exposure;
     this.material.uniforms.uOutlineScale.value = params.outlineScale;
+    // 真值每帧从 tuning 走，与 uOutlineScale 完全同构；构造里那个 value 只剩初值。
+    this.material.uniforms.uShadowAmount.value = params.shadowAmount;
     const step = this.material.uniforms.uOutlineStep.value as THREE.Vector2;
     // CSS 尺寸取整到至少 1 像素：0 会把这个向量变成 Infinity，表现是整屏被描黑。
     step.set(1 / Math.max(1, params.cssWidth), 1 / Math.max(1, params.cssHeight));

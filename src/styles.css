@@ -4,6 +4,17 @@
   --ink-faint: rgba(242, 232, 210, 0.34);
   --panel: rgba(12, 20, 16, 0.78);
   --panel-solid: #101a15;
+  /* V8 · HUD 的 CRT 扫描线（10-01）。
+     周期 4 px、暗带 35 % —— 与招牌屏那份「每隔一行压暗一道横纹」同参数
+     （那边是 4 个**纹素**一个周期，这边是 4 个 **CSS 像素**，不同空间但同一种读感）。
+     刻意做成**面板底纹**而不是全屏覆盖层：`marqueeScreen.ts` 的 C 项已经定过一次口径 ——
+     扫描线是「发光面板」的横纹，**不该横切笔画**（用户当时的原话是「扫描线我也觉得很模糊」）。
+     盖在文字上面就会重犯那个错。 */
+  --crt-scanlines: repeating-linear-gradient(
+    to bottom,
+    rgb(0 0 0 / 0) 0 2px,
+    rgb(0 0 0 / 0.35) 2px 4px
+  );
   --line: rgba(242, 232, 210, 0.22);
   /* R3-U1：黄铜只允许这一支；绿 / 蓝 / 红留给语义（返币 / 钻石 / 危险），
      不得拿 accent 当装饰色。这些字面值原先散在按钮、数字、描边里 ——
@@ -228,11 +239,11 @@ body {
   white-space: nowrap;
 }
 
-#best-value,
-#wallet-value {
+#best-value {
   color: var(--ink-dim);
   font-variant-numeric: tabular-nums;
 }
+
 
 #earned-value {
   display: inline-block;
@@ -778,6 +789,22 @@ body {
   line-height: 1.6;
 }
 
+/* 画质锁按钮：跟在「继续」下面，靠 margin 分开，不抢主操作的视觉重量。 */
+#quality-lock-button {
+  margin-top: 10px;
+}
+
+/* 锁上之后要**看得出来是锁上的**：旧版只有一个状态文字，玩家按完不确定生效没有。 */
+#quality-lock-button[aria-pressed='true'] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+#pause-panel .pause-note {
+  margin: 12px 0 0;
+  font-size: 0.72rem;
+}
+
 /* 面板从底部滑入，不是瞬间弹出（破产弹窗与暂停面板共用）。 */
 @keyframes result-slide-in {
   from {
@@ -986,4 +1013,44 @@ body {
 .cp-audio-status[data-tone='error'] {
   background: rgba(208, 103, 74, 0.14);
   color: var(--danger);
+}
+
+/* V8 的两条规则放在**文件末尾**是必需的，不是排版偏好：
+   `#drain-prompt` 与 `#resource-readout` 的 `background: var(--panel)` 简写在下面几百行处，
+   简写会把 `background-image` 重置成 none ⇒ 规则写在它们前面就等于没写。
+   （实测：写在第 258 行时只有 `#earned-block` 与 `.hud-chip` 挂上条纹，
+   `#resource-readout` 读到的 computed background-image 是 none。） */
+/*
+ * V8 之二：HUD 的四个读数面板挂上扫描线底纹。
+ *
+ * 选择器列成一张表（而不是给 `background: var(--panel)` 那几处各加一行）的理由：
+ * 那五处里有一处是调试面板的文件按钮（`.cp-audio-file::file-selector-button`），
+ * 它不是机台 UI，跟着发光会很怪 —— 逐处加就会把它一起加进去。
+ * 另外 `background` 是简写、会把 `background-image` 重置成 none，
+ * 所以这里用**后写的长写**覆盖，而不是去改那几条简写。
+ */
+#earned-block,
+.hud-chip,
+#resource-readout,
+#drain-prompt {
+  background-image: var(--crt-scanlines);
+}
+
+/*
+ * V8 之三：数字读数改等宽 + 关掉抗锯齿（"像素字"里**能用系统字体做到**的那部分）。
+ *
+ * ⚠️ 真正的像素字体要带一份字体资产（本项目不联网、也没有位图字体文件），
+ * 所以这条只做两件确定有效的事：
+ *   ① 等宽数字 ⇒ 数值跳动时字宽不抖（`tabular-nums` 已经在 `#best-value` 上用了，
+ *      但对没有该特性的系统字体不保险，等宽栈是硬保证）；
+ *   ② `-webkit-font-smoothing: none` ⇒ 笔画边缘不再被灰阶抗锯齿糊掉，
+ *      这正是用户那句「模糊」的反面。作用域**只有数字**，正文与按钮文案不动 ——
+ *      小字号关抗锯齿在长文上会读成锯齿，那是另一种脏。
+ */
+#earned-value,
+#credits-value,
+#best-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: none;
 }

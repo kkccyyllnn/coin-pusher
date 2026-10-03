@@ -16,12 +16,18 @@ export type MechanismSnapshot = {
 export type RuinPayload = {
   /** 本局越线赚进的筹码（不含跪求赏赐）。 */
   earned: number;
-  /** 结算瞬间的局内筹码余额。 */
+  /**
+   * 结算瞬间的余额。★ S4：它与 `balance` 是**同一个数**（合并账户之后没有「桌上的」与
+   * 「钱包里的」之分了），保留两个字段只因为卡片要分别印「本局赚进/当前余额」与「峰值」，
+   * 而 `chipsPeak` 是历史峰值、与余额不同源。
+   */
   chips: number;
-  /** 收工能回存钱包的筹码。破产弹窗（本局未结束）时为 undefined。 */
-  cashOut?: number;
-  /** 当前钱包余额；总结卡片上传的是**回存之后**的值。 */
-  wallet: number;
+  /**
+   * 当前余额。
+   * ★ S4：`cashOut`（可回存额）这个字段**随「回存」这个动作一起删除** ——
+   *   钱从头到尾都在同一个账户里，没有"能带走多少"这回事了。
+   */
+  balance: number;
   drops: number;
   chipsPeak: number;
   begs: number;
@@ -31,6 +37,12 @@ export type RuinPayload = {
   grant: number;
   /** true 表示这是「保留尊严，收工」后的总结，不再显示跪求按钮。 */
   summary?: boolean;
+  /**
+   * 贷款续玩的一笔报价（S3）。**缺省 = 不给贷款**（结算卡片就走这条：本局已经结束，
+   * 借钱没有对象）。刻意传数据而不是加一个 `payload.mode` ——
+   * 行级 gating 沿用上面 `summary` 的既有形状，不发明第二套分支轴。
+   */
+  loan?: { amount: number; available: boolean; debt: number; ceiling: number };
 };
 
 /** XIXI 四槽的字形（点亮面板与无障碍标签共用）。 */
@@ -46,11 +58,12 @@ export class Hud {
   private readonly levelLabel = this.el('#level-label');
   private readonly earnedValue = this.el('#earned-value');
   private readonly bestValue = this.el('#best-value');
-  private readonly walletValue = this.el('#wallet-value');
   private readonly creditsValue = this.el('#credits-value');
   private readonly statusLine = this.el('#status-line');
   private readonly comboToast = this.el('#combo-toast');
   private readonly markNote = this.el('#mark-note');
+  private readonly debtLine = this.el('#debt-line');
+  private readonly debtNote = this.el('#debt-note');
   /**
    * XIXI 集章的容器。
    *
@@ -82,6 +95,7 @@ export class Hud {
   private readonly ruinStats = this.el('#ruin-stats');
   private readonly ruinBoard = this.el('#ruin-board');
   private readonly begButton = this.el<HTMLButtonElement>('#beg-button');
+  private readonly loanButton = this.el<HTMLButtonElement>('#loan-button');
 
   private lastComboShown = 0;
   private lastBoostCharges = 0;
@@ -95,15 +109,40 @@ export class Hud {
     this.el('#resume-button').addEventListener('click', toggle);
   }
 
+  /**
+   * 画质锁按钮（暂停面板里）。放在暂停面板而不是常驻 HUD：
+   * 它是一次性决定，不是要占住游玩时的视线；而且用户发现画面变了的时候，
+   * 手边正好就是那个面板。
+   */
+  bindQualityToggle(handler: () => void): void {
+    this.el('#quality-lock-button').addEventListener('click', (event) => {
+      event.preventDefault();
+      handler();
+    });
+  }
+
+  /** 按钮文案 = 玩家唯一能读到的状态，所以 `aria-pressed` 要一起写（读屏与判据都读它）。 */
+  setQualityLock(locked: boolean, tier: string): void {
+    const button = this.el<HTMLElement>('#quality-lock-button');
+    button.textContent = locked
+      ? `画质：已锁定（${tier}）`
+      : `画质：自动（当前 ${tier}）`;
+    button.setAttribute('aria-pressed', String(locked));
+  }
+
   /** 动效降级开关：读的是 <html data-motion>，与 CSS 同源。 */
   private get reducedMotion(): boolean {
     return document.documentElement.dataset.motion === 'reduced';
   }
 
-  bindRuinActions(onBeg: () => void, onQuit: () => void): void {
+  bindRuinActions(onBeg: () => void, onQuit: () => void, onLoan: () => void): void {
     this.begButton.addEventListener('click', (event) => {
       event.preventDefault();
       onBeg();
+    });
+    this.el<HTMLButtonElement>('#loan-button').addEventListener('click', (event) => {
+      event.preventDefault();
+      onLoan();
     });
     this.el('#quit-button').addEventListener('click', (event) => {
       event.preventDefault();
@@ -112,14 +151,24 @@ export class Hud {
   }
 
   /**
-   * 破产弹窗 / 本局结算卡片。
+   * 触底报价面板 / 本局结算卡片。
    *
-   * 破产不是失败状态，是这个模式的核心产出：所以标题、嘲讽、赏赐都在这里，
-   * 两个按钮是**真实选择**——跪求保留盘面（沉没价值是拉力来源），收工清空盘面。
+   * ★ S3 去局感：非总结态的标题从「破产」改成**「续玩报价」**——
+   * 触底不再是终点，而是「用哪种方式继续」的岔口。面板里现在有三个真选择，
+   * 按代价从轻到重排（DOM 顺序就是玩家看到的按钮顺序）：
+   *   贷款（`#loan-button`：借钱进余额接着打，**盘面一动不动**）、
+   *   跪求（`#beg-button`：脏钱——能继续玩但不能换永久进度，也保留盘面）、
+   *   收工（`#quit-button`：清空盘面；★ S4 之后**不动余额**，钱本来就在同一个账户里）。
+   *
+   * ⚠️ 标题是**文案**，而本项目的纪律是「按文案断言 ⇒ 改一次措辞判据就假红」
+   * （见 `setStatus` 上那段 `data-kind` 的说明）。所以本次**同步改了**
+   * `visual.spec` 里那条按文案断言的闭环用例，而不是留着它红。
+   * 反过来，DOM id（`#ruin-panel` / `#ruin-title` / `#ruin-taunt`）**刻意不改名**：
+   * `endless.ruinVisible` 与一大片判据都挂在这些名字上，改一次名等于第二次爆炸。
    */
   showRuin(payload: RuinPayload): void {
     const summary = payload.summary === true;
-    this.ruinTitle.textContent = summary ? '本局结束' : '破产';
+    this.ruinTitle.textContent = summary ? '本局结束' : '续玩报价';
     // 破产嘲讽的是手气与决策；收工是玩家主动离场，只做收束，不该被嘲。
     this.ruinTaunt.textContent = summary ? closingLine() : tauntFor(payload.totalBegs, payload.drops);
 
@@ -132,11 +181,9 @@ export class Hud {
       ['历史最高赚进', `${Math.max(payload.best, payload.earned)} 筹码`],
       ['累计跪求', `${payload.totalBegs} 次`],
     ];
-    // 「回存」只在收工时出现：破产弹窗里本局还没结束，能带走多少是未知的。
-    if (summary && payload.cashOut !== undefined) {
-      rows.push(['回存钱包', `+${payload.cashOut} 筹码`]);
-    }
-    rows.push(['钱包', `${payload.wallet} 筹码`]);
+    // ★ S4：原来这里有一行「回存钱包 +N」（且只在总结态出现）。
+    //   「回存」这个动作已随合并账户消失 ⇒ 整行删掉，不是改成显示 0。
+    rows.push(['余额', `${payload.balance} 筹码`]);
     for (const [label, value] of rows) {
       const dt = document.createElement('dt');
       dt.textContent = label;
@@ -158,6 +205,20 @@ export class Hud {
     this.begButton.textContent = summary
       ? ''
       : `跪求 xixi 大王大赏（+${payload.grant} 筹码）`;
+    // 贷款按钮的显隐走**行级 gating**（与 `summary`、`回存钱包` 那几行同一形状）：
+    // 到欠款上限时 `available=false` ⇒ **藏掉而不是留着可点**，
+    // 留着会让人点了什么都没发生，那正是本项目最讨厌的静默失败。
+    this.loanButton.hidden = summary || payload.loan?.available !== true;
+    // ★ 只在**真的能贷**的时候写文案：到上限时 `amount` 是 0，
+    // 于是隐藏状态下会留着一句「贷款续玩 +0 筹码」——按钮虽然看不见，
+    // 但无障碍树与任何读 textContent 的判据都会读到这句假话。
+    if (payload.loan?.available && !summary) {
+      this.loanButton.textContent =
+        `贷款续玩 +${payload.loan.amount} 筹码（欠款 ${payload.loan.debt} → ` +
+        `${payload.loan.debt + payload.loan.amount}/${payload.loan.ceiling}）`;
+    } else {
+      this.loanButton.textContent = '';
+    }
     this.el<HTMLButtonElement>('#quit-button').textContent = summary ? '再来一局' : '保留尊严，收工';
     this.ruinPanel.hidden = false;
   }
@@ -266,15 +327,17 @@ export class Hud {
     best: number,
     mechanisms: MechanismSnapshot = { sweeper: 0, grapple: 0, reload: 0 },
     bet: BetTier = { chips: 1, mul: 1, label: '1 投 · ×1' },
-    wallet = 0,
     /** XIXI 四槽亮灭（Game 持有，跨局持续；P5 起不再挂在 RunState 快照上）。 */
     xixi: boolean[] = [false, false, false, false],
   ): void {
     this.levelLabel.textContent = config.name;
-    // 三个数字分工明确，不能混：赚进 = 本局成绩，最高 = 历史成绩，筹码 = 现在能花多少。
+    // ★ S4 合并账户：这里原来有两个数 —— `walletValue`（钱包）与 `creditsValue`（局内筹码），
+    //   分别读 `save.wallet` 与 `snapshot.chips`，中间靠「买入/回存」两笔转账来回搬。
+    //   合并之后两者是同一个数 ⇒ **只剩一个读数**（参数 `wallet` 也一并删掉：
+    //   留着一个永远等于另一个的入参，就是留给下一个人的歧义源）。
+    //   现在显示的三个数分工仍然互不重叠：赚进 = 本段成绩，最高 = 历史成绩，余额 = 现在有多少钱。
     this.earnedValue.textContent = String(snapshot.earned);
     this.bestValue.textContent = String(Math.max(best, snapshot.earned));
-    this.walletValue.textContent = String(wallet);
     this.creditsValue.textContent = String(snapshot.chips);
 
     // XIXI 进度只出一行文字：四槽的亮灭**画在 3D 模型里**（推板前缘的四段标牌），
@@ -359,6 +422,24 @@ export class Hud {
   setStatus(text: string, kind = 'info'): void {
     this.statusLine.textContent = text;
     this.statusLine.dataset.kind = kind;
+  }
+
+  /**
+   * 欠款一行小字（S2）。无债就整条隐藏 —— 「零」也要占一行会把玩家的注意力
+   * 花在一条没有信息的话上。
+   *
+   * ★ 这里只**显示**，不持有数值：`debt` 的真源是 `SaveStore`，
+   * 在 HUD 里存一份就是本项目反复清的那种第二份真源。
+   */
+  setDebt(debt: number, ceiling: number): void {
+    if (!this.debtLine || !this.debtNote) return;
+    if (debt <= 0) {
+      this.debtLine.hidden = true;
+      this.debtNote.textContent = '';
+      return;
+    }
+    this.debtLine.hidden = false;
+    this.debtNote.textContent = `欠款 ${debt} / ${ceiling} 筹码 · 产出会按比例自动抵债`;
   }
 
   /**

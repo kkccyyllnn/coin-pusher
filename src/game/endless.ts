@@ -1,4 +1,4 @@
-import { COIN, ENDLESS, TABLE } from './constants';
+import { COIN, TABLE } from './constants';
 import { COIN_SCALE } from './coinScale';
 import { buildLayout, assertLayoutValid, layoutSummary, layoutCapacity, fitCells, MAX_JITTER, DRAIN_CLEARANCES, type CoinPlacement, type LayoutSpec } from './layout';
 
@@ -12,13 +12,6 @@ export type { CoinPlacement };
  */
 export type EndlessConfig = {
   name: string;
-  /**
-   * 本局买入筹码的**兜底值**。
-   *
-   * 实际入场额由 `SaveStore.buyIn()` 决定（受钱包余额限制，余额不足时按余额全押），
-   * 这个字段只在没有存档上下文时（例如纯布局测试）被用到。
-   */
-  credits: number;
   /** 本局预置盘面。 */
   layout: CoinPlacement[];
   /** 开场提示语。 */
@@ -343,7 +336,6 @@ export function endlessLevel(): EndlessConfig {
   assertLayoutValid(layout);
   cached = {
     name: '无尽 · xixi 大王大赏',
-    credits: ENDLESS.buyIn,
     layout,
     focus: 'xixi 大王大赏：撑多久算多久，破产了可以跪',
     seed: ENDLESS_SPEC.seed,

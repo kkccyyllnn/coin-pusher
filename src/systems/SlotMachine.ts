@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { TABLE } from '../game/constants';
+import { RULES, TABLE } from '../game/constants';
+import type { ClimaxTone } from '../game/kinds';
 import type { IconId } from '../game/icons';
 import {
   REEL_STRIP,
@@ -15,6 +16,7 @@ import {
   rollSlotOutcome,
   type SlotOutcome,
   type SlotSymbol,
+  type SlotTier,
 } from '../game/xixi';
 import { createReelStripTexture, ICON_TEXELS, reelOffsetFor } from '../render/iconTexture';
 import { makeToonMaterial, type LitMaterial } from '../render/ToonMaterial';
@@ -50,7 +52,8 @@ import type { Telemetry } from './Telemetry';
  * 奖励表（硬约束：**不走 `gainChips`**，越线返值仍是唯一筹码来源）：
  *   力 → `grantBoost()`（存满 → 改派 `BOOST_OVERFLOW_FALLBACK` 小型补货，**不空响**）
  *   塔 / 泉 / 钻 / 箱 → `ShowDirector.request(...)`（真币演出）
- *   胡萝卜四连 → 扣本局筹码（走 `RunState.fineChips`，账本恒等式一字不改）
+ *   胡萝卜四连 → 扣到 0 为止，扣不掉的转成欠款（`RunState.fineChips` + `SaveStore.chargeFine`，
+ *              两笔都不动恒等式的形状：实扣进 `spent`，转出的进 `debt`）
  */
 
 type SlotDeps = {
@@ -65,8 +68,27 @@ type SlotDeps = {
   grantBoost: () => boolean;
   /** 加力就绪音效。 */
   onBoostReady: () => void;
-  /** 胡萝卜四连的罚款：从本局筹码里扣到 0 为止，返回**实扣**数额。 */
-  fineChips: (amount: number) => number;
+  /**
+   * 胡萝卜四连的罚款：从余额里扣到 0 为止。
+   * 返回 `{applied, shortfall}` —— S5b 之后扣不掉的**不蒸发**，由 `chargeFine` 转成欠款。
+   */
+  fineChips: (amount: number) => { applied: number; shortfall: number };
+  /**
+   * 把罚不掉的那一截记进欠款（`SaveStore.chargeFine` 是 debt 的唯一写门之一）。
+   * 返回**实际入账额**（到上限时小于请求额，甚至为 0）——判据读的是这个数，
+   * 不是请求额：拿请求额断言就等于把 clamp 那一步藏起来不验。
+   */
+  chargeFine: (shortfall: number) => number;
+  /**
+   * 四同「力」：排 N 发**连续加长行程**（`Pusher.queueJackpotPush`）。
+   * 返回排完之后待用的总发数 —— 判据核的是这个数，理由同 `chargeFine`。
+   */
+  jackpotPush: (strokes: number) => number;
+  /**
+   * 全屏闪色（`Game.triggerClimax`）。四同各给一个自己的色调：
+   * 力白 / 塔金 / 钻蓝 / 箱金 —— 与 `kinds.ts` 的 `ClimaxTone` 同一套枚举，不新造色。
+   */
+  climax: (tone: ClimaxTone) => void;
   /** 中奖音效（灯条点亮那一刻）。 */
   onReveal?: (outcome: SlotOutcome) => void;
   /**
@@ -103,6 +125,20 @@ const DONE_AT = 3.4;
  * 玩家来不及意识到「中了」。多这 0.6 秒是给中奖的仪式感留的。
  */
 const WIN_HOLD = 0.6;
+/**
+ * ★ S5a：四同大奖再多停多久（在 `WIN_HOLD` 之上叠加）。
+ *
+ * 计划要求「WIN_HOLD 的 0.6 秒仪式感分成 3 同 / 4 同两档，否则『夸张』在时间轴上读不出来」。
+ * 1.8 秒的根据：一次四同的兑现动作本身要看得完 —— 塔的逐层是 0.4 秒一层，
+ * 加力要等第一发行程走出去。低于这个数就只有「闪了一下」，没有「发生了什么」。
+ */
+const JACKPOT_EXTRA_HOLD = 1.8;
+
+/** 某一结果该在时间轴上多停多久（判据与音效排程共读这一条，不写两处）。 */
+function holdOf(outcome: SlotOutcome | null): number {
+  if (outcome?.kind !== 'win') return 0;
+  return WIN_HOLD + (outcome.tier === 4 ? JACKPOT_EXTRA_HOLD : 0);
+}
 
 /** 贴图滚动速度（图标/秒）。**不能太快**：像素画高速滚动会产生车厢效应（轮子倒转）。 */
 const SCROLL_ICONS_PER_SEC = 7.5;
@@ -156,8 +192,10 @@ export class SlotMachine {
    *
    * `forced` 只给测试钩子用：奖励路径必须可指定结果逐一验证。
    * 接受 `SlotSymbol`（= 中奖）或 `'fine'` / `'miss'`。
+   * `forcedTier` 同样只给钩子用（S5a）：四同大奖必须能被**指名验证**，
+   * 而它在 2 000 次枚举里只占 1.5 %，靠随机路径等它出现不叫测试。
    */
-  spin(forced?: SlotSymbol | 'fine' | 'miss'): { outcome: SlotOutcome } | null {
+  spin(forced?: SlotSymbol | 'fine' | 'miss', forcedTier: SlotTier = 3): { outcome: SlotOutcome } | null {
     if (this.spinning) return null;
     // 固定消耗两次 rng：一次定分类，一次定分类内部的细节（中奖摇哪个符号 / 杂牌停哪四格）。
     // 两者互斥，所以两次够用。**即便强制指定结果也照抽**——消耗模式与随机路径一致，
@@ -170,7 +208,7 @@ export class SlotMachine {
         : forced === 'miss'
           ? { kind: 'miss' }
           : forced
-            ? { kind: 'win', symbol: forced }
+            ? { kind: 'win', symbol: forced, tier: forcedTier }
             : rollSlotOutcome(roll, detail);
 
     this.outcome = outcome;
@@ -189,8 +227,8 @@ export class SlotMachine {
       t: this.deps.now(),
     });
     this.deps.notify('老虎机转动……');
-    // 转动总时长随结果变化（中奖多停一拍，见 `WIN_HOLD`），音效据此排程重复播放。
-    this.deps.onSpinStart?.(DONE_AT + (outcome.kind === 'win' ? WIN_HOLD : 0));
+    // 转动总时长随结果变化（中奖多停一拍、四同再多停一拍，见 `holdOf`），音效据此排程重复播放。
+    this.deps.onSpinStart?.(DONE_AT + holdOf(outcome));
     return { outcome };
   }
 
@@ -226,7 +264,7 @@ export class SlotMachine {
       this.rewarded = true;
       this.applyReward(this.outcome);
     }
-    const done = DONE_AT + (this.outcome?.kind === 'win' ? WIN_HOLD : 0);
+    const done = DONE_AT + holdOf(this.outcome);
     if (this.spinT >= done) {
       this.spinning = false;
       this.outcome = null;
@@ -345,26 +383,82 @@ export class SlotMachine {
     }
 
     if (outcome.kind === 'fine') {
-      const fined = this.deps.fineChips(SLOT_PENALTY_CHIPS);
+      // ★ S5b：扣不掉的不再蒸发 ——  shortfall 转成欠款，「这一刻疼一下」变成「欠一笔要还」。
+      // 两笔分开记：`fined` 是**实扣的筹码**（进了 spent，账本看得见），
+      // `debtAdded` 是**转出去的那一截**（进 debt，未来的产出分流）。
+      // 遥测里两个都要有：只记一个就没法对账「罚 6 到底落在哪儿」，
+      // 而 `fined + debtAdded ≥ SLOT_PENALTY_CHIPS` 被上限 clamp 打破时也会露出来。
+      const { applied, shortfall } = this.deps.fineChips(SLOT_PENALTY_CHIPS);
+      const debtAdded = this.deps.chargeFine(shortfall);
       this.deps.telemetry.recordXixi({
         phase: 'reward',
         outcome: 'fine',
         faces: [...this.faces],
         granted: false,
         delivered: 0,
-        fined,
+        fined: applied,
+        debtAdded,
         t: this.deps.now(),
       });
       this.deps.notify(
-        fined > 0
-          ? `老虎机：胡萝卜×4，罚 ${fined} 筹码`
-          : '老虎机：胡萝卜×4，但你已经一分不剩了',
+        applied > 0 && debtAdded > 0
+          ? `老虎机：胡萝卜×4，罚 ${applied} 筹码，另 ${debtAdded} 记在账上`
+          : applied > 0
+            ? `老虎机：胡萝卜×4，罚 ${applied} 筹码`
+            : debtAdded > 0
+              ? `老虎机：胡萝卜×4，一分罚不出 —— 记 ${debtAdded} 欠款`
+              : '老虎机：胡萝卜×4，但你已经一分不剩、账也记满了',
       );
       return;
     }
 
     const { symbol } = outcome;
     const glyph = SLOT_SYMBOL_GLYPHS[symbol];
+    const tier = outcome.tier;
+
+    /*
+     * ── S5a 四同大奖 ──
+     *
+     * 四条分支各自「多演什么」见下表；共同点是**都不走 `gainChips`**：
+     * 老虎机的奖励一律是「看得见的东西」（行程 / 真币 / 视觉币 + 闪色），
+     * 筹码只从越线来 —— 那条硬约束从 P10 立起到现在没松过，`xixi` 的
+     * 「奖励不走 gainChips」判据就在守它。
+     *
+     * | 符号 | 四同做什么 | 进哪本账 |
+     * |---|---|---|
+     * | 力 | 连续 N 发加长行程（`jackpotPush`）+ 白闪 | **筹码账**：推下去的币靠越线结算，不往盘面加质量 |
+     * | 塔 | 同一座塔放大到 40 枚（`SHOW_SPECS.tower.jackpot`）+ 金闪 | **水量账**：四同里**加得最多**的一档（16→40 枚）；
+     *   ⚠️ 别读成"唯一加质量的"——钻 1 枚、箱 1 枚（外加一圈不进账的视觉币）、泉 10 枚都是真币，都进这本账 |
+     * | 钻 | 仍然**只给一枚**，换蓝闪与更长的停格时间轴 | **进水量账**（1 枚真币，固定 25 筹码面值，须推过得分线才兑现）；
+     *   它的"稀有感"（`kinds.ts:192`）说的是**不放大规模**，不是"不往盘面加质量"——两件事以前被并成一句 |
+     * | 箱 | 一枚宝箱 + 一圈视觉币（`TowerShow` 的 jackpot 分支）+ 金闪 | 不加质量（视觉币不进池、不进账） |
+     *
+     * ⚠️ **刻意不做**：镜头推近。计划里写了这一项，但 S16 用户原话是
+     * 「中币整个画面就会震荡，不要这个震动的动画」，之后相机已经一动不动。
+     * 再引入任何相机位移要用户点头，所以这里用**闪色 + 时间轴 + 行程**表达强度。
+     */
+    if (tier === 4) {
+      if (symbol === 'boost') {
+        const strokes = this.deps.jackpotPush(RULES.jackpotBoostStrokes);
+        this.deps.climax('white');
+        this.deps.telemetry.recordXixi({
+          phase: 'reward',
+          outcome: 'win',
+          symbol,
+          tier: 4,
+          faces: [...this.faces],
+          granted: strokes > 0,
+          // `delivered` 这一档装的是**排到的发数**（不是币数）：判据要能核
+          // 「四同力到底排了几发」，而行程没有枚数这个量。
+          delivered: strokes,
+          t: this.deps.now(),
+        });
+        this.deps.notify(`老虎机：${glyph}${glyph}${glyph}${glyph}！！连续 ${strokes} 发加长行程`);
+        return;
+      }
+      if (symbol === 'diamond') this.deps.climax('blue');
+      else this.deps.climax('gold');
+    }
 
     if (symbol === 'boost') {
       const granted = this.deps.grantBoost();
@@ -373,6 +467,7 @@ export class SlotMachine {
           phase: 'reward',
           outcome: 'win',
           symbol,
+          tier,
           faces: [...this.faces],
           granted,
           t: this.deps.now(),
@@ -393,6 +488,7 @@ export class SlotMachine {
         phase: 'reward',
         outcome: 'win',
         symbol,
+        tier,
         faces: [...this.faces],
         granted: false,
         // 兜底实发的枚数照记进 `delivered`：`granted === false && delivered > 0`
@@ -410,11 +506,17 @@ export class SlotMachine {
 
     // 除加力外，每个符号都直接是 ShowDirector 的 ShowId：奖励一律是「一场真币演出」。
     // 钻 / 箱要指定币种，否则演出会默认注入铜币——那就成了「钻石奖励给一枚铜币」。
-    const result = this.deps.shows.request(symbol, { kind: SLOT_SYMBOL_KIND[symbol] });
+    // ★ S5a：`jackpot` 只抬高**上限**（塔 16 → 40）并让演出自己加戏（宝箱喷视觉币），
+    //   预算不足时照常降级 —— 承诺与实发仍然两个数分开对账。
+    const result = this.deps.shows.request(symbol, {
+      kind: SLOT_SYMBOL_KIND[symbol],
+      jackpot: tier === 4,
+    });
     this.deps.telemetry.recordXixi({
       phase: 'reward',
       outcome: 'win',
       symbol,
+      tier,
       faces: [...this.faces],
       granted: result.ok,
       delivered: result.promised,

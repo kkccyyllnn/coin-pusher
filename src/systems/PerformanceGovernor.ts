@@ -62,6 +62,18 @@ export class PerformanceGovernor {
   /** 测试与截图时冻结「自动换档」，帧率采样继续跑。 */
   freeze(frozen: boolean): void {
     this.frozen = frozen;
+    // 锁档时把两个滞回计数清掉：**否则"解锁"会带着攒了一半的窗口立刻换档**。
+    // 例：玩家在低帧里锁上、过了一会儿帧率恢复了再解锁，那期间攒的 `highWindows`
+    // 会在解锁后的第一个窗口就把画面从低档弹回高档 —— 玩家完全不知道发生了什么。
+    if (frozen) {
+      this.lowWindows = 0;
+      this.highWindows = 0;
+    }
+  }
+
+  /** 是否处于「不自动换档」状态（截图/测试与玩家的画质锁共用这一个读数）。 */
+  get isFrozen(): boolean {
+    return this.frozen;
   }
 
   /** 每帧调用。返回 true 表示画质档位发生了变化。 */

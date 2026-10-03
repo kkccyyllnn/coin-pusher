@@ -13,7 +13,12 @@ import {
 } from '../render/PixelScale';
 import { iconReport } from '../render/iconTexture';
 import { GBuffer } from '../render/GBuffer';
-import { FinalPass, readFinalView } from '../render/FinalPass';
+import {
+  FINAL_PASS_SHADOW_RANGE,
+  FINAL_PASS_SHADOW_TINT,
+  FinalPass,
+  readFinalView,
+} from '../render/FinalPass';
 import { attachGInfoFallback } from '../render/glsl/gbuffer.glsl';
 import {
   applyCameraRig,
@@ -99,7 +104,7 @@ import {
 } from './cabinetShape';
 import { COIN_SCALE } from './coinScale';
 import { coinPhysics } from './coinPhysics';
-import { BET_TIERS, betTier, crossingReturn } from './economy';
+import { BET_TIERS, betTier, crossingReturn, ledgerBalances } from './economy';
 import { endlessCapacity, endlessLevel, type EndlessConfig } from './endless';
 import { crossingFeedback, FEEDBACK, flyTier, type FeedbackCounts } from './feedback';
 import {
@@ -114,11 +119,18 @@ import {
   layoutValue,
 } from './layout';
 import {
+  SLOT_OUTCOME_KEYS,
+  SLOT_OUTCOME_WEIGHTS,
+  SLOT_SYMBOL_WEIGHTS,
+  SLOT_TIER4_SYMBOLS,
+  outcomeTotalWeight,
+  outcomeWeightKey,
   reelFacesFor,
   rollSlotOutcome,
   xixiSlot,
   type SlotOutcome,
   type SlotSymbol,
+  type SlotTier,
 } from './xixi';
 
 /** 高于此高度视为「在途」，收尾时先等它们落到台面。 */
@@ -465,9 +477,22 @@ export class Game {
       reducedMotion: () => this.motion.reduced,
       grantBoost: () => this.run.grantBoost(),
       onBoostReady: () => this.audio.boostReady(),
-      // 胡萝卜四连的罚款：走 `RunState.fineChips`（内部仍走唯一的扣减入口
-      // `spendChips`，另记 `fines` 供对账）。**不新增账本项**——恒等式一字不改。
+      // 胡萝卜四连的罚款（S5b 两步）：实扣那一截走 `RunState.fineChips` → `spendChips`
+      // （唯一扣减入口，另记 `fines` 供对账）；扣不掉的 shortfall 交给
+      // `SaveStore.chargeFine` 转成欠款。**两笔都不新增恒等式项**：
+      // `spent` 吸收实扣，`debt` 是未来产出的分流承诺、不是余额的进出。
       fineChips: (amount) => this.run.fineChips(amount),
+      chargeFine: (shortfall) => {
+        const applied = this.save.chargeFine(shortfall);
+        // 欠款行要当场改文案：惩罚发生在滚筒停格那一刻，等下一帧 publishHud 也来得及，
+        // 但 HUD 的 debt 行只在显式调用时才重算 —— 不推就是「罚了款而债没动」的假象。
+        this.publishHud();
+        return applied;
+      },
+      /** S5a 四同「力」：排 N 发连续加长行程（与玩家按钮的「去重一发」是两个动作）。 */
+      jackpotPush: (strokes) => this.pusher.queueJackpotPush(strokes),
+      /** S5a 四同的闪色：复用越线反馈那条**同一个** `triggerClimax`，不另开一条闪光通道。 */
+      climax: (tone) => this.triggerClimax(tone),
       onReveal: (outcome) => this.audio.slotReveal(outcome.kind),
       // 转动的机械声要覆盖整段转动（3.4~4.0 秒），所以把时长传下去让音效排程。
       onSpinStart: (seconds) => this.audio.slotSpin(seconds),
@@ -522,7 +547,7 @@ export class Game {
         onRefillWallet: () => {
           this.save.refillWallet(100);
           this.publishHud();
-          this.hud.setStatus(`已充值 100 筹码，当前钱包：${this.save.wallet}`);
+          this.hud.setStatus(`已充值 100 筹码，当前钱包：${this.save.balance}`);
         },
         onClearSave: () => {
           this.save.clear();
@@ -535,6 +560,11 @@ export class Game {
         onCoinTexelChange: () => {
           this.applyCoinResolution();
         },
+        // 10-01 画质锁：手动改像素目标高度 = 人工意图 ⇒ 顺手锁上，别让它被下一次降档覆盖。
+        onQualityManualChange: () => {
+          if (this.governor.isFrozen) return;
+          this.setQualityLock(true);
+        },
         // S22：面板动完机位 → 只摆相机，不走 `applyTuning()`（那会顺带遍历 700 枚币）。
         onCameraChange: () => {
           this.applyCameraRigFromPanel();
@@ -545,17 +575,22 @@ export class Game {
     );
 
     this.config = endlessLevel();
-    // 占位实例：**真正的买入发生在构造函数末尾的 `startRun()` 里**，那一次才扣钱包。
-    // 这里绝对不能再调 `save.buyIn()`——那会让每次打开页面都扣两份买入
-    // （钱包少 40 而局内只有 20，多出来的 20 谁也拿不到）。
+    // 占位实例：**真正的那一局是在构造函数末尾的 `startRun()` 里创建的**，
+    // 那一次才把 `initial` 快照成当时的余额。
+    // ⚠️ S4 合并账户之后这里没有「扣两份买入」的风险了（买入这个动作已经消失），
+    // 但占位实例仍然必须在同一次构造里被换掉：它的 `initial` 是构造那一刻的余额，
+    // 留着不用就是拿着一个过期的起点去记账。
     // 这个实例在同一次构造里就被 `startRun()` 换掉，中间不会有任何一帧跑在它上面。
-    this.run = new RunState(this.config);
+    this.run = new RunState(this.save);
 
     this.buildScene(table.group);
     this.hud.bindPauseToggle(() => this.togglePause());
+    this.hud.bindQualityToggle(() => this.setQualityLock(!this.governor.isFrozen));
+    this.hud.setQualityLock(false, this.governor.current.tier);
     this.hud.bindRuinActions(
       () => this.begForChips(),
       () => this.endRun(),
+      () => this.loanToContinue(),
     );
     // UI 点击音（事件委托，见 `onDocumentClick` 的注释）。
     document.addEventListener('click', this.onDocumentClick);
@@ -1093,6 +1128,38 @@ export class Game {
   }
 
   /**
+   * 画质锁（10-01 用户点名「不要切画质啊」）。
+   *
+   * ## 为什么是"加锁"而不是"默认不降档"
+   * 自动降档是低端设备的保护，废掉它 = 老设备上直接卡死；
+   * 而玩家真正缺的是**一句话的否决权**：「这一档我觉得挺好，别再动了」。
+   * ⇒ 默认仍然自动降档，锁上之后 governor 只继续采样帧率、不再换档
+   *   （复用 `freeze()`，与截图/测试同一条路径，**不新增第二套换档逻辑**）。
+   *
+   * ## 为什么锁档要连"手动改像素高度"一起触发
+   * `applyQuality()` 写的是 `this.tuning.pixelTargetHeight`，与调试面板**同一个字段**。
+   * 于是旧行为是：玩家在面板里手动拖回 720，下一次降档又把它覆盖回去，
+   * 而且**没有任何地方说明为什么"我设的值不生效"**。
+   * ⇒ 手动改这个字段 = 明确的人工意图 = 自动上锁（`DebugTools` 那条 `onFinishChange`）。
+   *
+   * ⚠️ 锁**不落盘**（与档位本身同规格：`tier` 与 `pixelTargetHeight` 都不进存档，
+   *   刷新页面回到「自动 + 高档」）。这是刻意的：把锁持久化 = 让一次误触永久生效，
+   *   而玩家看到的会是"画质再也回不到自动"。
+   */
+  setQualityLock(locked: boolean): QualityTier {
+    this.governor.freeze(locked);
+    const tier = this.governor.current.tier;
+    this.hud.setQualityLock(locked, tier);
+    this.hud.setStatus(
+      locked
+        ? `画质已锁定在${tier === 'high' ? '高' : tier === 'medium' ? '中' : '低'}档（不再自动降档）`
+        : '画质恢复自动调节',
+    );
+    this.publishHud();
+    return tier;
+  }
+
+  /**
    * 重算并套用像素分辨率（V1）。返回画布 backing store 是否真的变了。
    *
    * 顺序：先从 `tuning` 同步入参（调参面板与画质分档都写 `tuning`）→
@@ -1141,6 +1208,7 @@ export class Game {
       exposure: this.renderer.toneMappingExposure,
       view: this.finalView,
       outlineScale: this.tuning.outlineScale,
+      shadowAmount: this.tuning.shadowGrade,
       // CSS 尺寸（不是 RT 尺寸）：见 `FinalPass.render` 与 `glsl/outline.glsl.ts`。
       cssWidth: this.renderer.domElement.clientWidth,
       cssHeight: this.renderer.domElement.clientHeight,
@@ -1269,12 +1337,21 @@ export class Game {
 
       // 记录「越过台面前缘」这一刻：这是币从上层掉到币床的唯一通道，
       // 位置必须贴合推板前缘，不能是任何形式的隐藏传送。
-      if (wasOnDeck && !onDeck && coin.playerDropped && p.z > front) {
+      //
+      // ★ S1b/#49：记录条件**不再要求 `playerDropped`**，而是给每条事件打来源标签。
+      //   原写法把「谁的币」混进了「要不要记」，于是 accept ④ 的样本只剩玩家币——
+      //   而 S1a 实测单枚玩家币走完台面要四位数循环（对称行程下摩擦净输送精确 0），
+      //   结果这条判据的失败**不是物理问题，是取样问题**（09-25 那次台面从 62 掉到 8，
+      //   遥测一条都没有，就是同一件事的极端表现）。
+      //   ⇒ 现在全记、按 source 分流：判据既能用全样本判「离台位置贴不贴前缘」，
+      //     也能单独用 player 子集判「玩家真正投入的那枚币有没有被偷偷传送」。
+      if (wasOnDeck && !onDeck && p.z > front) {
         this.telemetry.recordFallOff({
           z: round3(p.z),
           frontFaceZ: round3(this.pusher.frontFaceZ),
           offset: round3(this.pusher.offset),
           phase: this.pusher.currentPhase,
+          source: coin.playerDropped ? 'player' : 'bed',
         });
       }
 
@@ -1545,7 +1622,9 @@ export class Game {
       }
 
       // XIXI 集章：只有玩家主动投入的币、且已经掉到币床上（离开上层台面）才登记——
-      // 沿用通道印记的 `registerY` 判定语义（「真的掉到币床上才算」，弹飞的不登记）。
+      // 集章门槛：`p.y < channel.registerY`（0.13）。⚠️ 它与「在币床上」**不是同一件事**：
+      // 币床判据是 `isOnDeckVolume` 的体积带。停在上层台面的币心 ≈ 0.213 > 0.13 ⇒
+      // 只有币真的走完台面、从前唇掉下去之后才可能跨过这条线（S1a 实测：满盘后排币要四位数循环）。
       if (coin.playerDropped && !coin.xixiMarked) {
         if (p.y < TABLE.channel.registerY) {
           coin.xixiMarked = true;
@@ -1624,8 +1703,22 @@ export class Game {
     });
 
     const chipsBefore = this.run.chips;
-    this.run.gainChips(outcome.chips);
+    // ★ 甲规则（用户 09-28 拍板）：产出按 `debt : balance` 比例**实时分流抵债**，
+    // 落到玩家手里的是剩下的那一截。`balance` = 钱包 + 本局筹码 = 玩家此刻的全部持有
+    // （S4 合并账户之后就剩一个 `balance`，所以这里刻意不写单只口袋的 `save.wallet`）。
+    //
+    // ⚠️ 分流**不进三账本恒等式**：`earned` 只记到账那一截，抵债额记进 `run.repaid`
+    //（与 `fines` 同族的对账计数）。`RunState.ts` 里写明「加一项就要同步
+    // Ledger / ledgerBalances / 所有断言点」，这条分流照罚款的先例走，正好绕开那笔债。
+    const gross = outcome.chips;
+    const repaid = this.save.repayFrom(gross, this.save.balance + this.run.chips);
+    this.run.repaid += repaid;
+    this.run.gainChips(gross - repaid);
     const chipsAfter = this.run.chips;
+    if (repaid > 0) {
+      // HUD 必须实时显示分流额，否则玩家看到的是「越了一枚币，筹码怎么只加了一点」——那就是 bug 的形状。
+      this.hud.setStatus(`产出 ${gross} 筹码：抵债 −${repaid}，实得 +${gross - repaid}`);
+    }
 
     // ★ 4b 的汇判据：**这一枚**越线时是不是有装置正在跑。
     // 读 `activeId` 而不是「距演出开始多久」：窗口由演出自己定义，
@@ -1832,9 +1925,11 @@ export class Game {
    * 破产弹窗：嘲讽 + 两条真实选择。
    *
    * 跪求 → 领递减赏赐，**盘面保留**（你堆起来的台面是沉没价值，这是「再跪一次」的拉力）。
-   * 保留尊严 → 结束本局、回存钱包、盘面清空。
+   * 保留尊严 → 结束本局、盘面清空。
    *
-   * 这里**不回存钱包**：本局还没结束，玩家随时可能跪求续命。回存在 showEndlessSummary。
+   * ★ S4：这里旧写法还有一句「不回存钱包，因为本局还没结束，玩家随时可能跪求续命」——
+   *   合并账户之后收工本来就不动钱，那条顺序顾虑随之消失；**留下来的顾虑是另一个**：
+   *   弹窗出现时盘面还在沉降，迟到返值会继续进账，所以成绩单读的是收工那一刻的快照。
    */
   private showRuin(): void {
     if (this.ruinVisible) return;
@@ -1851,9 +1946,11 @@ export class Game {
       begs: this.begsThisRun,
       totalBegs: this.save.begCount(),
       best: this.save.snapshot.bestEarned,
-      wallet: this.save.wallet,
+      balance: this.save.balance,
       runs: this.save.snapshot.runs,
       grant: ENDLESS.begs[Math.min(this.begsThisRun, ENDLESS.begs.length - 1)],
+      // 贷款报价（S3）。到上限时 `available=false`，HUD 会藏掉按钮而不是留着可点。
+      loan: this.save.loanOffer,
     });
     this.hud.setStatus('破产。跪求 xixi 大王，还是保留尊严？');
   }
@@ -1866,7 +1963,8 @@ export class Game {
     this.ruinVisible = false;
     this.hud.hideRuin();
     // 赏赐走 grantBeg 而不是 gainChips：它记进 begged（脏钱），
-    // 所以收工时**不能回存钱包**——否则跪求就成了无限刷筹码的漏洞。
+    // 所以它**不能拿去换永久进度**（`SaveStore.spendable` 把它扣掉了）——
+    // 否则「破产 → 跪求 → 买图鉴」就成了无限刷进度的漏洞。
     this.run.grantBeg(grant);
     // 赏赐只续命：不计入赚进、不给任何加成。
     this.run.reviveFromRuin();
@@ -1877,6 +1975,43 @@ export class Game {
     this.restTimer = 0;
     this.audio.payoutReturn();
     this.hud.setStatus(`xixi 大王赏你 ${grant} 筹码。滚去推币，别再回来。`);
+    return true;
+  }
+
+  /**
+   * 贷款续玩（S3 去局感）：**同一副盘面、同一个 RNG 序列、不重开任何东西**，
+   * 只是把「又买了一次筹码」的钱记成欠款。
+   *
+   * 与 `begForChips()` **同形**（都保留盘面、都从沉降里拉回来、都重记收尾），
+   * 差别只在账上：跪给的是**脏钱**（`begged`：不能换成永久进度、也不计入成绩），
+   * 贷来的是**干净进账**（`loaned`，恒等式里的第四项）⇒ 两条都不必改动恒等式的形状。
+   *
+   * ★ **刻意不调 `startRun()`**：那会重摆盘面、重置 RNG、中止在途演出、
+   * 把本局计数器与异常统计全部清零。而「贷款前后**盘面枚数一动不动**」
+   * 是本功能唯一近确定性的判据（比任何分布统计都硬），一调 `startRun` 就没得验了。
+   * 这也是 S3「一局一局的感觉消失」在代码上的落点：触底不再是终点。
+   */
+  private loanToContinue(): boolean {
+    if (!this.ruinVisible) return false;
+    const stake = this.save.loanToStake();
+    // `stake === 0` 只在欠款到顶时发生。HUD 那时已经把按钮藏了
+    //（见 `Hud.showRuin` 里 `loan.available` 的行级 gating），所以这条是第二层防线，
+    // 不是给用户看的死按钮 —— 而且它必须返回 false，钩子才能把「没给钱」如实报出来。
+    if (stake <= 0) return false;
+    this.ruinVisible = false;
+    this.hud.hideRuin();
+    this.run.recordLoan(stake);
+    this.run.reviveFromRuin();
+    // 与跪求同一手：这次收尾没有结算，清掉记录重新计时。
+    this.resetDrainRecord();
+    this.pusher.start();
+    this.settleWindow = 0;
+    this.restTimer = 0;
+    this.audio.payoutReturn();
+    this.hud.setStatus(
+      `贷款 +${stake} 筹码续玩。欠款 ${this.save.debt}/${this.save.debtCeiling}，产出会按比例自动抵债。`,
+    );
+    this.publishHud();
     return true;
   }
 
@@ -1906,23 +2041,30 @@ export class Game {
   /**
    * 本局结算卡片。
    *
-   * 顺序很关键：**先回存钱包，再记这一局**——卡片上显示的钱包余额必须
-   * 和存档里的数字一致，否则玩家会看到「回存 +12」但钱包没动。
-   * 回存额由 `RunState.cashOut` 给出，已经扣掉不可回存的跪求筹码。
+   * ★ S4：旧写法这里有一条顺序要求（「先回存钱包、再记这一局」，否则卡片上的钱包数
+   * 与存档不一致）。合并账户之后**回存这个动作不存在了**，卡片显示的余额与存档
+   * 是同一个数的同一次读取 ⇒ 顺序要求一起消失。保留的是另一件事：
+   * `recordRun` 读的是**收工那一刻**的 snapshot，之后的迟到返值只进账本、不进成绩单。
    *
    * 跪求次数是排行榜的第二列：把羞辱变成收集品。
    */
   private showEndlessSummary(): void {
     const snapshot = this.run.snapshot();
-    const cashOut = this.run.cashOut;
-    this.save.depositWallet(cashOut);
+    /*
+     * ★ S4：这里原本有三行 —— `const cashOut = this.run.cashOut` →
+     *   `this.save.depositWallet(cashOut)` → 卡片上打「回存钱包 +N」。
+     *   合并账户之后**这三行一起删掉，不是改写**：钱从始至终都在同一个余额里，
+     *   「回存」这个动作没有对象了。玩家眼里少掉一次「钱从一个口袋搬进另一个口袋」的表演，
+     *   而这正是他抱怨的那个别扭处（「我的钱怎么少了 20？」）。
+     *   脏钱的约束没有丢：它现在长在 `SaveStore.spendable`（买图鉴的门槛）上，
+     *   等价性见 `economy.spendableOf` 的代入验算。
+     */
     const record = this.save.recordRun(snapshot.earned, snapshot.drops, this.begsThisRun);
     this.summaryVisible = true;
     this.hud.showRuin({
       earned: snapshot.earned,
       chips: snapshot.chips,
-      cashOut,
-      wallet: this.save.wallet,
+      balance: this.save.balance,
       drops: snapshot.drops,
       chipsPeak: snapshot.chipsPeak,
       begs: this.begsThisRun,
@@ -1932,7 +2074,7 @@ export class Game {
       grant: 0,
       summary: true,
     });
-    this.hud.setStatus(`本局结束：回存 ${cashOut} 筹码，钱包现有 ${this.save.wallet}`);
+    this.hud.setStatus(`本段结束：余额 ${this.save.balance}`);
     this.publishDiagnostics();
   }
 
@@ -1965,10 +2107,12 @@ export class Game {
 
   /** 开一局新的：盘面预置，筹码从钱包买入。 */
   private startRun(): void {
-    // 买入放在最前面：钱包扣款必须发生在任何状态重置之前。
-    // 钱包见底时 buyIn 返回 0（不拒绝），本局会以 0 筹码开局、立刻进沉降，
-    // 玩家跪求一次就能继续——这条路必须走得通，否则钱包空就成了死状态。
-    this.run = new RunState(this.config, this.save.buyIn());
+    // ★ S4：这里原来第一件事是「买入扣钱包」，必须排在任何状态重置之前。
+    //   合并账户之后 `new RunState(save)` 就是把**当时的余额**快照成本局起始额，
+    //   所以「先扣后重置」这件事自然成立，不再有独立的扣款步骤。
+    //   余额见底时起始就是 0：本局以 0 开局、立刻进沉降，玩家跪求一次就能继续——
+    //   这条路必须走得通，否则余额空就成了死状态。
+    this.run = new RunState(this.save);
     this.rng = createSeededRandom(this.seedOverride ?? this.config.seed);
 
     // **推板先归位，再摆盘。顺序不能反。**
@@ -2054,7 +2198,7 @@ export class Game {
       this.feedbackCounts[key] = 0;
     }
     this.hud.setStatus(
-      `${this.config.focus} · 本局买入 ${this.run.buyIn} 筹码 · 选位自动左右摆，轻点机台或按空格投币`,
+      `${this.config.focus} · 余额 ${this.save.balance} 筹码 · 选位自动左右摆，轻点机台或按空格投币`,
     );
     this.input.setEnabled(true);
     this.publishHud();
@@ -2426,17 +2570,18 @@ export class Game {
       this.xixiFlashTimer > 0 ? this.xixiFlashTimer / XIXI_FLASH_SECONDS : 0,
     );
     const snapshot = this.run.snapshot();
+    // 欠款跟着 HUD 一起刷新：读的是 `SaveStore` 本尊，HUD 不存副本。
+    this.hud.setDebt(this.save.debt, this.save.debtCeiling);
     this.hud.update(
       snapshot,
       this.config,
       this.save.snapshot.bestEarned,
       this.mechanismSnapshot(),
       betTier(this.betIndex),
-      this.save.wallet,
       this.xixi,
     );
     // 屏上的账本与 DOM 读的是**同一个 snapshot 对象**：不存在「HUD 说 56、招牌说 54」。
-    marqueeScreen().pushLedger({ wallet: this.save.wallet, earned: snapshot.earned });
+    marqueeScreen().pushLedger({ balance: this.save.balance, earned: snapshot.earned });
   }
 
   /**
@@ -2499,12 +2644,45 @@ export class Game {
         const settings = this.governor.force(tier as QualityTier);
         this.governor.freeze(true);
         this.applyQuality();
+        this.hud.setQualityLock(true, settings.tier);
         this.render();
         return {
           tier: settings.tier,
           pixelTargetHeight: settings.pixelTargetHeight,
           shadows: settings.shadows,
         };
+      },
+      /**
+       * 画质锁（10-01 用户点名）。`locked` 省略时**读**当前锁状态而不改 ——
+       * 判据要能分清「没锁」与「锁在高档」，而这两件事在 tier 上看起来一样。
+       */
+      qualityLock: (locked?: boolean) => {
+        if (locked === undefined) {
+          return { locked: this.governor.isFrozen, tier: this.governor.current.tier, fps: this.governor.fps };
+        }
+        const tier = this.setQualityLock(locked);
+        return { locked: this.governor.isFrozen, tier, fps: this.governor.fps };
+      },
+      /**
+       * 灌 N 个「低帧」采样窗口，用来验锁档真的拦住了自动降档。
+       *
+       * 为什么要有这条钩子：判据不能靠"等机器真的卡"——那是不可复现的等待。
+       * `sample()` 是纯的（吃 delta 出换档决定），所以把 delta 喂进去就能确定性地
+       * 复现「连续两个 1 秒窗口低于 45 ⇒ 降一档」这条规则本身。
+       */
+      feedFrames: (delta: number, windows: number) => {
+        let changed = 0;
+        for (let i = 0; i < Math.max(0, Math.round(windows)); i += 1) {
+          // 一个窗口 = 累计满 1 秒仿真时间；`1 / delta` 帧就是那个窗口的帧数。
+          const frames = Math.max(2, Math.ceil(1 / Math.max(0.001, delta)));
+          for (let f = 0; f < frames; f += 1) {
+            if (this.governor.sample(delta)) {
+              changed += 1;
+              this.applyQuality();
+            }
+          }
+        }
+        return { changed, tier: this.governor.current.tier, fps: this.governor.fps };
       },
       /**
        * 像素分辨率开关（V1，V2 解耦）：`pixelated` 只管最近邻/平滑，`upscale` 管内部分辨率。
@@ -2581,7 +2759,7 @@ export class Game {
        * 推板把币往前挤，前沿的先越线、先掉进下水道。所以构造出来的状态与
        * 「真的玩到那一步」是**同一个形态**，而不是一个「随机挖空」的人造态。
        *
-       * 只 `despawn`，不碰账本：币不是筹码，`chips = buyIn + earned + begged − spent`
+       * 只 `despawn`，不碰账本：币不是筹码，`balance = initial + earned + begged + loaned − spent`
        * 不受影响。判据要的是「盘面变薄」这一个变量，别的一律不动。
        */
       clearBedTo: (keep = 120) => {
@@ -2609,19 +2787,35 @@ export class Game {
         begs: this.begsThisRun,
         totalBegs: this.save.begCount(),
         best: this.save.snapshot.bestEarned,
-        wallet: this.save.wallet,
+        balance: this.save.balance,
         // 验证脚本会主动充值钱包（见 `refillWallet` 钩子），所以钱包守恒的
         // 算式必须把 Σ充值 算进去，否则会报出假失败。
         refilled: this.save.refilled,
         ruinVisible: this.hud.ruinVisible,
         summaryVisible: this.summaryVisible,
       }),
-      /** 三账本 + 钱包：P1 验收要逐笔核对 `chips = buyIn + earned + begged − spent`。 */
+      /**
+       * 本局账本 + 账户读数：验收要逐笔核对
+       * `balance = initial + earned + begged + loaned − spent`（S4 合并账户之后的式子）。
+       *
+       * ★ `balanced` 是**这条恒等式唯一的真源**（直接调 `economy.ledgerBalances`）。
+       * 原先 harness 的 `ledgerOk()`、Playwright 的 `expect(...).toBe(...)`、以及
+       * `ledgerText()` 打的中文式子**各自手抄了一遍同一个算式**（共四处）。
+       * 于是 S4 合并账户动 `Ledger` 那一族时要同步改四个地方——漏一处就是
+       * 「src 绿、spec 红」的假回归对。现在下游一律**读这个字段**，不再自己算。
+       */
       ledger: () => ({
         ...this.run.ledger,
-        cashOut: this.run.cashOut,
-        wallet: this.save.wallet,
+        balance: this.save.balance,
+        spendable: this.save.spendable,
         refilled: this.save.refilled,
+        balanced: ledgerBalances(this.run.ledger),
+        /**
+         * ★ S4 的全局守恒式（验证批 ②）要用它。
+         * 局级账本每次开局重新快照，抓不到「上一局收尾时那笔没记进任何局账的余额变动」
+         * —— 旧 ② 报的「差 26」正是这种。这份累计表不按局清零，所以抓得到。
+         */
+        totals: this.save.accountTotals,
       }),
       /** 加注档位表（含返值倍率），供验证脚本做「换档重算」。 */
       betTiers: () => BET_TIERS.map((tier) => ({ ...tier })),
@@ -3192,7 +3386,7 @@ export class Game {
       },
       coinReport: () => this.coins.coinReport(),
       collection: () => ({
-        wallet: this.save.wallet,
+        balance: this.save.balance,
         coinSkins: [...this.save.snapshot.coinSkins],
         cabinetSkins: [...this.save.snapshot.cabinetSkins],
         selectedCoinSkin: this.save.snapshot.selectedCoinSkin,
@@ -3204,20 +3398,31 @@ export class Game {
         this.xixi = [...this.save.snapshot.xixi];
         this.collection.refresh();
         this.applySkins();
-        return { wallet: this.save.wallet };
+        return { balance: this.save.balance };
       },
       /**
        * 往钱包里补筹码（测试/调试用）。
        *
-       * 存在的理由：**验证脚本会在同一个会话里反复 `startRun`，而每次开局都从钱包扣 20**，
-       * 只在收工（`endRun` → `showEndlessSummary`）时才回存。脚本跑十几条用例就把钱包掏空了，
-       * 于是 `buyIn` 变 0 —— 而引擎现在会正确地以「开局即破产」响应（见 `startRun`）。
+       * 存在的理由：**验证脚本会在同一个会话里反复 `startRun`，而一局就是把余额投到底**，
+       * 脚本跑几条用例就把余额见底，于是下一局以 0 起始开局 —— 引擎会正确地以
+       * 「开局即破产」响应（见 `startRun` 的零余额分支）。
        * 那些用例测的是玩法而不是破产，所以在 `startRun` 之前先补满。
        *
-       * 充值额记进 `SaveStore.refilled`，钱包守恒算式把它算进去（`run()` 钩子暴露）。
+       * 充值额记进 `SaveStore` 的 `totals.refill`（旧名 `refilled`），
+       * 余额守恒算式把它算进去（`run()` / `ledger()` 两个钩子都暴露）。
        */
       // R4-4b 的生命周期自证用（见 `PhysicsWorld.countColliders` 为何不进 diagnostics）。
       countColliders: () => this.physics.countColliders(),
+      /**
+       * S5a 四同「力」的对账读数：待发的加长行程**发数** + 引擎侧那次排了几发。
+       * 判据要能分清「四同真的排了 N 发」与「只排了一发普通加力」——
+       * 这两件事在画面上只差几个循环，看截图是判不出来的。
+       */
+      boostQueue: () => ({
+        strokes: this.pusher.pendingBoostStrokes,
+        jackpotStrokes: RULES.jackpotBoostStrokes,
+        travelBonus: this.pusher.boostTravelBonus,
+      }),
       // R4-4b 的「汇」：演出窗口内越线的枚数，按出处分成「演出币 / 存量币」。
       showWindow: () => ({
         crossings: this.showWindowCrossings,
@@ -3226,7 +3431,56 @@ export class Game {
       refillWallet: (amount = 200) => {
         this.save.refillWallet(amount);
         this.publishHud();
-        return { wallet: this.save.wallet, refilled: this.save.refilled };
+        return { balance: this.save.balance, refilled: this.save.refilled };
+      },
+      /**
+       * 贷一笔款（S2）。返回**实际到账额**——到上限时它小于请求额，甚至为 0。
+       *
+       * 与 `refillWallet` 刻意分成两个钩子：`refillWallet` 是**验证脚本发钱**（记进 `refilled`，
+       * 守恒式要减掉它），`loan` 是**游戏机制发钱**（记进 `debt` 与 `loanedTotal`）。
+       * 合成一个的话，钱包守恒那条判据就分不出「白给的」与「借的」，
+       * 而 S2 的全部意义就在这两者的区别上。
+       */
+      loan: (amount?: number) => {
+        const applied = this.save.loan(amount);
+        this.publishHud();
+        return {
+          applied,
+          balance: this.save.balance,
+          debt: this.save.debt,
+          ceiling: this.save.debtCeiling,
+          loanedTotal: this.save.loanedTotal,
+        };
+      },
+      /** 只读欠款状态（判据与调试用，不改任何账）。 */
+      debt: () => ({
+        debt: this.save.debt,
+        ceiling: this.save.debtCeiling,
+        loanedTotal: this.save.loanedTotal,
+        repaidThisRun: this.run.repaid,
+        offer: this.save.loanOffer,
+      }),
+      /**
+       * 走一次「贷款续玩」（S3）。返回 false = 什么都没发生
+       * （不在破产态，或欠款已到顶 ⇒ 破产弹窗上那个按钮本来就该是藏着的）。
+       *
+       * ★ 判据要拿它验的是**盘面枚数不变**：这条路径不调 `startRun()`，
+       * 所以调用前后 `coins().length` 必须逐枚相同。那是本功能唯一近确定性的判据。
+       */
+      loanToContinue: () => {
+        const before = {
+          onDeck: this.coins.activeCount(),
+          chips: this.run.chips,
+          loaned: this.run.loaned,
+        };
+        const applied = this.loanToContinue();
+        return {
+          applied,
+          before,
+          after: { onDeck: this.coins.activeCount(), chips: this.run.chips, loaned: this.run.loaned },
+          debt: this.save.debt,
+          ceiling: this.save.debtCeiling,
+        };
       },
       /**
        * 把钱包设成指定值（验证脚本用）。
@@ -3238,12 +3492,12 @@ export class Game {
       setWallet: (amount: number) => {
         this.save.setWallet(amount);
         this.publishHud();
-        return { wallet: this.save.wallet, refilled: this.save.refilled };
+        return { balance: this.save.balance, refilled: this.save.refilled };
       },
       unlockSkin: (kind: string, id: string, cost: number) => {
         const unlocked = this.save.unlockSkin(kind as 'coin' | 'cabinet', id, cost);
         this.collection.refresh();
-        return { unlocked, wallet: this.save.wallet };
+        return { unlocked, balance: this.save.balance };
       },
       selectSkin: (kind: string, id: string) => {
         const selected = this.save.selectSkin(kind as 'coin' | 'cabinet', id);
@@ -3416,12 +3670,19 @@ export class Game {
        * 奖励路径必须可逐一指定验证：「力力力→加力入账且 earned 不动」、
        * 「塔塔塔→ShowDirector 登记」，不能靠权重随机去赌。
        */
-      xixiSpin: (forced?: string) => {
-        const result = this.slotMachine.spin(forced as SlotSymbol | 'fine' | 'miss' | undefined);
+      xixiSpin: (forced?: string, tier?: SlotTier | null) => {
+        // ⚠️ `?? 3` 而不是直接把 `tier` 传下去：TS 的默认参数只在 `undefined` 时生效，
+        // 而脚本从页面外面传进来的是 `null` —— 不夹的话强制三同会摇出一个 `tier: null` 的结果，
+        // 四同分支判断 `tier === 4` 为假、时间轴判断也跟着走空。
+        const result = this.slotMachine.spin(
+          forced as SlotSymbol | 'fine' | 'miss' | undefined,
+          tier ?? 3,
+        );
         if (!result) return null;
         return {
           kind: result.outcome.kind,
           symbol: result.outcome.kind === 'win' ? result.outcome.symbol : undefined,
+          tier: result.outcome.kind === 'win' ? result.outcome.tier : undefined,
           faces: this.slotMachine.reelWindowReport().faces,
         };
       },
@@ -3432,13 +3693,18 @@ export class Game {
       /**
        * 结果表的实测分布：把 `rollSlotOutcome` 在 `[0,1)` 上均匀枚举。
        *
-       * 判据**不写第二份权重公式**（纪律 2）：45/15/40 只存在于 `xixi.ts`，
-       * 测试读的是引擎函数枚举出来的实际分布。改权重忘了改测试 → 测试自动跟上。
+       * ★ S5a：计数桶**按权重表的键开**（`SLOT_OUTCOME_KEYS`），并把权重表本身与
+       * 符号数一起吐出去 ⇒ 判据拿「枚举出来的比例」对「引擎自己的表」，
+       * 测试里不再出现 45/15/40 与「5 个符号」这类第二份事实。
+       * 加一档（win4）或改权重，判据自己跟上；反过来**表写漏一格也会当场红**
+       * （计数键不在表里 → Σcounts ≠ samples）。
        */
       slotOdds: (samples = 2000) => {
         const total = Math.max(1, Math.floor(samples));
-        const counts = { win: 0, fine: 0, miss: 0 };
+        const counts: Record<string, number> = {};
+        for (const key of SLOT_OUTCOME_KEYS) counts[key] = 0;
         const symbols: Record<string, number> = {};
+        const tier4SymbolsSeen: Record<string, number> = {};
         /**
          * `detailRoll` 走**独立的确定性 LCG**（不引入 `Math.random`：判据要可复现）。
          *
@@ -3453,24 +3719,38 @@ export class Game {
         };
         for (let i = 0; i < total; i += 1) {
           const outcome = rollSlotOutcome(i / total, nextDetail());
-          counts[outcome.kind] += 1;
+          counts[outcomeWeightKey(outcome)] += 1;
           if (outcome.kind === 'win') {
             symbols[outcome.symbol] = (symbols[outcome.symbol] ?? 0) + 1;
+            if (outcome.tier === 4) {
+              tier4SymbolsSeen[outcome.symbol] = (tier4SymbolsSeen[outcome.symbol] ?? 0) + 1;
+            }
           }
         }
-        return { samples: total, counts, symbols };
+        return {
+          samples: total,
+          counts,
+          symbols,
+          weights: { ...SLOT_OUTCOME_WEIGHTS },
+          totalWeight: outcomeTotalWeight(),
+          /** 符号池大小由引擎给：判据断「无死项」时读它，不写 5。 */
+          symbolCount: SLOT_SYMBOL_WEIGHTS.length,
+          /** 四同池成员与**枚举里真的摇到过的符号**：判据据此核「池里没有死项、池外没人混进来」。 */
+          tier4Symbols: [...SLOT_TIER4_SYMBOLS],
+          tier4SymbolsSeen,
+        };
       },
       /**
        * 停格画面的枚举：给定结果，`reelFacesFor` 沿 `detailRoll` 轴扫一遍。
        * 判据用它核「win/fine 四连、miss 两两不同」，不在测试里重写这段规则。
        */
-      reelFaces: (kind: string, symbol?: string) => {
+      reelFaces: (kind: string, symbol?: string, tier?: SlotTier) => {
         const outcome: SlotOutcome =
           kind === 'fine'
             ? { kind: 'fine' }
             : kind === 'miss'
               ? { kind: 'miss' }
-              : { kind: 'win', symbol: (symbol ?? 'boost') as SlotSymbol };
+              : { kind: 'win', symbol: (symbol ?? 'boost') as SlotSymbol, tier: tier ?? 3 };
         const out: string[][] = [];
         for (let i = 0; i < 25; i += 1) out.push(reelFacesFor(outcome, i / 25));
         return out;
@@ -3860,14 +4140,20 @@ export class Game {
       frame: this.frame,
       elapsed: this.elapsed,
       phase: snapshot.phase,
-      // 三账本：`chips === buyIn + earned + begged − spent` 必须在每一帧都成立。
+      // S4 合并账户后的恒等式：`balance = initial + earned + begged + loaned − spent`
       chips: snapshot.chips,
-      buyIn: snapshot.buyIn,
+      initial: snapshot.initial,
       earned: snapshot.earned,
       begged: snapshot.begged,
+      loaned: snapshot.loaned,
       spent: snapshot.spent,
-      cashOut: this.run.cashOut,
-      wallet: this.save.wallet,
+      /** 本局被分流抵债的累计额（S2）。不进恒等式，与 `fines` 同族，见 `RunState.repaid`。 */
+      repaid: snapshot.repaid,
+      /** ★ 恒等式的唯一真源（`economy.ledgerBalances`）——诊断快照与 `ledger()` 钩子共用这一个函数。 */
+      balanced: ledgerBalances(this.run.ledger),
+      /** 可花余额（扣掉跪来的那一份）——脏钱约束在合并之后唯一的执行点。 */
+      spendable: this.save.spendable,
+      balance: this.save.balance,
       bestCombo: snapshot.bestCombo,
       /** XIXI 四槽亮灭（跨局持续；点亮/集齐事件在 telemetry.xixiEvents）。 */
       xixi: [...this.xixi],
@@ -3992,6 +4278,12 @@ export class Game {
         // 大赏币注入间隔。测试读这里而不是写死数字：P8 重新标定时
         // 硬编码的 15/30 会让断言变成假失败，而它其实只是配置。
         bountyEveryDrops: ENDLESS.bountyEveryDrops,
+        /**
+         * 一个**标准注额**（`ENDLESS.buyIn`）。S4 合并账户之后它不再是「每局买入」——
+         * 一局的入场额就是全部余额 —— 它现在只有两个读者：贷款额的基准，
+         * 以及 `economy` 批用来把局长口径对齐到旧标定（脚本里不抄第二份常量，同一个理由）。
+         */
+        referenceStake: ENDLESS.buyIn,
         // 本局已注入的大赏币枚数（注入率断言的分子）。
         bounties: snapshot.bounties,
       },
@@ -4039,6 +4331,8 @@ export class Game {
       performance: {
         fps: round3(this.governor.fps),
         tier: this.governor.current.tier,
+        /** 画质锁是否合上（10-01）。`tier` 相同而 `locked` 不同是两种完全不同的状态。 */
+        locked: this.governor.isFrozen,
         // 像素分辨率（V1）：取代了旧的 maxDpr。`upscale` 是整数倍率，
         // `internalHeight` 是实际内部渲染高度（CSS 像素）。
         pixelTargetHeight: this.tuning.pixelTargetHeight,
@@ -4048,11 +4342,22 @@ export class Game {
         shadows: this.governor.current.shadows,
       },
       collection: {
-        wallet: this.save.wallet,
+        balance: this.save.balance,
         coinSkin: this.save.snapshot.selectedCoinSkin,
         cabinetSkin: this.save.snapshot.selectedCabinetSkin,
         coinSkins: this.save.snapshot.coinSkins.length,
         cabinetSkins: this.save.snapshot.cabinetSkins.length,
+      },
+      /**
+       * 贷款 / 欠款（S2）。`repaid` 是**本局**被分流抵债的累计额（`RunState.repaid`，
+       * 不进三账本恒等式），所以「gross 产出」= `earned + repaid` —— economy 的稳态判据
+       * 读的就是 `repaid / (earned + repaid)` 这个分流率。
+       */
+      debt: {
+        debt: this.save.debt,
+        ceiling: this.save.debtCeiling,
+        loanedTotal: this.save.loanedTotal,
+        repaidThisRun: this.run.repaid,
       },
       reel: this.reelDiagnostics(),
       renderer: {
@@ -4071,6 +4376,15 @@ export class Game {
         outline: {
           scale: this.tuning.outlineScale,
           ...this.finalPass.outlineThresholds,
+        },
+        /**
+         * 暗部分级的**当前生效值**：grade 走 tuning（面板/测试都能改，恒等门读的就是它），
+         * tint/range 是常量所以直接报——它们没有被第二份可改的副本，不构成第二真源。
+         */
+        shadow: {
+          grade: this.tuning.shadowGrade,
+          tint: FINAL_PASS_SHADOW_TINT,
+          range: FINAL_PASS_SHADOW_RANGE,
         },
       },
       canvas: {

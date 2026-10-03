@@ -5,18 +5,28 @@ interface ThreeGameDiagnostics {
   elapsed: number;
   phase: string;
   /**
-   * 三账本 + 钱包。恒等式 `chips === buyIn + earned + begged − spent`
+   * 合并账户的账本。恒等式 `balance = initial + earned + begged + loaned − spent`
    * 必须在每一帧都成立——这是 P1 的核心验收，也是后面加机关/道具时最易写漏的地方。
+   *
+   * ★ `balanced` 由引擎调 `economy.ledgerBalances` 算出，是这条恒等式的**唯一真源**；
+   * 下游（harness 的 `ledgerOk`、Playwright 的断言）一律读它，不要手抄算式。
    */
   chips: number;
-  buyIn: number;
+  initial: number;
+  loaned: number;
   earned: number;
   begged: number;
   spent: number;
-  /** 此刻收工能回存钱包的筹码（已扣掉不可回存的跪求筹码）。 */
-  cashOut: number;
+  balanced: boolean;
+  /**
+   * 本局产出里被分流抵债的累计额（S2 甲规则）。
+   * **不进三账本恒等式**（与 `fines` 同族）：`earned + repaid` 才是 gross 产出。
+   */
+  repaid: number;
+  //** 可花余额 = 余额扣掉跪来的那一份（脏钱约束在合并后唯一的执行点）。 */
+  spendable: number;
   /** 钱包余额（跨局持久化，图鉴的购买力）。 */
-  wallet: number;
+  balance: number;
   bestCombo: number;
   /** XIXI 四槽亮灭（跨局持续；点亮/集齐/摇奖/奖励事件在 telemetry.xixiEvents）。 */
   xixi: boolean[];
@@ -157,6 +167,11 @@ interface ThreeGameDiagnostics {
     ruinVisible: boolean;
     /** 大赏币注入间隔（每多少投 1 枚）。测试读它，避免写死数字。 */
     bountyEveryDrops: number;
+    /**
+     * 标准注额（`ENDLESS.buyIn`）。S4 之后它不是「每局买入」——一局入场额就是全部余额——
+     * 只剩贷款基准与 `economy` 批的局长口径基准两个用途。测试读它，不抄第二份常量。
+     */
+    referenceStake: number;
     /** 本局已注入的大赏币枚数（注入率断言的分子）。 */
     bounties: number;
   };
@@ -219,6 +234,8 @@ interface ThreeGameDiagnostics {
   performance: {
     fps: number;
     tier: string;
+    /** 画质锁是否合上（10-01）：`tier` 相同而 `locked` 不同是两种状态。 */
+    locked: boolean;
     /** 内部分辨率的目标高度上限。调低 = 倍率更大 = 更省。 */
     pixelTargetHeight: number;
     /** 最近邻开关（`?pixel=N` 开、`off` 关；默认关 = 平滑）。 */
@@ -230,11 +247,21 @@ interface ThreeGameDiagnostics {
     shadows: boolean;
   };
   collection: {
-    wallet: number;
+    balance: number;
     coinSkin: string;
     cabinetSkin: string;
     coinSkins: number;
     cabinetSkins: number;
+  };
+  /**
+   * 贷款 / 欠款（S2）。真源是 `SaveStore`，这里只出快照。
+   * `repaidThisRun` 是**本局**被分流抵债的累计额，不进三账本恒等式 ⇒ gross 产出 = `earned + repaid`。
+   */
+  debt: {
+    debt: number;
+    ceiling: number;
+    loanedTotal: number;
+    repaidThisRun: number;
   };
   /**
    * 背板老虎机（P10）：4 个滚筒窗的读数。
@@ -266,6 +293,8 @@ interface ThreeGameDiagnostics {
     textures: number;
     /** 描边的当前生效值（强度 + 两条阈值）。判据读的就是这一份。 */
     outline: { scale: number; id: number; depth: number; grazing: number };
+    /** 暗部分级当前生效值。⚠️ 与 outline 一样是**必填**：写成可选会让判据读不到时静默拿 undefined。 */
+    shadow: { grade: number; tint: string; range: number };
   };
   canvas: {
     clientWidth: number;
@@ -402,6 +431,10 @@ interface ThreeGameTestHooks {
   hideDebugUi(hidden: boolean): void | Promise<void>;
   /** 推币机扩展：强制画质档位（high / medium / low），并冻结自动分档。 */
   setQuality?(tier: string): { tier: string; pixelTargetHeight: number; shadows: boolean };
+  /** 画质锁：传 `locked` 切换、省略则只读当前状态。 */
+  qualityLock?(locked?: boolean): { locked: boolean; tier: string; fps: number };
+  /** 灌 N 个低帧采样窗口，用来**确定性地**验锁档拦住了自动降档（不用真把机器跑卡）。 */
+  feedFrames?(delta: number, windows: number): { changed: number; tier: string; fps: number };
   /**
    * 推币机扩展：像素分辨率（V1，V2 解耦）。`pixelated` 只切最近邻/平滑采样，
    * `upscale` 是显式内部分辨率倍率（`null` 取消、回到 `targetHeight` 推导）——两者正交。
@@ -598,22 +631,43 @@ interface ThreeGameTestHooks {
     begs: number;
     totalBegs: number;
     best: number;
-    wallet: number;
+    balance: number;
     /** 累计充值额（脚本主动补钱包的次数），钱包守恒算式要把它算进去。 */
     refilled: number;
     ruinVisible: boolean;
     summaryVisible: boolean;
   };
-  /** 三账本 + 钱包快照，用于逐笔核对恒等式。 */
+  /**
+   * 三账本 + 钱包快照，用于逐笔核对恒等式。
+   *
+   * ★ `balanced` 由**引擎自己**算（`Game.ts` 的 `ledger()` 调 `economy.ledgerBalances`），
+   * 是这条恒等式的唯一真源 —— 下游（harness 的 `ledgerOk`、Playwright 的断言）
+   * 一律读这个字段，不要再手抄一遍 `buyIn + earned + begged − spent`。
+   */
   ledger?(): {
-    buyIn: number;
+    initial: number;
+    loaned: number;
     earned: number;
     begged: number;
     spent: number;
-    chips: number;
-    cashOut: number;
-    wallet: number;
+    balance: number;
+    /** 可花余额（余额扣掉终身跪求额）—— 脏钱约束在合并账户之后唯一的执行点。 */
+    spendable: number;
     refilled: number;
+    balanced: boolean;
+    /**
+     * 终身累计进出账（`SaveStore.AccountTotals` 的快照）。
+     * 全局守恒式（验证批 ②）读它 —— 局级账本每次开局重新快照，抓不到没进任何局账的
+     * 余额变动，这份不按局清零所以抓得到。四个进账桶 + 两个出账桶 = 余额的全部合法去路。
+     */
+    totals: {
+      earned: number;
+      begged: number;
+      loaned: number;
+      refill: number;
+      spend: number;
+      skin: number;
+    };
   };
   /** 加注档位表（含返值倍率）。 */
   betTiers?(): Array<{ chips: number; mul: number; label: string }>;
@@ -798,14 +852,14 @@ interface ThreeGameTestHooks {
     outlines: { tall: Array<[number, number]>; low: Array<[number, number]> };
   };
   collection?(): {
-    wallet: number;
+    balance: number;
     coinSkins: string[];
     cabinetSkins: string[];
     selectedCoinSkin: string;
     selectedCabinetSkin: string;
   };
   /** 图鉴与外观：清空存档（仅测试用）。 */
-  clearSave?(): { wallet: number };
+  clearSave?(): { balance: number };
   /** 直接设定 XIXI 四槽亮灭（只改渲染状态，不碰存档与遥测）。 */
   setXixi?(slots: boolean[]): ThreeXixiLaneReport;
   /** 推板前缘 XIXI 标牌的实际状态与几何（判据按计数比对，不看截图）。 */
@@ -815,11 +869,48 @@ interface ThreeGameTestHooks {
   /** 演出窗口内越线的分类累计（R4-4b 的「汇」）：见 `Game.showWindowCrossings`。 */
   showWindow?(): { crossings: number; foreign: number };
   /** 往钱包补筹码（测试/调试）：反复 `startRun` 会把钱包掏空，用例前先补满。 */
-  refillWallet?(amount?: number): { wallet: number; refilled: number };
+  refillWallet?(amount?: number): { balance: number; refilled: number };
+  /**
+   * 贷一笔款（S2）。返回**实际到账额** `applied`：到 `ceiling` 时它小于请求额、甚至为 0。
+   *
+   * ⚠️ 与 `refillWallet` 是**两个不同的钩子**，别合并：`refillWallet` 是脚本白发的钱
+   * （记进 `refilled`，钱包守恒式要减掉），`loan` 是机制借的钱（记进 `debt` / `loanedTotal`）。
+   * 合成一个就分不出「白给的」与「借的」，而 S2 的全部意义正在这个区别上。
+   */
+  loan?(amount?: number): {
+    applied: number;
+    balance: number;
+    debt: number;
+    ceiling: number;
+    loanedTotal: number;
+  };
+  /** 只读欠款状态（判据/调试用，不改任何账）。 */
+  debt?(): {
+    debt: number;
+    ceiling: number;
+    loanedTotal: number;
+    repaidThisRun: number;
+    offer: { amount: number; available: boolean; debt: number; ceiling: number };
+  };
+  /**
+   * 走一次「贷款续玩」（S3）。`applied=false` 表示什么都没发生（不在破产态，或欠款到顶）。
+   *
+   * ★ 判据用它验**盘面枚数不变**：这条路径不调 `startRun()`，
+   * 所以 `before.onDeck === after.onDeck` 必须逐枚成立；账上则要求
+   * `loaned` 与 `balance`（=`chips`，同一个数）**同时**加上同一个数，而 `initial` 不动
+   * ——恒等式不加项的那条设计就靠这里自证（S4 之前是「chips 与 buyIn 同时加」）。
+   */
+  loanToContinue?(): {
+    applied: boolean;
+    before: { onDeck: number; chips: number; loaned: number };
+    after: { onDeck: number; chips: number; loaned: number };
+    debt: number;
+    ceiling: number;
+  };
   /** 把钱包设成指定值：用来确定性构造「钱包见底」场景。 */
-  setWallet?(amount: number): { wallet: number; refilled: number };
+  setWallet?(amount: number): { balance: number; refilled: number };
   /** 图鉴与外观：解锁一个外观。 */
-  unlockSkin?(kind: string, id: string, cost: number): { unlocked: boolean; wallet: number };
+  unlockSkin?(kind: string, id: string, cost: number): { unlocked: boolean; balance: number };
   /** 图鉴与外观：选用一个已解锁的外观。 */
   selectSkin?(
     kind: string,
@@ -848,6 +939,8 @@ interface ThreeGameTestHooks {
       frontFaceZ: number;
       offset: number;
       phase: string;
+      /** 与 `Telemetry.FallOffEvent.source` 同一份口径；S1b 起床币也记。 */
+      source: 'player' | 'bed';
     }>;
     /** 掉进下水道的币（P10）：经济上「汇」的直接读数。 */
     drainEvents: Array<{
@@ -888,6 +981,10 @@ interface ThreeGameTestHooks {
       faces?: string[];
       /** 胡萝卜四连的实扣筹码（`fine` 才有）。 */
       fined?: number;
+      /** S5a 四同分档（3 / 4），只有 `win` 才有。 */
+      tier?: 3 | 4;
+      /** 胡萝卜四连罚不掉而转成欠款的那一截（S5b，`fine` 才有）。 */
+      debtAdded?: number;
       granted?: boolean;
       delivered?: number;
       t: number;
@@ -914,7 +1011,7 @@ interface ThreeGameTestHooks {
   /** XIXI 槽位映射（引擎纯函数）：判据枚举调用它收成集合，不在测试里手写分段。 */
   xixiSlot?(x: number): number;
   /** 装置规模表：判据写「实发 = 承诺」时读它，不手抄枚数（改配置不该弄红测试）。 */
-  showSpecs?(): Record<string, { count: number; min: number }>;
+  showSpecs?(): Record<string, { count: number; min: number; jackpot?: number }>;
   /**
    * 纯视觉币通道的读数（S16）。`reset = true` 时顺带清零统计。
    *
@@ -1006,7 +1103,14 @@ interface ThreeGameTestHooks {
    * `forced` 接受奖励符号（= 中奖四连）或 `'fine'`（胡萝卜四连）/ `'miss'`（杂牌）。
    * 奖励路径必须能逐一指定验证——靠权重随机去赌「摇到塔」是测不稳的。
    */
-  xixiSpin?(forced?: string): { kind: string; symbol?: string; faces: string[] } | null;
+  xixiSpin?(forced?: string, tier?: 3 | 4 | null): {
+    kind: string;
+    symbol?: string;
+    tier?: 3 | 4;
+    faces: string[];
+  } | null;
+  /** S5a 四同「力」的行程队列读数（发数 + 引擎侧那次排几发 + 每发追加比例）。 */
+  boostQueue?(): { strokes: number; jackpotStrokes: number; travelBonus: number };
   /** 滚筒窗读数（P10 判据读它，不读截图）。 */
   reelWindowReport?(): ThreeGameDiagnostics['reel'];
   /** 像素图标图集的读数：来源、尺寸、每格调色板大小、**每格底色**。 */

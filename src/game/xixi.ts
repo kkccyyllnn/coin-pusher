@@ -144,28 +144,61 @@ export function reelStripIndex(icon: IconId): number {
 // ── 结果表（P10） ────────────────────────────────────────────────────────
 
 /**
- * 一次摇奖的结果。**三分类**（用户拍板）：
- * - `win`  45%：四个滚筒停在同一奖励符号上（四连），按下面的符号权重分。
- * - `fine` 15%：四个滚筒停在胡萝卜上，**扣本局筹码**。
- * - `miss` 40%：四个滚筒各不相同（杂牌），不奖不罚。
+ * 一次摇奖的结果。
  *
- * ## 为什么不是「中奖/不中奖」两分类
+ * ## 三分类 → 四分段（S5a）
  *
- * 原话里「总中奖概率 45%」与「滚筒更随机一点」是两条要求：只做两分类的话，
- * 55% 的那一半要么全是胡萝卜（每次非奖即罚，太狠），要么四个滚筒永远同号
- * （画面完全不随机）。三分类让 40% 的杂牌承担「随机」、15% 的胡萝卜承担「惩罚」，
- * 两条要求同时成立，而且**三种结果在画面上各自一眼可辨**。
+ * 用户拍板过的是**三分类**（中奖 / 胡萝卜惩罚 / 杂牌），S5a 没有推翻它，
+ * 只是把「中奖」那一格在 **`roll` 轴上再切一刀**分成 3 同与 4 同（路线 A）：
+ * 老虎机仍然**精确吃 2 个 rng 值**（一次定分类、一次定内部细节），
+ * 所以逐事件对账、既有夹具与所有历史经济数据全部保持可比。
+ * 代价 = 4 同的图案由 `detailRoll` 在**四同池**里摇，池子比五符号小（见 `SLOT_TIER4_SYMBOLS`）。
+ *
+ * - `win3` 中奖三同：现在的奖励档（加力 / 演出，规模照旧）。
+ * - `win4` **四同大奖**：改变命运的那一摇，每个符号有自己的演出（见 `SlotMachine` 的奖励表）。
+ * - `fine` 胡萝卜四连：扣到 0 为止，扣不掉的转欠款（S5b）。
+ * - `miss` 杂牌：四格两两不同，不奖不罚。
+ *
+ * ## ★ 为什么权重是 43.5 / 1.5 / 15 / 40 而不是草稿建议的 20 / 1.5 / 3 / 65
+ *
+ * 计划里那组「起步建议」把中奖率从 45 % 砍到 21.5 %、胡萝卜从 15 % 砍到 3.4 %，
+ * 但它自己写在同一页上的**效果**是「+0.09~0.13 筹码/投，×1 回收 0.741 → ≈0.83（不点火）」
+ * —— 那个数只算了「新增一档大奖」，**没有算把原有中奖率砍掉一半半**。
+ * 两头一对质就露馅：照抄那组数会把回收率**往下**推，而用户 09-30 点的是「大奖与惩罚**加强**」。
+ * ⇒ 这里只动一件事：从中奖率里切出 1.5 % 给 4 同（稀有度按建议），
+ *   中奖总量与胡萝卜频率**一个都不动**，于是
+ *   ① 效果与计划写的那个期望一致；② S6 重标只需在这张表上做一次微调，不必整表重标。
+ *   ⚠️ 稀有度换算：4 同 = 1.5 % 的摇奖，而摇奖约 0.046 次/投 ⇒ **约每 1 450 投一次**
+ *   （典型局 74 投 ⇒ 平均 20 局才见一次）。这是「望不到头」的原意，不是 bug。
  */
+export type SlotTier = 3 | 4;
+
 export type SlotOutcome =
-  | { kind: 'win'; symbol: SlotSymbol }
+  | { kind: 'win'; symbol: SlotSymbol; tier: SlotTier }
   | { kind: 'fine' }
   | { kind: 'miss' };
 
-export const SLOT_OUTCOME_WEIGHTS = { win: 45, fine: 15, miss: 40 } as const;
+/**
+ * 结果权重表。**是权重不是百分数**（`outcomeTotalWeight()` 归一化），
+ * 所以加一档不用凑 100；判据读的是这张表本身（`slotOdds` 钩子把它吐出去）。
+ */
+export const SLOT_OUTCOME_WEIGHTS = { win3: 43.5, win4: 1.5, fine: 15, miss: 40 } as const;
 
-/** 摇奖结果的纯函数入口（判据枚举它，不在测试里手写分段）。 */
+/** 权重表的全部键（判据按它开计数桶 —— 加一档时测试不用改第二处）。 */
+export const SLOT_OUTCOME_KEYS = Object.keys(SLOT_OUTCOME_WEIGHTS) as (keyof typeof SLOT_OUTCOME_WEIGHTS)[];
+
+/** 对权重求和：`Object.values` 一次算完，**加一档不需要在这里补一项**（S5a 的教训写在上面）。 */
 export function outcomeTotalWeight(): number {
-  return SLOT_OUTCOME_WEIGHTS.win + SLOT_OUTCOME_WEIGHTS.fine + SLOT_OUTCOME_WEIGHTS.miss;
+  return Object.values(SLOT_OUTCOME_WEIGHTS).reduce((sum, weight) => sum + weight, 0);
+}
+
+/**
+ * 一个结果落在权重表的哪一格。**判据用它给枚举计数归桶**，
+ * 这样「分段」这件事在代码里只有一份（这里），测试不会写出第二份分段逻辑。
+ */
+export function outcomeWeightKey(outcome: SlotOutcome): string {
+  if (outcome.kind !== 'win') return outcome.kind;
+  return outcome.tier === 4 ? 'win4' : 'win3';
 }
 
 /**
@@ -173,7 +206,10 @@ export function outcomeTotalWeight(): number {
  *
  * ## 为什么「力」占大头，而不是五个符号均分
  *
- * 免费币预算是硬红线（见下面的 `FAUCET_BUDGET_PER_DROP`）：**只有加力与钻石
+ * 免费币预算是硬红线（见下面的 `FAUCET_BUDGET_PER_DROP`）：**只有「加力」不往盘面加质量**（它给的是行程，不是币）。
+ * ⚠️ 旧写法把「钻石」也算进"不加质量"，那是脱钩：`SHOW_SPECS.diamond.count = 1`，
+ *   钻石是**一枚真币**（固定 25 筹码面值，见 `ShowDirector.ts` 的 diamond 注释），要玩家把它推过得分线才兑现 ⇒ 它进水量账。
+ *   塔 / 泉 / 箱 / 钻 每发一枚都直接抬高回收率，差别只在规模（塔 16→40、泉 10、钻 1、箱 1 + 一圈**视觉币**）。
  * 不往盘面加质量**，塔 / 泉 / 箱 每发一枚都直接抬高回收率。
  * 45% 的中奖率 × 均分 × 阵型规模（塔 16 枚）会算出约 **3 枚/投**的水量——
  * 是红线的 **75 倍**，盘面会瞬间肥到局不终局（§5.7 的「点火」）。
@@ -187,13 +223,24 @@ export function outcomeTotalWeight(): number {
  *
  * 展开就是 `0.45 × (6/45) × 16` —— **`0.45` 与分母 `45` 恰好约掉**，
  * 结果等于 `0.06 × 16`。以前的注释写成 `0.45 × (0.06 × 16 + …)`，
- * 把中奖率**乘了两次**，于是水量被低估约 2.2 倍（记 0.068 枚/投，实际约 0.15）。
+ * 把中奖率**乘了两次**，于是水量被系统性低估。⚠️ 这里原先补的一句「实际约 0.15 枚/投」**同样没有真源**：
+ *   本文件下方那份唯一算式（箱按 `count = 1`）乘上分段摇/投 0.00598~0.01533，得到的是 **0.017~0.043 枚/投**，
+ *   0.15 要成立得假设一个高得多的频率或每摇水量 ⇒ 已作废为「待测」，等 ① `delivered`（实发枚数）与 ② `granted===false`
+ *   占比两数到手再定档。**定档前不要引用 0.068 也不要引用 0.15。**
  * 这个低估直接导致 S10 给「加力存满」加了个 3 枚的兜底演出时，
  * 没人预料到它本身就是一条可观的源（+0.78 枚/摇奖）。
  *
- * 现档（力 26 / 钻 7 / 塔 20 / 泉 11 / 箱 6，合计 70）：
- *   塔 0.45×20/70×16 = 2.057 · 泉 0.45×11/70×10 = 0.707 · 箱 0.45×6/70×8 = 0.309
- *   → **3.073 枚/摇奖**。
+ * 现档（符号权重取自本文件 `SLOT_SYMBOL_WEIGHTS`＝力 26/钻 7/塔 20/泉 11/箱 6，合计 70；
+ *   枚数取自 `SHOW_SPECS`：塔 16、泉 10、**箱 1**（`chest.count` 早先是 8，`kinds.ts` 第 268 行记的『8 → 1』就是它）：
+ *   塔 0.45×20/70×16 = 2.057 · 泉 0.45×11/70×10 = 0.707 · 箱 0.45×6/70×**1** = **0.039**
+ *   → **约 2.80 枚/摇奖**（旧写法按箱 8 枚算成 3.073，把这条源高估了 ~10 %）。
+ *
+ * ★ 这段是**全项目唯一的一份水量算式**（`ShowDirector.ts` 与 `FAUCET_BUDGET_PER_DROP` 那两处已降级成指向这里的指针）。
+ *   要改成『每投』口径得乘摇/投频率，而摇/投是**分段实测**、段间差 2.56 倍：
+ *     · 段1 = 0.01533 ⇒ ≈ 0.043 枚/投；· 段2 = 0.00598 ⇒ ≈ 0.017 枚/投；红线 `FAUCET_BUDGET_PER_DROP = 0.04`。
+ *   ⇒ 结论只能写成**区间 [0.42, 1.07] × 红线**（跨线），不能写成任何单点；再加力存满兜底（gate 3 枚，另一条源）会把它推得更高。
+ *   ⚠️ 尚未测的两项会让区间收窄或改向：① `xixiEvents.reward.delivered`（实发枚数，名义只是上界）
+ *     ② `granted === false` 的占比（定兜底频率）。accept 场景当前 0 样本 ⇒ 补齐前**别照任何点值定档**。
  *
  * ## 逐轮实测（`ECON_RUNS=6`，见 PLAN-v4 §10.7 的 S11 表）
  *
@@ -259,18 +306,40 @@ export function rollWinSymbol(roll: number): SlotSymbol {
 }
 
 /**
+ * 有「四同大奖演出」的符号池（S5a）。
+ *
+ * ★ **泉不在池里**，这不是漏写：计划的四同表只给了力/塔/钻/箱四个效果，
+ *   泉没有第四档的画法。若让泉也进池，它摇到四同时只能回落去演三同那一档 ——
+ *   那正是本项目最讨厌的「承诺了但没发生」的形状（`miss` 落进 `win` 分支同一类错）。
+ *   所以 4 同从这四个里摇，泉只有 3 同。
+ */
+export const SLOT_TIER4_SYMBOLS: readonly SlotSymbol[] = ['boost', 'tower', 'diamond', 'chest'];
+
+/** 四同池内**等权**（不加第三张表）：稀有度由 `win4` 那一档整体控制，符号内部不再分层。 */
+export function rollWinTier4Symbol(roll: number): SlotSymbol {
+  const index = Math.floor(clamp01(roll) * SLOT_TIER4_SYMBOLS.length);
+  return SLOT_TIER4_SYMBOLS[Math.min(SLOT_TIER4_SYMBOLS.length - 1, index)];
+}
+
+/**
  * 摇一次奖：先定**结果分类**，再定分类内部的细节。
  *
- * 街机老虎机的标准做法——**先定结果、再演停格**。`roll` 决定分类，
+ * 街机老虎机的标准做法——**先定结果、再演停格**。`roll` 决定落在权重表的哪一格，
  * `detailRoll` 决定「中奖摇哪个符号」或「杂牌停哪四格」（两者互斥，所以一个够用）。
+ *
+ * ★ S5a 把中奖格在 `roll` 轴上切成 3同/4同两段（路线 A）⇒ **rng 消耗次数一个字没改**，
+ *   同一种子跑出来的序列与切档之前逐摇可比；变的只是每段占多宽。
  */
 export function rollSlotOutcome(roll: number, detailRoll: number): SlotOutcome {
-  const total = outcomeTotalWeight();
-  const value = clamp01(roll) * total;
-  if (value < SLOT_OUTCOME_WEIGHTS.win) {
-    return { kind: 'win', symbol: rollWinSymbol(detailRoll) };
+  const { win3, win4, fine } = SLOT_OUTCOME_WEIGHTS;
+  const value = clamp01(roll) * outcomeTotalWeight();
+  if (value < win3) {
+    return { kind: 'win', tier: 3, symbol: rollWinSymbol(detailRoll) };
   }
-  if (value < SLOT_OUTCOME_WEIGHTS.win + SLOT_OUTCOME_WEIGHTS.fine) {
+  if (value < win3 + win4) {
+    return { kind: 'win', tier: 4, symbol: rollWinTier4Symbol(detailRoll) };
+  }
+  if (value < win3 + win4 + fine) {
     return { kind: 'fine' };
   }
   return { kind: 'miss' };
@@ -327,7 +396,8 @@ export const SLOT_PENALTY_CHIPS = 6;
  * 所以免费币超过 ~0.11 枚/投就会把回收率顶过 1 → 局不终局（点火）。
  * 留一倍余量取 **0.04**。
  *
- * ⚠️ **P10 起现档水量已经高于这条线**（见 `SLOT_SYMBOL_WEIGHTS` 的推导：约 0.068 枚/投）。
+ * ⚠️ **P10 起现档水量已经在红线量级上**（口径见本文件 `SLOT_SYMBOL_WEIGHTS` 那段唯一算式：
+ *   按分段摇/投得 ≈ 0.017~0.043 枚/投，红线 0.04 落在区间内 ⇒ **单点比较没有意义**，要按源与汇的净差成对验证）。
  * 红线本身没有失效，是**新增了汇**（`DRAIN` 的两侧排水槽 + 得分线两端下水道）来买回余量。
  * 所以这条常量现在的正确用法是「**源与汇的净差**要落在这条线以下」，
  * 而不是「源单独不许超线」——判据仍然是 `economy` 的回收率 < 1 与「局必须终局」。

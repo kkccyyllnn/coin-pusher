@@ -33,6 +33,13 @@ export type ShowRequestOptions = {
   kind?: CoinKind;
   /** 落点中心 x（默认 0）。 */
   x?: number;
+  /**
+   * S5a 四同大奖：允许把承诺数放到 `SHOW_SPECS[id].jackpot` 那一档高度，
+   * 并让演出自己走「更长的仪式时间轴」（塔逐层停格、宝箱喷一圈视觉币）。
+   * ⚠️ 它**只是上限**，不是保证：预算（`coins.remaining`）该降级照样降级，
+   *   降级如实记进 `downgraded` 与 completed 事件的 `spawned`。
+   */
+  jackpot?: boolean;
 };
 
 export type ShowResult = {
@@ -110,7 +117,16 @@ const MAX_QUEUE = 4;
  * tower 的 count 不必是 4 的倍数（`TowerShow` 按承诺数硬停发，最后一层可以是半层）；
  * min 保留 2 是为了留出降级交付窗口（余量不够一整场时交半场）。
  */
-const SHOW_SPECS: Record<ShowId, { count: number; min: number }> = {
+/**
+ * 每场演出的规模。
+ *
+ * `jackpot` 是 **S5a 四同大奖的上限**（不是默认值）：`request(id, {jackpot: true})`
+ * 允许把承诺数放到这个高度，普通中奖仍然封顶在 `count`。
+ * 刻意**只给塔填**（16 → 40）：另外三个符号的大奖不靠枚数取胜 ——
+ * 力走推板行程（见 `RULES.jackpotBoostStrokes`），钻/箱走仪式与闪色（见 `SlotMachine` 的
+ * 四同分支）。往盘面上加质量的那一档只此一处，水量账因此好对账。
+ */
+const SHOW_SPECS: Record<ShowId, { count: number; min: number; jackpot?: number }> = {
   /**
    * ★ **P10 起回到「阵型规模」**（用户拍板 #8）。
    *
@@ -119,9 +135,11 @@ const SHOW_SPECS: Record<ShowId, { count: number; min: number }> = {
    * 所以每一枚免费币都直接顶回收率，只能给到个位数。
    *
    * P10 换了前提：老虎机变成 **45% 中奖 / 15% 胡萝卜惩罚 / 40% 杂牌**，
-   * 奖励是「看得见的大场面」而不是「涓涓细流」——总量靠**降低频率**（中奖符号权重
-   * 力 26 / 钻 7 / 塔 6 / 泉 4 / 箱 2）压下来，单次规模则放大到阵型规模。
-   * 期望水量 ≈ 0.45 × (0.06×16 + 0.04×10 + 0.02×8) ≈ **0.75 枚/摇奖 ≈ 0.068 枚/投**。
+   * 奖励是「看得见的大场面」而不是「涓涓细流」——总量靠**降低频率**、单次规模放大到阵型规模。
+   * ⚠️ 这里原本抄了一份自己的水量算式，用的是**旧符号权重表**（塔 6/泉 4/箱 2 是 45/54 归一化那版）
+   *   并且把中奖率乘了两次 ⇒ 得出「0.068 枚/投」这种低估数。口径已错位两轮，**删掉不再重算**。
+   * ⇒ 水量的唯一算式在 `xixi.ts` 的 `SLOT_SYMBOL_WEIGHTS` 注释里（含箱=1 的现档与摇/投分段区间）；
+   *   本表只负责「一次演出放几枚」（`SHOW_SPECS`），改这里就是改那份算式的一个因子。
    *
    * ⚠️ **这仍然高于 `FAUCET_BUDGET_PER_DROP = 0.04` 约 1.7 倍**——
    * 余量是靠 P10 新增的**汇**（两侧排水槽 + 得分线两端下水道）买回来的。
@@ -129,7 +147,10 @@ const SHOW_SPECS: Record<ShowId, { count: number; min: number }> = {
    * 只放大源不装汇 → `economy` 的回收率会被顶过 1 → 整局不终局（点火）。
    */
   // 塔 16 枚 = 4 层 × 2×2，柱高 4×(2×0.01+0.004) ≈ 0.096 米。
-  tower: { count: 16, min: 4 },
+  // ★ 四同 = 10 层 × 2×2 = 40 枚（plan S5a「中央巨塔 16 → 40」）。
+  //   柱高 10 × 0.024 ≈ 0.24 米；层距由 `layerStep()` 从**碰撞体高度**派生，
+  //   所以放大层数不会引来自我重叠（S16 那个坑的防法本身就在这条链上）。
+  tower: { count: 16, min: 4, jackpot: 40 },
   // chest 复用 `TowerShow`。
   // ★ S16：从 8 枚（2 层 × 2×2）降到 **1 枚** —— 用户拍板「降到 1 个宝箱」。
   //
@@ -176,7 +197,7 @@ const SHOW_SPECS: Record<ShowId, { count: number; min: number }> = {
  *
  * - 复用 `gate`（闸门落币）而不是新造装置：它本来就是「庄家补货」的载体，
  *   语义贴合，且**零新增 draw call**（装置几何是演出期临时挂载的）。
- * - `count: 3` 取 `gate.min`：兜底应当**小于**一次正常奖励（泉 10 / 箱 8），
+ * - `count: 3` 取 `gate.min`：兜底应当**小于**一次正常奖励（泉 10 / **箱 1**，S16 从 8 降到 1，见 `SHOW_SPECS.chest`；塔 16 / 钻 1 也都是真币），
  *   否则「存满」反而比「用掉」划算，玩家会故意囤积。
  *   3 枚约合 3.9 筹码期望，比一次加力（多推一程）略低——方向是对的。
  */
@@ -283,7 +304,12 @@ export class ShowDirector {
    * 脚本里写死 `promised === 1` 的话，S6 把塔从 1 改到 16 就会变成假红
    * （它其实只是配置变了）。让判据枚举引擎函数，改配置不用改测试。
    */
-  static showSpecs(): Record<ShowId, { count: number; min: number }> {
+  /**
+   * 规模表读数（判据从引擎读，不抄第二份）。
+   * ★ S5a 带上 `jackpot`：四同那一档的**期望枚数**也必须能从引擎读，
+   *   否则「塔四同 = 40 枚」这条判据就只能把 40 写死在脚本里。
+   */
+  static showSpecs(): Record<ShowId, { count: number; min: number; jackpot?: number }> {
     return SHOW_SPECS;
   }
 
@@ -309,7 +335,9 @@ export class ShowDirector {
    */
   request(id: ShowId, opts: ShowRequestOptions = {}): ShowResult {
     const spec = SHOW_SPECS[id];
-    const wanted = Math.max(spec.min, Math.min(opts.count ?? spec.count, spec.count));
+    // ★ 大奖档位只抬高**上限**，其余口径（min 兜底、预算降级）一个字不变。
+    const ceiling = opts.jackpot ? (spec.jackpot ?? spec.count) : spec.count;
+    const wanted = Math.max(spec.min, Math.min(opts.count ?? ceiling, ceiling));
 
     if (this.queue.length >= MAX_QUEUE) {
       return this.refuse(id, wanted, '演出排队中，等上一场演完');
@@ -327,7 +355,8 @@ export class ShowDirector {
 
     const kind = opts.kind ?? 'bronze';
     const x = opts.x ?? 0;
-    this.queue.push(() => this.createShow(id, promised, downgraded, kind, x));
+    const jackpot = opts.jackpot === true;
+    this.queue.push(() => this.createShow(id, promised, downgraded, kind, x, jackpot));
     this.deps.telemetry.recordShow({
       id,
       phase: 'registered',
@@ -398,16 +427,23 @@ export class ShowDirector {
     return { ok: false, id, promised: 0, downgraded: false, reason };
   }
 
-  private createShow(id: ShowId, promised: number, downgraded: boolean, kind: CoinKind, x: number): Show {
+  private createShow(
+    id: ShowId,
+    promised: number,
+    downgraded: boolean,
+    kind: CoinKind,
+    x: number,
+    jackpot: boolean,
+  ): Show {
     switch (id) {
       case 'fountain':
-        return new FountainShow(this.deps, this.group, id, promised, downgraded, kind, x);
+        return new FountainShow(this.deps, this.group, id, promised, downgraded, kind, x, jackpot);
       case 'gate':
       case 'diamond':
-        return new GateShow(this.deps, this.group, id, promised, downgraded, kind, x);
+        return new GateShow(this.deps, this.group, id, promised, downgraded, kind, x, jackpot);
       case 'chest':
       case 'tower':
-        return new TowerShow(this.deps, this.group, id, promised, downgraded, kind, x);
+        return new TowerShow(this.deps, this.group, id, promised, downgraded, kind, x, jackpot);
     }
   }
 
@@ -445,6 +481,13 @@ abstract class TimedShow implements Show {
     readonly downgraded: boolean,
     protected readonly kind: CoinKind,
     protected readonly x: number,
+    /**
+     * S5a 四同大奖的仪式标记。子类各自决定它**多演什么**：
+     * 目前只有 `TowerShow` 用（宝箱大奖喷一圈视觉币 + 拉长节拍），
+     * `GateShow` / `FountainShow` 拿到它是**故意什么都不做**——
+     * 那两档的枚数没有 jackpot 上限（见 `SHOW_SPECS` 的注释），加戏等于加水量。
+     */
+    protected readonly jackpot = false,
   ) {}
 
   /** 子类的时间轴总长（未压缩）。 */
@@ -640,6 +683,12 @@ class TowerShow extends TimedShow {
   private static readonly COLUMN_Z = 0.3;
 
   /**
+   * 四同宝箱出场喷的**视觉币**枚数（S5a）。纯渲染，不进 `CoinPool`、不进账本，
+   * 所以这个数不影响任何经济读数 —— 它买的是「看一眼就知道这不是一般的一摇」。
+   */
+  private static readonly JACKPOT_SPRAY_COUNT = 12;
+
+  /**
    * 懒建 kinematic 柱体。**第一帧 `tick` 才建**，不在 `ShowDirector` 构造期建：
    * 演出是按需的，构造期建等于每局都往世界里塞一根没人看的柱子。
    *
@@ -715,6 +764,24 @@ class TowerShow extends TimedShow {
       while (this.spawnedLayers < dueLayer) {
         this.spawnLayer(this.spawnedLayers, topY);
         this.spawnedLayers += 1;
+        /*
+         * ★ S5a 宝箱四同的「不一样出场」：**只加视觉，不加碰撞体**。
+         *
+         * 为什么用 `CoinSpray` 而不是多给几个宝箱：用户 09-30 明确拍板**不做宝箱雨**，
+         * 而理由不是审美 —— 多枚巨型宝箱同层重叠就是求解器注入能量（R4-P3 修过的同一类，
+         * 宝箱碰撞体高 224 mm，层距稍小就互相插进一半）。所以要堆的是**仪式感**而不是数量：
+         * 缩放/旋转入场（既有时间轴）+ 这一圈纯渲染的溢币 + 全屏金闪（`SlotMachine` 那侧的
+         * `climax`）+ 招牌屏开奖字幕（`notify` 已经把文案推给 `marqueeScreen().subtitle`）。
+         * 四样里三样是现成的，新增的这一样 `burst()` **不进 `CoinPool`、不进账本**
+         * （见 `ShowDeps.spray` 的警告），所以 `economy` 的回收率读数一个字都不动。
+         */
+        if (this.jackpot && this.kind === 'chest' && this.spawnedLayers === 1) {
+          this.deps.spray?.burst(
+            TowerShow.JACKPOT_SPRAY_COUNT,
+            { x: this.x, y: 0.12, z: TowerShow.COLUMN_Z },
+            this.deps.rng,
+          );
+        }
       }
     }
     const centerY = topY - this.topHeight() / 2;
@@ -961,7 +1028,9 @@ class GateShow extends TimedShow {
    * 一枚币都够不到，现在**正立在落点带里**——
    *   闸板 z ∈ [−1.268, −1.232]（深 `COIN_DIAMETER / 4`），
    *   落币脚印（半径 0.072）覆盖 `z_c ∈ [−1.25, −1.15]` 的 **90%**，
-   *   而币被摩擦拖出这条带要 **~7 秒**（26 毫米/循环）⇒ 玩家一在投币，
+   *   而币被摩擦拖出这条带要 **~7 秒**（⚠️ 这个 7 秒是用 **S13 破对称期**的 26 毫米/循环推出来的：
+   *     出厂态对称时 `probe` 净漂移 **−0.25 毫米/循环**（上限 2.32）⇒ 摩擦几乎不拖行，
+   *     所以 7 秒只能读成「破对称态下会这么快」，不是出厂态的保证。口径详见 `kinds.ts` 标定史第 5 轮。）⇒ 玩家一在投币，
    *   闸板「滑下」那 0.35 秒几乎每场演出都会扫过一枚静置币。
    * 所以闭闸下沿必须 ≥ 币顶 `pusherTopY + 2 × halfThickness`，否则就是穿模。
    *

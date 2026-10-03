@@ -223,7 +223,8 @@ export class Pusher {
   private phaseTime = 0;
   private offsetZ = 0;
   private travelForStroke: number = TABLE.pusherTravel;
-  private boostQueued = false;
+  /** 待发的加长行程**次数**（S5a：玩家加力最多排 1 发，四同大奖排 N 发）。 */
+  private boostStrokes = 0;
   /**
    * 演出期「停在回收位」的闸门（见 `park` / `resume`）。
    * 它**不是** `running` 的别名：`running=false` 是「这局还没开始/已经收工」，
@@ -356,24 +357,45 @@ export class Pusher {
     this.offsetZ = 0;
     this.velocityZ = 0;
     this.travelForStroke = this.travel;
-    this.boostQueued = false;
+    this.boostStrokes = 0;
     this.cyclesCompleted = 0;
     this.applyTransform(true);
   }
 
   /** 请求在下一次完整前推上追加行程。返回 false 表示已有一发待用。 */
   requestBoost(): boolean {
-    if (this.boostQueued) return false;
-    this.boostQueued = true;
+    if (this.boostStrokes > 0) return false;
+    this.boostStrokes = 1;
     return true;
   }
 
+  /**
+   * 排队 **N 发连续加长行程**（S5a 四同「力」）。
+   *
+   * 与 `requestBoost()` 的区别只有一件：它**不去重、不拒绝**。玩家的按钮必须去重
+   * （存一发与存十发的观感差别太大，且 `boostStoreCap = 1` 就是为此存在的），
+   * 而大奖的语义本来就是「多」——所以它是另一个动作，不是同一个动作的另一种调法。
+   *
+   * ⚠️ 一发 = 一次完整的「加长前推 + 回撤」，**不是一次性把行程乘 N**：
+   *   推板立面一程只能推到 `+0.27` 米，够不着币床后界，多喂几段才能把后排往前带。
+   * @returns 排完之后待用的总发数（调用方要拿它记账，别拿请求额当实发额）。
+   */
+  queueJackpotPush(strokes: number): number {
+    this.boostStrokes += Math.max(0, Math.round(strokes));
+    return this.boostStrokes;
+  }
+
+  /** 待发的加长行程次数（S5a 之后「有没有一发加力」不再是个布尔）。 */
   get pendingBoost(): boolean {
-    return this.boostQueued;
+    return this.boostStrokes > 0;
+  }
+
+  get pendingBoostStrokes(): number {
+    return this.boostStrokes;
   }
 
   cancelBoost(): void {
-    this.boostQueued = false;
+    this.boostStrokes = 0;
   }
 
   get currentPhase(): PusherPhase {
@@ -435,9 +457,11 @@ export class Pusher {
 
       if (this.phase === 'extend') {
         this.travelForStroke = this.travel;
-        if (this.boostQueued) {
+        if (this.boostStrokes > 0) {
           this.travelForStroke = this.travel * (1 + this.boostTravelBonus);
-          this.boostQueued = false;
+          // 一次吃掉**一发**（S5a 之后这里是计数而不是布尔）：大奖排的四发会
+          // 在连续四个循环里逐一兑现，而不是叠成一次超长行程。
+          this.boostStrokes -= 1;
           tick.boostConsumed = true;
         }
       }

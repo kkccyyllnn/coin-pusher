@@ -63,7 +63,7 @@ const SCANLINE = 'rgba(0, 0, 0, 0.35)';
 const BRASS = '#ffd88a';
 const DIM = '#7f8a76';
 
-export type MarqueeLedger = { wallet: number; earned: number };
+export type MarqueeLedger = { balance: number; earned: number };
 
 export class MarqueeScreen {
   readonly texture: THREE.CanvasTexture;
@@ -84,7 +84,7 @@ export class MarqueeScreen {
   private readonly probeCtx: CanvasRenderingContext2D;
   /** 当前纹素宽度（高度固定为 `H`，宽度由面板实际宽高比反推）。 */
   private width = DEFAULT_WIDTH;
-  private ledger: MarqueeLedger = { wallet: 0, earned: 0 };
+  private ledger: MarqueeLedger = { balance: 0, earned: 0 };
   private subtitleText = '';
   private subtitleLeft = 0;
   private repaintLeft = 0;
@@ -173,7 +173,7 @@ export class MarqueeScreen {
    * `Math.max(best, earned)`，屏上再算一遍就是第二份真源（改一处忘一处，且没有任何判据会红）。
    */
   pushLedger(ledger: MarqueeLedger): void {
-    if (ledger.wallet === this.ledger.wallet && ledger.earned === this.ledger.earned) return;
+    if (ledger.balance === this.ledger.balance && ledger.earned === this.ledger.earned) return;
     this.ledger = { ...ledger };
     this.dirty = true;
   }
@@ -229,7 +229,7 @@ export class MarqueeScreen {
 
   /** 第一行：钱包 / 本段赚进。数字用千分位以外的一致性格式——点阵上逗号会糊。 */
   private line1(): string {
-    return `钱包 ${this.ledger.wallet}  本局 +${this.ledger.earned}`;
+    return `余额 ${this.ledger.balance}  本段 +${this.ledger.earned}`;
   }
 
   /**
