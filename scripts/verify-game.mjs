@@ -7346,12 +7346,16 @@ async function runHooksGuard(page, context) {
     );
   }
 
-  // ── M0-b：dispose() 必须释放每一个"会注册 window 监听器"的子系统（清单派生，不手抄）──
-  const disposeMatch = gameSrc.match(/\n {2}dispose\(\): void \{([\s\S]*?)\n {2}\}/);
-  const disposeBody = disposeMatch ? disposeMatch[1] : '';
-  const importStatements = gameSrc.match(/^import[\s\S]*?from\s+'[^']+';$/gm) ?? [];
-  const needsDispose = [];
-  for (const statement of importStatements) {
+  // ── M0-b：dispose() 必须调用每一个"自己实现了 dispose() 且被 Game 持有成字段"的子系统 ──
+  // ★ 派生规则踩过两次坑，都写在这儿免得再犯：
+  //   ① 只匹配 `x: ClassName` 会漏掉本项目最常见的 `private readonly hud = new Hud()`（无类型标注）
+  //      与 `private readonly x: X` 这类**双修饰符**声明 ⇒ 网小到只剩 1 个候选，此时"0 缺失"是假绿。
+  //   ② 只找 `dispose(): void;` 会把**接口声明**（`interface Show { dispose(): void; }`）算成实现
+  //      ⇒ 必须要求带函数体 `dispose(): void {`。
+  //   ③ 候选数为 0 一律报红（探针失效不等于没有泄漏）。
+  const disposeBody = (gameSrc.match(/\n {2}dispose\(\): void \{([\s\S]*?)\n {2}\}/) ?? [])[1] ?? '';
+  const classImplementsDispose = new Map(); // 类名 → 它自己文件里的 addEventListener 数（只为多打一句现场）
+  for (const statement of gameSrc.match(/^import[\s\S]*?from\s+'[^']+';$/gm) ?? []) {
     const spec = (statement.match(/from\s+'([^']+)'/) ?? [])[1];
     if (!spec || !spec.startsWith('.')) continue;
     let target = resolve(gamePath, '..', spec);
@@ -7360,33 +7364,52 @@ async function runHooksGuard(page, context) {
     try {
       moduleSrc = await fs.readFile(target, 'utf8');
     } catch {
-      continue; // 目录/非模块说明符：不是子系统字段，跳过
+      continue; // 目录 / 非模块说明符：不是子系统字段
     }
-    const declaresDispose = /\n {2}(?:public )?dispose\(\)/.test(moduleSrc);
-    const registersWindowListener = /window\.addEventListener/.test(moduleSrc);
-    if (!declaresDispose || !registersWindowListener) continue;
     const names = (statement.match(/\{([^}]*)\}/) ?? [null, ''])[1]
       .split(',')
       .map((entry) => entry.trim().split(/\s+as\s+/)[0])
       .filter(Boolean);
     for (const typeName of names) {
-      const fieldRe = new RegExp(`\\n {2}(?:private |readonly |protected )?([a-zA-Z]+)\\s*:\\s*${typeName}\\b`, 'g');
-      for (const found of gameSrc.matchAll(fieldRe)) {
-        const field = found[1];
-        if (!new RegExp(`this\\.${field}\\??\\.dispose\\(`).test(disposeBody)) {
-          needsDispose.push(`${field}: ${typeName}（注册了 window 监听器，dispose() 里没调用它）`);
-        }
-      }
+      const at = moduleSrc.search(new RegExp(`class ${typeName}\\b`));
+      if (at < 0) continue;
+      const rest = moduleSrc.slice(at);
+      const nextClass = rest.search(/\n(?:export )?(?:abstract )?class /);
+      const body = nextClass > 0 ? rest.slice(0, nextClass) : rest;
+      if (!/\n {2}(?:public )?dispose\(\): void \{/.test(body)) continue;
+      classImplementsDispose.set(typeName, (body.match(/addEventListener/g) ?? []).length);
+    }
+  }
+  const MOD = String.raw`(?:(?:private|public|protected|readonly)\s+)*`;
+  const fieldTypes = [];
+  for (const found of gameSrc.matchAll(new RegExp(`\\n {2}${MOD}([a-zA-Z]+)\\s*:\\s*([A-Za-z][\\w.]*)(?:\\s*\\|\\s*null)?[;=]`, 'g'))) {
+    fieldTypes.push({ name: found[1], type: found[2].split('.').pop() ?? found[2] });
+  }
+  for (const found of gameSrc.matchAll(new RegExp(`\\n {2}${MOD}([a-zA-Z]+)\\s*=\\s*new\\s+([A-Za-z][\\w.]*)\\(`, 'g'))) {
+    fieldTypes.push({ name: found[1], type: found[2].split('.').pop() ?? found[2] });
+  }
+  const needsDispose = [];
+  const examined = []; // 派生循环里顺手数：零候选=探针失效，绝不能报绿
+  const seenFieldNames = new Set();
+  for (const field of fieldTypes) {
+    if (seenFieldNames.has(field.name)) continue;
+    seenFieldNames.add(field.name);
+    if (!classImplementsDispose.has(field.type)) continue;
+    examined.push(`${field.name}: ${field.type}`);
+    if (!new RegExp(`this\\.${field.name}\\??\\.dispose\\(`).test(disposeBody)) {
+      needsDispose.push(`${field.name}: ${field.type}（dispose() 里没调用它）`);
     }
   }
   check(
-    'M0 Game.dispose() 释放了每一个会注册 window 监听器的子系统（清单由源码派生）',
-    disposeBody.length > 0 && needsDispose.length === 0,
+    'M0 Game.dispose() 调用了每个自己实现 dispose() 的子系统字段（清单由源码派生）',
+    disposeBody.length > 0 && needsDispose.length === 0 && examined.length > 0,
     disposeBody.length === 0
       ? '🔴 没找到 dispose() 方法体 ⇒ 探针失效，不是"没有泄漏"'
-      : needsDispose.length === 0
-        ? '派生出的待释放清单已全部被释放'
-        : `缺 ${needsDispose.length} 件：${needsDispose.join('；')}`,
+      : examined.length === 0
+        ? '🔴 派生出的待查清单是**空的** ⇒ 这条门什么都没在看（零命中先怀疑探针，不报绿）'
+        : needsDispose.length === 0
+          ? `查了 ${examined.length} 个候选字段，全部已被释放（${examined.join(' / ')}）`
+          : `查了 ${examined.length} 个候选字段，缺 ${needsDispose.length} 件：${needsDispose.join('；')}`,
   );
 
   // ── M1：读数 census（结构逐字节比；不稳定字段的值不比，名单由两遍连拍派生）──

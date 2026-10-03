@@ -646,8 +646,19 @@ export class Game {
     this.input.dispose();
     this.audio.dispose();
     this.debugTools.dispose();
+    // 模型模式（S24）注册了 5 个 window 监听器（pointerdown/move/up/wheel/keydown），
+    // 它的清理函数一直写好了却没人调 ⇒ HMR 每热换一次就留一套监听器。
+    // 这条由 `hooks` 模式的 M0 结构门盯着：清单是从源码派生的（声明了 dispose() 且注册了
+    // window 监听器的类 ⇒ 被 Game 持有成字段就必须被 dispose() 调用），不是手抄名单。
+    this.modelMode?.dispose();
     this.coins.dispose();
     this.mechanismShows.dispose();
+    // 演出导演与背板老虎机：两者的 `dispose()` 都是给自己拆资源用的
+    // （`ShowDirector.ts:409` 的注释直接写着「停手清理（dispose 游戏实例时）」，
+    //   `SlotMachine.ts:287` 释放滚筒几何 + 自建的那批贴图），但 Game 拆的时候没人调。
+    // 这两处不是人工看出来的，是 `hooks` 模式 M0-b 的派生清单点出来的（候选 10 个、缺 2 个）。
+    this.shows.dispose();
+    this.slotMachine.dispose();
     // 视觉币通道（S16）：它自带一份圆柱几何与一份材质，**不是**币池的资源，
     // 所以要单独释放 —— 漏了这一行会在重开游戏时漏掉几何体与一张贴图。
     this.spray.dispose();
@@ -655,6 +666,11 @@ export class Game {
     // 不释放就是重开一局漏一整帧的显存 —— 这类泄漏 `renderer.info` 看不出来。
     this.gbuffer.dispose();
     this.finalPass.dispose();
+    // 机台外壳的几何：`disposeCabinetShell()` 是它的唯一释放入口（此前只被模型模式的重建用），
+    // 整个 Game 拆掉时没人调 ⇒ 外壳那批 BufferGeometry 一直挂着。
+    // ⚠️ **只释放几何、不碰材质/纹理**：机柜材质是模块单例缓存（`TableBuilder.cabinetMaterials()`），
+    //    把它一起 dispose 会让换肤/重开读到已释放的贴图。
+    if (this.cabinetShell) disposeCabinetShell(this.cabinetShell);
     this.renderer.dispose();
     window.__THREE_GAME_DIAGNOSTICS__ = undefined;
     window.__THREE_GAME_TEST_HOOKS__ = undefined;
