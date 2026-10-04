@@ -7415,12 +7415,16 @@ async function runHooksGuard(page, context) {
   const gamePath = resolve(REPO_ROOT, 'src/game/Game.ts');
   const gameSrc = await fs.readFile(gamePath, 'utf8');
   for (const name of ['__THREE_GAME_TEST_HOOKS__', '__THREE_GAME_DIAGNOSTICS__']) {
-    const assigns = (gameSrc.match(new RegExp(`window\\.${name} = \\{`, 'g')) ?? []).length;
+    // ★ 数的是「装配点」而不是「字面量开头的形状」：S4 之后诊断全局的右边是 `diagSnapshot.build(...)`，
+    //   如果判据写成只认 `= {`，搬运会把门本身弄哑（10-04 真就这么红了一次，报的是门、不是代码）。
+    const total = (gameSrc.match(new RegExp(`window\\.${name} =`, 'g')) ?? []).length;
     const clears = (gameSrc.match(new RegExp(`window\\.${name} = undefined`, 'g')) ?? []).length;
+    const assigns = total - clears;
     check(
       `M0 ${name}：装配点唯一且 dispose 里撤销`,
       assigns === 1 && clears >= 1,
-      `赋值 ${assigns} 处（要求恰好 1）、置 undefined ${clears} 处（要求 ≥1）⇒ 多出的赋值点就是第二真源`,
+      `赋值 ${assigns} 处（要求恰好 1，右边可以是字面量也可以是 build(...)）、置 undefined ${clears} 处（要求 ≥1）` +
+        '⇒ 多出的赋值点就是第二真源',
     );
   }
 
