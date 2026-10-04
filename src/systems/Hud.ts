@@ -99,6 +99,38 @@ export class Hud {
 
   private lastComboShown = 0;
   private lastBoostCharges = 0;
+  /**
+   * XIXI `aria-label` 的签名。四槽亮灭没变就不必重建那串 `X已亮 I未亮 …` ——
+   * 它在每帧路径上做一次 `map` + `join`，而四槽平均几秒才变一次。
+   */
+  private lastXixiSignature = -1;
+  /** 后装填的提示只跟配置走、不跟帧走 ⇒ 算一次，别每帧拼同一个模板。 */
+  private readonly reloadHint = `花 ${MECHANISM_COST.reload} 筹码 · 注入 3 枚`;
+
+  /**
+   * 文本真的变了才写 DOM（沿用本文件既有的 `lastComboShown` / `lastBoostCharges` 脏检查范式）。
+   *
+   * `update()` 每帧被调用，而这些字符串在绝大多数帧里逐字不变；值仍然**全部**从传进来的
+   * snapshot 现算 ⇒ 这不是"界面自己存了一份状态"的第二真源，只是省掉重复的 set。
+   * ⚠️ 故意**不节流**：读 DOM 文本的判据（`save-migration.spec.ts:281-282`、
+   *    `verify-game.mjs:4061-4077`）要求"这一帧的值这一帧就能读到"。
+   */
+  private setText(node: { textContent: string | null }, text: string): void {
+    if (node.textContent === text) return;
+    node.textContent = text;
+  }
+
+  private setAttribute(
+    node: {
+      getAttribute(qualifiedName: string): string | null;
+      setAttribute(qualifiedName: string, value: string): void;
+    },
+    name: string,
+    value: string,
+  ): void {
+    if (node.getAttribute(name) === value) return;
+    node.setAttribute(name, value);
+  }
 
   bindPauseToggle(handler: () => void): void {
     const toggle = (event: Event) => {
@@ -330,45 +362,61 @@ export class Hud {
     /** XIXI 四槽亮灭（Game 持有，跨局持续；P5 起不再挂在 RunState 快照上）。 */
     xixi: boolean[] = [false, false, false, false],
   ): void {
-    this.levelLabel.textContent = config.name;
+    this.setText(this.levelLabel, config.name);
     // ★ S4 合并账户：这里原来有两个数 —— `walletValue`（钱包）与 `creditsValue`（局内筹码），
     //   分别读 `save.wallet` 与 `snapshot.chips`，中间靠「买入/回存」两笔转账来回搬。
     //   合并之后两者是同一个数 ⇒ **只剩一个读数**（参数 `wallet` 也一并删掉：
     //   留着一个永远等于另一个的入参，就是留给下一个人的歧义源）。
     //   现在显示的三个数分工仍然互不重叠：赚进 = 本段成绩，最高 = 历史成绩，余额 = 现在有多少钱。
-    this.earnedValue.textContent = String(snapshot.earned);
-    this.bestValue.textContent = String(Math.max(best, snapshot.earned));
-    this.creditsValue.textContent = String(snapshot.chips);
+    this.setText(this.earnedValue, String(snapshot.earned));
+    this.setText(this.bestValue, String(Math.max(best, snapshot.earned)));
+    this.setText(this.creditsValue, String(snapshot.chips));
 
     // XIXI 进度只出一行文字：四槽的亮灭**画在 3D 模型里**（推板前缘的四段标牌），
     // 这里不再重复画一遍圆点。进度仍按 `xixi` 数，与 3D 标牌同源。
-    const litCount = xixi.filter(Boolean).length;
-    this.markNote.textContent = `XIXI 集章 ${litCount}/${xixi.length} · 投币点亮四槽，集齐摇老虎机`;
-    this.channelMarks.setAttribute(
-      'aria-label',
-      `XIXI 集章 ${litCount}/${xixi.length}（${xixi
-        .map((lit, index) => `${XIXI_GLYPHS[index]}${lit ? '已亮' : '未亮'}`)
-        .join(' ')}）`,
-    );
+    // 一次位运算同时拿到"亮了几槽"和"哪几槽亮"，顺便当签名用：
+    // 原写法每帧要做 `filter` + `map().join()` 两次数组分配，而四槽平均几秒才变一次。
+    let bits = 0;
+    let litCount = 0;
+    for (let index = 0; index < xixi.length; index += 1) {
+      if (xixi[index]) {
+        bits |= 1 << index;
+        litCount += 1;
+      }
+    }
+    this.setText(this.markNote, `XIXI 集章 ${litCount}/${xixi.length} · 投币点亮四槽，集齐摇老虎机`);
+    // 签名没变 ⇒ 那串 `X已亮 I未亮 …` 不必重建（`setAttribute` 自己也会再比一次）。
+    if (bits !== this.lastXixiSignature) {
+      this.lastXixiSignature = bits;
+      this.setAttribute(
+        this.channelMarks,
+        'aria-label',
+        `XIXI 集章 ${litCount}/${xixi.length}（${xixi
+          .map((lit, index) => `${XIXI_GLYPHS[index]}${lit ? '已亮' : '未亮'}`)
+          .join(' ')}）`,
+      );
+    }
     // 加力进账（老虎机「力力力」）：整条提示闪一下并把一枚「充能」滑向加力按钮，
     // 把「摇中了」直接导向下一步该按哪个键。
     if (snapshot.boostCharges > this.lastBoostCharges) this.playChannelComplete();
     this.lastBoostCharges = snapshot.boostCharges;
     // 加力就绪时**顶掉**进度文字：此刻玩家该做的事从「继续集章」变成了「用加力」，
     // 两句话挤在同一行只会都读不清。上面的进度已写进 `aria-label`，信息没丢。
-    if (snapshot.boostCharges > 0) this.markNote.textContent = '加力已就绪，随时可用';
+    if (snapshot.boostCharges > 0) this.setText(this.markNote, '加力已就绪，随时可用');
 
     // 加力未充能时**隐藏**，而不是置灰——没充能时这个按钮不该占位置。
     const boostReady =
       snapshot.boostEnabled && snapshot.boostCharges > 0 && snapshot.phase !== 'settled';
     this.boostButton.disabled = !boostReady;
     this.boostButton.hidden = !boostReady;
-    this.boostState.textContent =
-      snapshot.boostCharges > 0 ? `就绪 ×${snapshot.boostCharges}` : `未充能 · 剩 ${snapshot.boostUsesLeft} 次`;
+    this.setText(
+      this.boostState,
+      snapshot.boostCharges > 0 ? `就绪 ×${snapshot.boostCharges}` : `未充能 · 剩 ${snapshot.boostUsesLeft} 次`,
+    );
 
     const canDrop = (snapshot.phase === 'ready' || snapshot.phase === 'playing') && snapshot.chips > 0;
     this.dropButton.disabled = !canDrop;
-    this.dropState.textContent = canDrop ? '普通铜币' : '筹码见底，等沉降';
+    this.setText(this.dropState, canDrop ? '普通铜币' : '筹码见底，等沉降');
 
     // 机关：每个都有明确的可用条件。不可用时**置灰**而不是隐藏——玩家得知道它存在。
     const settled = snapshot.phase === 'drainOut' && snapshot.plateStopped;
@@ -376,29 +424,33 @@ export class Hud {
     // 扫板与加力互斥：同一次收尾只能选一个，否则扫板会变成无脑必点。
     const canSweep = settled && !holdingBoost;
     this.sweeperButton.disabled = !canSweep || mechanisms.sweeper <= 0;
-    this.sweeperState.textContent =
+    this.setText(
+      this.sweeperState,
       mechanisms.sweeper <= 0
         ? '本局已用完'
         : canSweep
           ? '把贴线的币推过去'
           : holdingBoost
             ? '先决定加力'
-            : '收尾停板后可用';
+            : '收尾停板后可用',
+    );
 
     const canGrapple = snapshot.phase === 'playing' && snapshot.chips >= MECHANISM_COST.grapple;
     this.grappleButton.disabled = !canGrapple || mechanisms.grapple <= 0;
-    this.grappleState.textContent =
+    this.setText(
+      this.grappleState,
       mechanisms.grapple <= 0
         ? '本局已用完'
-        : `剩 ${mechanisms.grapple} 次 · 花 ${MECHANISM_COST.grapple} 筹码`;
+        : `剩 ${mechanisms.grapple} 次 · 花 ${MECHANISM_COST.grapple} 筹码`,
+    );
 
     const canReload =
       (snapshot.phase === 'ready' || snapshot.phase === 'playing') && snapshot.chips >= MECHANISM_COST.reload;
     this.reloadButton.disabled = !canReload;
-    this.reloadState.textContent = `花 ${MECHANISM_COST.reload} 筹码 · 注入 3 枚`;
+    this.setText(this.reloadState, this.reloadHint);
 
     this.betButton.disabled = snapshot.phase === 'settled';
-    this.betState.textContent = bet.label;
+    this.setText(this.betState, bet.label);
   }
 
   /**
