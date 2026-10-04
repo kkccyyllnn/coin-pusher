@@ -75,10 +75,11 @@ import {
 } from '../systems/TableBuilder';
 import type { CabinetSkin } from './cosmetics';
 import { Telemetry } from '../systems/Telemetry';
-import { RAPIER } from '../systems/PhysicsWorld';
+
 import { createSeededRandom } from '../utils/random';
 import { setCoinTexelScale } from '../utils/coinTexture';
-import { clamp, round1, round3 } from '../utils/numeric';
+import { clamp, round3 } from '../utils/numeric';
+import * as diag from './diagnostics/probes';
 import {
   COLORS,
   COIN,
@@ -252,6 +253,13 @@ export class Game {
   private readonly telemetry = new Telemetry();
   private drainRecorded = false;
   private tableGroup: THREE.Group | null = null;
+
+  /** 探针模块的读口（S3）：全是闭包 ⇒ 读到的永远是当下值，不存在第二份状态。 */
+  private readonly probeHost = {
+    physics: (): PhysicsWorld => this.physics,
+    coins: (): CoinPool => this.coins,
+    tableGroup: (): THREE.Group | null => this.tableGroup,
+  };
   /**
    * 机柜外壳那一具（S24）。
    *
@@ -3775,46 +3783,10 @@ export class Game {
     };
   }
 
-  /** 调试用：列出指定点附近的碰撞体实际世界位置。 */
   private probeColliders(x: number, y: number, z: number): Array<Record<string, unknown>> {
-    const out: Array<Record<string, unknown>> = [];
-    const radius = 0.6;
-    this.physics.world.colliders.forEach((collider) => {
-      const t = collider.translation();
-      const dx = t.x - x;
-      const dy = t.y - y;
-      const dz = t.z - z;
-      if (Math.hypot(dx, dy, dz) > radius) return;
-      const r = collider.rotation();
-      const shape = collider.shape as unknown as {
-        type: number;
-        halfExtents?: () => unknown;
-        halfHeight?: number;
-        radius?: number;
-      };
-      out.push({
-        handle: collider.handle,
-        isSensor: collider.isSensor(),
-        t: [round3(t.x), round3(t.y), round3(t.z)],
-        q: [round3(r.x), round3(r.y), round3(r.z), round3(r.w)],
-        shapeType: shape.type,
-        half: typeof shape.halfExtents === 'function' ? shape.halfExtents() : null,
-        // 圆柱（钉子）：halfHeight 是沿自身 y 轴的半长，配合 q 的旋转可还原世界长度。
-        cylinder:
-          typeof shape.halfHeight === 'number'
-            ? { halfHeight: shape.halfHeight, radius: shape.radius ?? null }
-            : null,
-      });
-    });
-    return out;
+    return diag.probeColliders(this.probeHost, x, y, z);
   }
 
-  /**
-   * 调试/试玩用：采样活跃币的位置与速度。
-   *
-   * `slot` 是对象池里的固定槽位号——`forEachActive` 会跳过停用的币，
-   * 数组下标会被压缩，只有槽位号才能跨帧稳定标识同一枚币。
-   */
   private sampleCoins(): Array<{
     slot: number;
     kind: string;
@@ -3842,42 +3814,7 @@ export class Game {
     playerDropped: boolean;
     preset: boolean;
   }> {
-    const out: Array<{
-      slot: number;
-      kind: string;
-      x: number;
-      y: number;
-      z: number;
-      vz: number;
-      speed: number;
-      tiltDeg: number;
-      sleeping: boolean;
-      playerDropped: boolean;
-      preset: boolean;
-    }> = [];
-    this.coins.coins.forEach((coin, slot) => {
-      if (!coin.active) return;
-      const p = coin.position;
-      const r = coin.body.rotation();
-      // 把局部 +Y 用四元数转到世界系，再与 (0,1,0) 取夹角。
-      const upY = 1 - 2 * (r.x * r.x + r.z * r.z);
-      const tiltDeg = (Math.acos(Math.min(1, Math.max(-1, upY))) * 180) / Math.PI;
-      out.push({
-        slot,
-        kind: coin.kind,
-        x: round3(p.x),
-        y: round3(p.y),
-        z: round3(p.z),
-        vz: round3(coin.body.linvel().z),
-        // 合速度：静置断言要的是「真的不动了」，只看 vz 会漏掉横向漂移。
-        speed: round3(coin.speed()),
-        tiltDeg: round1(tiltDeg),
-        sleeping: coin.body.isSleeping(),
-        playerDropped: coin.playerDropped,
-        preset: coin.preset,
-      });
-    });
-    return out;
+    return diag.sampleCoins(this.probeHost);
   }
 
   /**
@@ -3971,82 +3908,18 @@ export class Game {
     }
   }
 
-  /** 竖直向下打一条射线，报告第一个命中的碰撞体（诊断币堆穿模用）。 */
   private castDown(
     x: number,
     y: number,
     z: number,
   ): { distance: number; hitY: number; shapeType: number; isSensor: boolean } | null {
-    const ray = new RAPIER.Ray({ x, y, z }, { x: 0, y: -1, z: 0 });
-    const hit = this.physics.world.castRay(ray, 5, true);
-    if (!hit) return null;
-    const collider = hit.collider;
-    const t = collider.translation();
-    const shape = collider.shape as unknown as { type: number };
-    return {
-      distance: round3(hit.toi),
-      hitY: round3(t.y),
-      shapeType: shape.type,
-      isSensor: collider.isSensor(),
-    };
+    return diag.castDown(this.probeHost, x, y, z);
   }
 
-  /**
-   * 渲染侧的真实位置：地板网格顶面、推板顶面、最低几枚币的网格中心。
-   *
-   * 存在的理由：物理读数说「币沉在地板下方」，画面却说「币好好地摆在地板上」时，
-   * 必须有一条能把**渲染**与**物理**放在同一把尺子上量的通路，否则只能靠猜。
-   */
   private probeMeshes(): Array<Record<string, unknown>> {
-    const out: Array<Record<string, unknown>> = [];
-    const box = new THREE.Box3();
-    const record = (label: string, object: THREE.Object3D) => {
-      if (!object.visible) return;
-      box.setFromObject(object);
-      out.push({
-        label,
-        min: [round3(box.min.x), round3(box.min.y), round3(box.min.z)],
-        max: [round3(box.max.x), round3(box.max.y), round3(box.max.z)],
-        worldY: round3(object.getWorldPosition(new THREE.Vector3()).y),
-      });
-    };
-
-    this.tableGroup?.traverse((child) => {
-      const role = (child.userData as { role?: string }).role;
-      if (role === 'floor' && (child as THREE.Mesh).isMesh) record('floor', child);
-      if (role === 'pusherTop' && (child as THREE.Mesh).isMesh) record('pusherTop', child);
-    });
-
-    // 最低的三枚活跃币：渲染位置与物理位置一起报
-    const active = this.coins.coins
-      .map((coin, slot) => ({ coin, slot }))
-      .filter((entry) => entry.coin.active)
-      .map((entry) => ({ ...entry, y: entry.coin.body.translation().y }))
-      .sort((a, b) => a.y - b.y)
-      .slice(0, 3);
-    for (const entry of active) {
-      // P3 起币走 InstancedMesh：没有逐枚的 Object3D 可量，渲染位置从实例矩阵读回，
-      // 包围盒用币半径近似——探针要的是「渲染与物理对在同一把尺子上」，不是精确 AABB。
-      const p = entry.coin.renderPosition();
-      if (!p) continue;
-      const r = COIN.radius;
-      out.push({
-        label: `coin#${entry.slot}(物理y=${round3(entry.y)})`,
-        min: [round3(p.x - r), round3(p.y - r), round3(p.z - r)],
-        max: [round3(p.x + r), round3(p.y + r), round3(p.z + r)],
-        worldY: round3(p.y),
-      });
-    }
-    return out;
+    return diag.probeMeshes(this.probeHost);
   }
 
-  /**
-   * 从接触流形读真实穿透深度（负距离 = 穿透）。
-   *
-   * 返回两组数：币与币之间、以及币与**静态机台**（地板/护栏/推板）之间的最深穿透。
-   * 两者要分开看：币躺在地板上时本来就有毫米级穿透（Rapier 的 `allowedLinearError`
-   * 默认就是 1 毫米），而那属于正常工作区间；币与币之间嵌进半个币厚才是缺陷。
-   */
   private penetrationReport(limitMillimeters: number): {
     coinContacts: number;
     staticContacts: number;
@@ -4055,61 +3928,7 @@ export class Game {
     overLimit: number;
     worst: Array<{ depth: number; pair: string; at: [number, number, number] }>;
   } {
-    const world = this.physics.world;
-    const limit = limitMillimeters / 1000;
-    const seen = new Set<string>();
-    const worst: Array<{ depth: number; pair: string; at: [number, number, number] }> = [];
-    let coinContacts = 0;
-    let staticContacts = 0;
-    let coinDeepest = 0;
-    let staticDeepest = 0;
-    let overLimit = 0;
-
-    this.coins.coins.forEach((coin, slot) => {
-      if (!coin.active) return;
-      const own = coin.body.collider(0);
-      world.contactPairsWith(own, (other) => {
-        // 同一对接触会被两边各报一次，按句柄排序去重。
-        const key = own.handle < other.handle ? `${own.handle}:${other.handle}` : `${other.handle}:${own.handle}`;
-        if (seen.has(key)) return;
-        seen.add(key);
-
-        // 币是圆柱，机台是 cuboid，用形状类型区分（不需要额外的分组标记）。
-        const otherShape = other.shape as unknown as { type: number };
-        const isCoinPair = otherShape.type !== 1;
-
-        world.contactPair(own, other, (manifold) => {
-          for (let i = 0; i < manifold.numContacts(); i += 1) {
-            const distance = manifold.contactDist(i);
-            if (distance >= 0) continue;
-            const depth = -distance;
-            if (isCoinPair) {
-              coinContacts += 1;
-              coinDeepest = Math.max(coinDeepest, depth);
-            } else {
-              staticContacts += 1;
-              staticDeepest = Math.max(staticDeepest, depth);
-            }
-            if (depth > limit) overLimit += 1;
-            worst.push({
-              depth: round3(depth),
-              pair: isCoinPair ? `coin#${slot} ↔ coin` : `coin#${slot} ↔ 机台`,
-              at: [round3(coin.position.x), round3(coin.position.y), round3(coin.position.z)],
-            });
-          }
-        });
-      });
-    });
-
-    worst.sort((a, b) => b.depth - a.depth);
-    return {
-      coinContacts,
-      staticContacts,
-      coinDeepest: round3(coinDeepest),
-      staticDeepest: round3(staticDeepest),
-      overLimit,
-      worst: worst.slice(0, 5),
-    };
+    return diag.penetrationReport(this.probeHost, limitMillimeters);
   }
 
   private applyTestState(name: string): string {
