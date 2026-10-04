@@ -2,6 +2,7 @@ import type { Coin } from '../entities/Coin';
 import type { CoinPool } from '../entities/CoinPool';
 import { COIN, TABLE } from '../game/constants';
 import { COIN_SCALE } from '../game/coinScale';
+import { clamp } from '../utils/numeric';
 
 /**
  * 机关 id（P7 起只剩三个）。
@@ -226,10 +227,6 @@ export class Mechanisms {
     }
     return { ok: placed > 0, affected: placed, reason: placed > 0 ? undefined : '盘面已满' };
   }
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
 }
 
 /** 供测试与 HUD 引用的常量（避免测试里写魔法数）。 */

@@ -1,4 +1,5 @@
 import { TABLE } from '../game/constants';
+import { clamp } from '../utils/numeric';
 
 /** 选位模式：自动匀速往返 / 玩家手动接管。 */
 export type LaneMode = 'auto' | 'manual';
@@ -332,8 +333,4 @@ export class InputController {
     this.lane = normalized;
     this.laneDirty = true;
   }
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
 }

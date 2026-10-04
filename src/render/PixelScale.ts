@@ -35,6 +35,7 @@
  * 默认（不平滑）时降档表现为**轻微模糊**；开了最近邻才是「更方块」。
  * 原来的 `maxDpr` 语义被取代：DPR 不再参与分辨率计算（见 `pixelRatio`）。
  */
+import { clamp } from '../utils/numeric';
 
 export type PixelScaleSettings = {
   /** 期望的内部渲染高度上限（CSS 像素）。实际内部高度 = CSS 高 ÷ 整数倍率。 */
@@ -93,10 +94,6 @@ export const PIXEL_SCALE_DEFAULTS: PixelScaleSettings = {
   pixelated: false,
   upscaleOverride: null,
 };
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
 
 /** 由 CSS 尺寸与设置解出内部渲染尺寸。纯函数，便于判据直接枚举调用。 */
 export function resolvePixelScale(

@@ -78,6 +78,7 @@ import { Telemetry } from '../systems/Telemetry';
 import { RAPIER } from '../systems/PhysicsWorld';
 import { createSeededRandom } from '../utils/random';
 import { setCoinTexelScale } from '../utils/coinTexture';
+import { clamp, round1, round3 } from '../utils/numeric';
 import {
   COLORS,
   COIN,
@@ -4455,14 +4456,6 @@ export class Game {
     return element;
   }  }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-function round3(value: number): number {
-  return Math.round(value * 1000) / 1000;
-}
-
 /**
  * 按 `userData.part` 选出对应的 Arcane 贴图工厂（S19：判据从 `role` 改成 `part`）。
  *
@@ -4546,6 +4539,3 @@ function pickCabinetMap(
 }
 
 /** 角度只留一位小数：诊断里要的是「平躺 / 搭着 / 立起」三档，不是精确姿态。 */
-function round1(value: number): number {
-  return Math.round(value * 10) / 10;
-}
