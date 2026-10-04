@@ -146,8 +146,83 @@ function check(name, ok, detail = '') {
   console.log(`[${ok ? 'PASS' : 'FAIL'}] ${name}${detail ? ` — ${detail}` : ''}`);
 }
 
+/**
+ * 存档写盘读数（10-03 计划步 2b：**先量再改**）。
+ *
+ * 评审说「每次筹码进出都立刻 stringify+setItem，一波 12 币 = 12+ 次串行写盘」，前半句我核过是对的
+ * （`SaveStore.write()` 被 9 个方法直接调用，全仓无节流/无 dirty 标志），但 `perf` 里**没有任何写盘耗时读数**
+ * ⇒ 收益量级无证据，所以这一轮只加测量、不动 `SaveStore`。
+ * 包法只计数不改语义：原调用照常执行、返回值原样透传；拿不到 `localStorage` 就静默不测。
+ */
+async function installSaveWriteProbe(context) {
+  await context.addInitScript(() => {
+    try {
+      const ls = window.localStorage;
+      const original = ls.setItem.bind(ls);
+      const obs = { writes: 0, bytes: 0, msTotal: 0, maxMs: 0, byKey: {} };
+      Object.defineProperty(ls, 'setItem', {
+        configurable: true,
+        writable: true,
+        value: (key, value) => {
+          const t0 = performance.now();
+          const result = original(key, value);
+          const dt = performance.now() - t0;
+          obs.writes += 1;
+          obs.bytes += String(value).length;
+          obs.msTotal += dt;
+          if (dt > obs.maxMs) obs.maxMs = dt;
+          obs.byKey[key] = (obs.byKey[key] ?? 0) + 1;
+          return result;
+        },
+      });
+      window.__SAVE_OBS__ = obs;
+    } catch {
+      // 测不到就不测：这条是读数，不参与任何判据。
+    }
+  });
+}
+
+/** 把累计的写盘计数打成一行读数（不进判据）。 */
+async function reportSaveWrites(page, label, divisor) {
+  let obs = await page.evaluate(() => window.__SAVE_OBS__ ?? null);
+  // 正对照：0 有两种解释（"这段时间真没写盘" vs "探针根本没接上"）。用**同值** setWallet
+  // 触发一次写（不改余额、不动账本），计数器要是不动就是探针死了 —— 直说，不许蒙混成 0。
+  if (!obs || obs.writes === 0) {
+    const proof = await page.evaluate(() => {
+      const before = window.__SAVE_OBS__?.writes ?? -1;
+      const balance = window.__THREE_GAME_DIAGNOSTICS__?.balance ?? null;
+      const hook = window.__THREE_GAME_TEST_HOOKS__?.setWallet;
+      // 用引擎自己的返回值证"没改状态"，不拿同一份诊断快照自比（那会是恒真）。
+      const res = typeof hook === 'function' ? hook(balance) : null;
+      return {
+        before,
+        after: window.__SAVE_OBS__?.writes ?? -1,
+        hasObs: !!window.__SAVE_OBS__,
+        setWalletOk: !!res,
+        balanceUnchanged: !!res && res.balance === balance,
+      };
+    });
+    console.log(
+      `  [info] 存档写盘读数：${label} 计数为 0 ⇒ 正对照（同值 setWallet 触发一次写）` +
+        `探针${proof.after > proof.before && proof.before >= 0 ? '活着：这段时间真的没写盘' : '**是空的**：包装没生效，这条读数不可信'}` +
+        `（hasObs=${proof.hasObs}、setWalletOk=${proof.setWalletOk}、返回值里余额没变=${proof.balanceUnchanged}）`,
+    );
+    return;
+  }
+  const perUnit = divisor > 0 ? (obs.writes / divisor).toFixed(2) : '—';
+  console.log(
+    `  [info] 存档写盘读数（不进判据）：${label} 共 ${obs.writes} 次 / ${(obs.bytes / 1024).toFixed(1)} KB，` +
+      `平均 ${(obs.msTotal / obs.writes).toFixed(3)} ms、单次最大 ${obs.maxMs.toFixed(3)} ms、` +
+      `累计占用 ${(obs.msTotal / 1000).toFixed(3)} s；` +
+      (divisor > 0 ? `每单位 ${perUnit} 次（分母 = ${divisor}）；` : '') +
+      `键分布 ${JSON.stringify(obs.byKey)}`,
+  );
+}
+
 async function openGame(browser) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  // 写盘探针必须在导航之前装：`SaveStore` 在构造期就会写一次，goto 之后再包就漏掉那一笔。
+  await installSaveWriteProbe(context);
   const page = await context.newPage();
   const errors = [];
   // ★ 页内错误**立刻**走 stderr：批若在几十局后崩在 Rapier 的「recursive use」上，真凶是
@@ -2038,6 +2113,9 @@ async function runEconomy(page) {
         `win 拒收 ${refused}/${wins} = ${wins ? (refused / wins).toFixed(3) : '—'}（兜底频率分母是中奖数，不是投币数）`,
     );
   }
+  // 写盘读数（计划步 2b）：分母取**总投币数**，这样"投一枚币写几遍盘"是能直接读出来的数，
+  // 不用再去猜评审那句"12+ 次串行写盘"。不进判据。
+  await reportSaveWrites(page, `${RUNS} 局 economy`, totalDrops);
 
   check(
     '① 每一局账本恒等式成立（误差 0）',
@@ -7567,6 +7645,8 @@ async function main() {
     if (MODE === 'hooks') await runHooksGuard(page, context);
     if (MODE === 'refill') await runRefill(page);
     if (MODE === 'feedback') await runFeedback(page);
+    // 任何模式跑完都给一行写盘读数（步 2b：先量再改）。这条不参与判据，缺席时自己会说明。
+    await reportSaveWrites(page, `模式 ${MODE} 全程`, 0);
     check('运行期无控制台/页面错误', errors.length === 0, errors.slice(0, 3).join(' | '));
   } finally {
     await context.close();
