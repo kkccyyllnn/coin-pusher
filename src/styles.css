@@ -878,6 +878,28 @@ body {
   background: linear-gradient(180deg, rgb(var(--brass-rgb) / 0.26), rgba(169, 118, 44, 0.16));
 }
 
+/* Stage 3b · 按钮硬件化：投币键上加一枚**圆形按钮帽**（纯 CSS 画的，不需要素材）。
+   读感是"一颗按下去会凹的机器键"，而不是又一块玻璃圆角条：
+   高光偏左上、内阴影压在下方、外圈双色边 —— 与机柜的黄铜件同一套受光方向。
+   ⚠️ 没有把它做成整颗按钮的轮廓：那格还有"投币 / 普通铜币"两行文字，
+   整颗圆会把文字挤成弧形，反而更不像机器。`:active` 的 translateY(1px) 由通用规则给。 */
+#drop-button::before {
+  content: '';
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--edge-hi);
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 34% 30%,
+    var(--brass-hi),
+    rgb(var(--brass-rgb)) 52%,
+    var(--brass-deep)
+  );
+  box-shadow:
+    inset 0 -2px 3px rgba(0, 0, 0, 0.5),
+    0 0 8px var(--brass-glow);
+}
+
 #boost-button:not(:disabled) {
   border-color: var(--mint);
   box-shadow: 0 0 14px rgba(111, 211, 165, 0.28);

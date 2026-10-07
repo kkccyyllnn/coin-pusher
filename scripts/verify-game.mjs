@@ -146,6 +146,104 @@ function check(name, ok, detail = '') {
   console.log(`[${ok ? 'PASS' : 'FAIL'}] ${name}${detail ? ` — ${detail}` : ''}`);
 }
 
+/*
+ * `UI_NEG_ARM=<臂>` —— G- 系列 UI 门的**变异臂**（一次只注入一条门改掉的那个状态）。
+ *
+ * 立它的理由不是"多一个开关"，是这条项目的纪律：**没红过一次的判据不算判据**。
+ * 跑法：`UI_NEG_ARM=color XIXI_FAST=1 node scripts/verify-game.mjs xixi`，
+ *      `UI_NEG_ARM=small node scripts/verify-game.mjs camera`。
+ * 臂只动运行时 DOM/CSS（`document.head` 里一个带 id 的 `<style>` 或一个探针节点），
+ * 不碰 `src`、不碰存档 ⇒ 关页面就没，也不需要还原器。
+ * ⚠️ 两条读法上的坑：
+ *   ① 红了**不能**记成"代码回归" —— 摘要行会自报臂名；
+ *   ② 臂打在"真会被检查的位置"才算数，打偏了会得出"门坏了"的假结论，
+ *      所以下面每条臂都注明它改的是哪条门的哪个统计量。
+ */
+const UI_NEG_ARMS = {
+  clearance: 'G-遮挡：把 `--marquee-clearance` 打回 0（顶部条压回招牌屏）',
+  readout: 'G-单读数：让 `#resource-readout` 重新可见（余额出现第二处读数）',
+  opacity: 'G-disabled：给 `button:disabled` 加回 `opacity`',
+  small: 'G-字号：往 HUD 里塞一条 9px 可见文本',
+  glass: 'G-无玻璃：给 `#hud-top` 加回 `backdrop-filter: blur()`',
+  color: 'G-调色板：往 HUD 里加 12 族新的声明底色',
+  lights: 'G-计数灯：把亮灯数与引擎 usesLeft 拧开一格（显示说谎）',
+};
+
+async function applyUiNegArm(page) {
+  const arm = process.env.UI_NEG_ARM ?? '';
+  if (!arm) return '';
+  const spec = UI_NEG_ARMS[arm];
+  if (!spec) {
+    throw new Error(`UI_NEG_ARM=${arm} 不在臂名里（可选：${Object.keys(UI_NEG_ARMS).join(' / ')}）`);
+  }
+  const applied = await page.evaluate((which) => {
+    const hud = document.querySelector('#hud');
+    if (!hud) return 'no-hud';
+    const addStyle = (css) => {
+      document.getElementById('ui-neg-arm')?.remove();
+      const node = document.createElement('style');
+      node.id = 'ui-neg-arm';
+      node.textContent = css;
+      document.head.appendChild(node);
+    };
+    switch (which) {
+      case 'clearance':
+        document.documentElement.style.setProperty('--marquee-clearance', '0px');
+        return 'ok';
+      case 'readout':
+        addStyle('#resource-readout{display:flex !important}');
+        return 'ok';
+      case 'opacity':
+        addStyle('button:disabled{opacity:0.55}');
+        return 'ok';
+      case 'small': {
+        const el = document.createElement('small');
+        el.id = 'ui-neg-small';
+        el.style.cssText = 'position:absolute;left:8px;bottom:8px;font-size:9px';
+        el.textContent = '变异臂小字';
+        hud.appendChild(el);
+        return 'ok';
+      }
+      case 'glass':
+        addStyle('#hud-top{backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}');
+        return 'ok';
+      case 'color': {
+        const host = document.createElement('div');
+        host.id = 'ui-neg-color';
+        host.style.cssText = 'position:absolute;left:4px;bottom:4px;display:flex';
+        for (let i = 0; i < 12; i += 1) {
+          const cell = document.createElement('span');
+          cell.style.cssText = 'width:2px;height:2px';
+          cell.style.backgroundColor = `rgb(${i * 17}, ${i * 7}, ${255 - i * 11})`;
+          host.appendChild(cell);
+        }
+        hud.appendChild(host);
+        return 'ok';
+      }
+      case 'lights': {
+        // 优先复现历史上真犯过的那个谎（引擎 3 盏只亮 2 盏 ⇒ 撤掉一盏）；
+        // 此刻若一盏都没亮就换方向（多加一盏）——臂必须**总能**把显示与引擎拧开，
+        // 不然"臂没红"会被读成"门坏了"，而那其实是臂打在了空样本上。
+        const lit = document.querySelector('#grapple-state .light-on');
+        if (lit) {
+          lit.classList.remove('light-on');
+          return 'ok（少亮一盏）';
+        }
+        const extra = document.createElement('i');
+        extra.className = 'light light-on';
+        document.querySelector('#grapple-state')?.appendChild(extra);
+        return document.querySelector('#grapple-state') ? 'ok（多亮一盏）' : 'no-grapple-state';
+      }
+      default:
+        return 'unknown-arm';
+    }
+  }, arm);
+  console.log(
+    `  [info] UI_NEG_ARM=${arm}（${spec}）⇒ 注入结果 ${applied}；**本批的红是变异臂，不是代码回归**`,
+  );
+  return arm;
+}
+
 /**
  * 存档写盘读数（10-03 计划步 2b：**先量再改**）。
  *
@@ -541,6 +639,16 @@ async function playRun(page, { drops = ECON_RUN_DROPS_CAP, lanes, waitEnd = true
      （2026-09-28 自证批）。这个字段是局长口径的直接证据，不能猜。 */
   const runStart = (await readState(page))?.elapsed ?? 0;
   const pickLanes = lanes ?? [-0.85, -0.45, 0, 0.45, 0.85];
+  /*
+   * `ECON_DRAFT=1` ⇒ 机器人会**领卡**（点第一张买得起的候选，走的还是玩家那条 DOM 路径）。
+   * 默认关，理由与 `ECON_LOAN` 同一条纪律：**换协议要能被看出来**。
+   * 三选一是正反馈，会把局长与回收率往"更长"推，而 economy 现有的阈值是按"不领卡"标定的；
+   * 拿开了领卡的批去比那批读数，等于把两种协议混进同一个池子。
+   * 波次到达率分布（1d 要的 n≥20）必须开着它跑 —— 不然波永远停在 1，
+   * 那批读数测的是"没人玩构筑时的自然深度"，不是波次目标可达性。
+   */
+  const draftOn = process.env.ECON_DRAFT === '1';
+  let draftsClicked = 0;
 
   // 冷启动兜底：首投必须**真的被接受**（见 `primeFirstDrop` 的说明）。
   await primeFirstDrop(page, pickLanes[0]);
@@ -569,6 +677,21 @@ async function playRun(page, { drops = ECON_RUN_DROPS_CAP, lanes, waitEnd = true
       break;
     }
     if (state?.phase !== 'drainOut') {
+      // 领卡优先于投币：面板立着的时候玩家也在"先决定下一步"，而且它不花仿真时间。
+      if (draftOn && state?.endless?.pendingDraft === true) {
+        const picked = await page.evaluate(() => {
+          const button = [...document.querySelectorAll('#draft-choices button')].find(
+            (b) => !b.disabled,
+          );
+          if (!button) return null;
+          const id = button.dataset.effect ?? '';
+          button.click();
+          return id;
+        });
+        if (picked) draftsClicked += 1;
+        // 没领成（买不起 / 面板还没立起来）就继续正常投币，不在这条腿上等死。
+        continue;
+      }
       // 这个 20 秒是**死循环兜底**，不是局长来源：每圈都以「推板多走一个循环」为进度条件，
       // 所以投币节奏本身已经是仿真对齐的。局长口径只在 `waitForRunEnd` 里定。
       const advanced = await waitFor(page, (current) => (current?.pusher?.cycles ?? 0) > lastCycle, 20_000);
@@ -585,6 +708,8 @@ async function playRun(page, { drops = ECON_RUN_DROPS_CAP, lanes, waitEnd = true
       ...capped,
       end: 'cap',
       loans,
+    /** 本局机器人领了几次卡（`ECON_DRAFT=1` 才可能非 0）——"这条腿跑没跑"的直接证据。 */
+    draftsClicked,
       runSeconds: Math.max(0, (capped?.elapsed ?? runStart) - runStart),
     };
   }
@@ -594,6 +719,8 @@ async function playRun(page, { drops = ECON_RUN_DROPS_CAP, lanes, waitEnd = true
     boostResolved,
     end,
     loans,
+    /** 本局机器人领了几次卡（`ECON_DRAFT=1` 才可能非 0）——"这条腿跑没跑"的直接证据。 */
+    draftsClicked,
     runSeconds: Math.max(0, (state?.elapsed ?? runStart) - runStart),
   };
 }
@@ -2200,6 +2327,8 @@ async function runEconomy(page) {
       ticketCrossSource: final?.endless?.ticketBySource?.crossing ?? 0,
       waveReached: final?.endless?.wave ?? 0,
       draftsTaken: final?.endless?.draftsTaken ?? 0,
+      /** 机器人点了几次卡（与 `draftsTaken` 是**两个真源**：一个来自 DOM 点击，一个来自引擎计数）。 */
+      draftsClicked: final?.draftsClicked ?? 0,
       /**
        * Stage 2 的**接线证据**：催债币从第 `hazardAfterDrops` 投起自动注入，
        * 所以真打法里 `coinEffects.triggers` 会长出来。这里要的是"每次触发都留了归因"
@@ -2330,16 +2459,39 @@ async function runEconomy(page) {
       );
     }
     // 1c 的波次到达**只报分布**：样本不足时报"缺席"，不拿点值当结论（计划 1d 原话）。
+    // ⚠️ 口径要跟着 `ECON_DRAFT` 走：不开领卡时波永远停在 1，那批读数测的是
+    //   "没人玩构筑时的自然深度"，**不是**波次目标可达性 —— 两者不能混着引用。
+    const draftLeg = process.env.ECON_DRAFT === '1';
+    const clicked = runs.reduce((sum, run) => sum + run.draftsClicked, 0);
+    const taken = runs.reduce((sum, run) => sum + run.draftsTaken, 0);
+    console.log(
+      `  [info] 1c 协议标记：ECON_DRAFT=${draftLeg ? '1（机器人会领卡）' : '未开（不领卡）'}｜` +
+        `DOM 点击 ${clicked} 次 vs 引擎 draftsTaken ${taken} 张（两个真源，不等就是领卡腿与账对不上）`,
+    );
+    if (draftLeg && clicked !== taken) {
+      check(
+        '1c 领卡两源对质：DOM 点击次数 === 引擎 draftsTaken',
+        false,
+        `点击 ${clicked} ≠ 引擎计 ${taken} ⇒ 有点了没生效的卡（先查票券够不够，再查 CoinEffects.pick）`,
+      );
+    }
     if (runs.length >= 20) {
       const dist = waves.map((w) => `${w}`).join(' ');
       console.log(
         `  [info] 1c 波次到达分布 n=${runs.length}（定档用，不进判据）：${dist}｜` +
-          `领卡合计 ${runs.reduce((sum, run) => sum + run.draftsTaken, 0)} 张`,
+          `领卡合计 ${taken} 张｜口径 = ${draftLeg ? '会领卡' : '不领卡（此时分布没有可达性含义）'}`,
       );
+      if (draftLeg) {
+        check(
+          '1c 波次可达性：n≥20 且会领卡时，至少有一局走到第 2 波以后（否则目标表第一档就太高）',
+            Math.max(...waves) >= 2,
+            `wave 分布 ${dist}`,
+        );
+      }
     } else {
       console.log(
         `  [info] 1c 波次到达分布**样本不足**（n=${runs.length} < 20）⇒ 不报分布、不报绿：` +
-          `本批 wave=${waves.join('/')}，drafts=${runs.reduce((sum, run) => sum + run.draftsTaken, 0)}`,
+          `本批 wave=${waves.join('/')}，drafts=${taken}`,
       );
     }
   }
@@ -3593,6 +3745,49 @@ async function runXixi(page) {
   );
 
   /*
+   * G-调色板（Stage 3b）：HUD 自己的颜色预算。
+   *
+   * ⚠️ **这条门与计划里写的那条不是同一条**，理由是量出来的而不是感觉：
+   *   计划要的是"HUD 区域截图颜色数 ≤ 机柜 LUT 槽数上界"。实测两件事先把它否了：
+   *   ① `#hud` 是透明覆盖层，直接截它会把**背后的 3D 场景一起数进来**
+   *     （1280×720 下 15,081 种颜色，全是场景的），必须先把画布 `visibility:hidden` 再截；
+   *   ② 只留 HUD 之后实测 **exact 6,618 / coarse 126** 种，而机柜 LUT 只有 4 条 × 4 档 = 16 槽。
+   *     差两个数量级的来源不是"配色乱了"，而是**按钮面的 linear-gradient 与文字抗锯齿** ——
+   *     它们是刻意的设计，不是缺陷。所以"≤ 16 槽"这条门一装就是永久红，
+   *     而永久红的门等于没有门（还会诱导别人抬阈值消红）。
+   *   ⇒ 落地的是另一条**有实测余量的回归栅栏**：数 HUD 里**声明出来的颜色**
+   *     （`getComputedStyle` 的 color / backgroundColor / 两条 border-color + 渐变声明，
+   *     只数可见且自己有样式的节点）。实测基线 **15 种**，上限取 **24**（1.6 倍余量）。
+   *     它抓的是"有人往 HUD 里再加一族颜色/底色"，
+   *     抓不到也**不假装能抓到**"HUD 是不是像素语言"——那一半搬给了 camera 段的
+   *     **G-无玻璃**（可见节点里 `blur(` 必须为 0，与这条互不包含）+ G-字号 + 看图，
+   *     真要钉成硬判据得先把 HUD 正文换成像素字（那是一个独立的决定，已上报待拍）。
+   */
+  await applyUiNegArm(page);
+  const palette = await page.evaluate(() => {
+    const hud = document.querySelector('#hud');
+    if (!hud) return null;
+    const colors = new Set();
+    for (const el of [hud, ...hud.querySelectorAll('*')]) {
+      if (el.offsetParent === null && el !== hud) continue;
+      const s = getComputedStyle(el);
+      for (const prop of ['color', 'backgroundColor', 'borderTopColor', 'borderLeftColor']) {
+        const value = s[prop];
+        if (value && value !== 'rgba(0, 0, 0, 0)') colors.add(value);
+      }
+      for (const image of [s.backgroundImage, s.borderImageSource]) {
+        if (image && image !== 'none') colors.add(image.slice(0, 96));
+      }
+    }
+    return { declared: colors.size };
+  });
+  check(
+    'G-调色板：HUD 声明的颜色种类在预算内（基线 15，上限 24；见注释里"为什么不是 ≤16 槽"）',
+      palette !== null && palette.declared > 0 && palette.declared <= 24,
+      `HUD 声明色 ${palette?.declared} 种（实测基线 15，上限 24 ≈ 1.6 倍余量）`,
+  );
+
+  /*
    * G-计数灯（Stage 3b）：抓斗"还剩几次"必须由**灯**表示，而不是 0.6rem 的小字。
    * 三条一起断才不算自证：亮灯数 == 引擎的 `usesLeft`、总灯数 == 表的上限、
    * 而且这个元素里**不再有**裸文本数字（否则"换了灯"只是把字藏起来又写一遍）。
@@ -3624,7 +3819,8 @@ async function runXixi(page) {
 
   /*
    * `XIXI_FAST=1` ⇒ 跑到这里就收尾。**只为变异批存在**：1a 那四条门（面值恒等 / 表端点 /
-   * 永不转债 / 深度臂）全在上面，而下面「落床 / 集齐」段最坏要等 4 轮 × 200 循环 ≈ 27 分钟，
+   * 永不转债 / 深度臂）、1b/1c 的票券与三选一、S2 四条（协议 / 结算归因 / 池水）与
+   * 3b 的 G-调色板 / G-计数灯**都已跑完**，而下面「落床 / 集齐」段最坏要等 4 轮 × 200 循环 ≈ 27 分钟，
    * 与本批改判无关（实测：不开 FAST 一轮 10~30 分钟，开 FAST 约 1 分钟）。
    * ⚠️ 这不是"少跑一点也没关系"的开关 —— 用了它下面这些就**没跑**，所以：
    *   ① 打印一行显式声明未覆盖面，合计条数也随之变小，不会被读成整模式绿；
@@ -3632,7 +3828,7 @@ async function runXixi(page) {
    */
   if (process.env.XIXI_FAST === '1') {
     console.log(
-      '  [info] XIXI_FAST=1 ⇒ 本模式在 1a 四条门之后提前返回：未跑「落床点亮 / 集齐 completed / ' +
+      '  [info] XIXI_FAST=1 ⇒ 本模式在 1a/1b/1c + S2 + G-调色板/G-计数灯 之后提前返回：未跑「落床点亮 / 集齐 completed / ' +
         '演出窗口计数器 / 全程三账本恒等式 / XIXI 无异常 / S5b 合成输入 / S5a 四同」⇒ **本模式不算整批通过**',
     );
     return;
@@ -7336,7 +7532,11 @@ async function runCamera(page, context) {
    * G-disabled：`button:disabled` 的 CSS 规则里不许出现 `opacity`
    *   —— `:313-314` 那条注释早就说过"灰掉的按钮才读作不能按"，但实现里留着 0.55，
    *   注释与代码各说一套。这条把它钉成静态判据（不依赖"此刻恰好有个禁用按钮"）。
+   *
+   * 七条 G-门（本模式这五条 + xixi 段的 G-调色板 / G-计数灯）各配一条 `UI_NEG_ARM` 变异臂，
+   * 臂名与判据的对应写在 `UI_NEG_ARMS` 里；跑法与实测结果记在 README 的验证表。
    */
+  await applyUiNegArm(page);
   const occlusion = await page.evaluate(() => {
     const box = window.__THREE_GAME_TEST_HOOKS__?.marqueeScreenBox?.() ?? null;
     const rectOf = (selector) => {
@@ -7379,6 +7579,17 @@ async function runCamera(page, context) {
         }
       }
     }
+    // 玻璃指纹用**computed style**扫，不扫 CSSOM：内联、class、继承来的都算，
+    // 而 CSSOM 会漏掉 style 属性（G-无玻璃 要抓的正是"有人把 blur 加回来"这个动作本身）。
+    const glassNodes = [];
+    const hudRoot = document.querySelector('#hud');
+    for (const el of hudRoot ? [hudRoot, ...hudRoot.querySelectorAll('*')] : []) {
+      if (el.offsetParent === null && el !== hudRoot) continue;
+      const filter = `${getComputedStyle(el).backdropFilter} ${getComputedStyle(el).webkitBackdropFilter ?? ''}`;
+      if (/blur\(/.test(filter)) {
+        glassNodes.push(`${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ''}`);
+      }
+    }
     return {
       box,
       hudTop,
@@ -7387,6 +7598,7 @@ async function runCamera(page, context) {
       overlapTop: intersects(marquee, hudTop),
       overlapReadout: intersects(marquee, readout),
       opacityRules,
+      glassNodes,
       viewport: { w: window.innerWidth, h: window.innerHeight },
     };
   });
@@ -7409,6 +7621,20 @@ async function runCamera(page, context) {
     'G-disabled：button:disabled 的规则里不出现 opacity（灰阶 + 收 glow，不减透明度）',
       occlusion.opacityRules.length === 0,
       `还在用 opacity 的选择器：${occlusion.opacityRules.join(' / ') || '（无）'}`,
+  );
+  /*
+   * G-无玻璃（Stage 3b）：HUD 里不许再有 `backdrop-filter: blur()`。
+   *
+   * 计划原本想让"调色板"一条门同时管住玻璃，量过之后知道管不住 ——
+   * blur 不新增**声明色**，它改的是采样方式（见 xixi 段 G-调色板 的注释）。
+   * 所以把"玻璃换硬边"这件事搬成它自己的、直接可测的判据：
+   * 可见节点里 computed `backdropFilter` 含 `blur(` 的数量必须为 0。
+   * 这条和 G-调色板 是**互不包含**的两半：一个抓"多一族颜色"，一个抓"多一层玻璃"。
+   */
+  check(
+    'G-无玻璃：#hud 内可见节点都没有 backdrop-filter 模糊（面板 = 不透明 + 硬描边）',
+      occlusion.glassNodes.length === 0,
+      `带 blur 的可见节点：${occlusion.glassNodes.join(' / ') || '（无）'}`,
   );
   /*
    * G-字号（Stage 3b）：HUD 里**可见文本**的 computed font-size 不许低于 11px。
