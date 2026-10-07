@@ -714,6 +714,56 @@ function coinsPerCycle(cycles) {  const perCycle = [];
   return { perCycle, total, average, maxCycle, longestGap };
 }
 
+/**
+ * 相位锁定的净输送采样：只在**每个循环开始**（`pusher.cycles` 递增的那一刻）读一次币的 z。
+ *
+ * 为什么必须锁相位：推板行程是振荡量（振幅 = `TABLE.pusherTravel` 0.36 米），
+ * 比净输送大一个半数量级；不锁相位读到的是振幅，不是漂移。
+ *
+ * 出厂臂（②）与破对称正对照（③）共用这一份 —— 两处各写一遍采样节拍的话，
+ * 将来改其中一处就会出现「正对照量的不是判据量的那个量」，正对照随即失效。
+ *
+ * `perCycle === null` 表示样本不足（币离场或超时）。**这算红还是算缺席由调用方定**：
+ * 出厂臂上是「读不到」，正对照上是「对照根本没跑成」—— 后者必须红，
+ * 因为一条没执行过的正对照等于守卫没被证明过。
+ */
+async function samplePhaseLockedDrift(page, samples, budgetMs) {
+  const zs = [];
+  let cycles = (await readState(page))?.pusher?.cycles ?? 0;
+  const deadline = Date.now() + budgetMs;
+  while (zs.length < samples && Date.now() < deadline) {
+    const state = await readState(page);
+    if ((state?.pusher?.cycles ?? 0) > cycles) {
+      cycles = state.pusher.cycles;
+      const coin = await playerCoin(page);
+      if (coin) zs.push(coin.z);
+    }
+    await page.waitForTimeout(60);
+  }
+  const perCycle = zs.length >= 2 ? (zs[zs.length - 1] - zs[0]) / (zs.length - 1) : null;
+  return { zs, perCycle };
+}
+
+/** 写调参表并立刻落到推板实例字段（`Game.applyTuning`），与调试面板同一条路径。 */
+const setPusherRetractSec = (page, value) =>
+  page.evaluate((v) => window.__THREE_GAME_TEST_HOOKS__?.setTuning?.({ pusherRetractSec: v }), value);
+
+/**
+ * 回读**实际生效**的 retract 秒数。
+ *
+ * 两个坑，各对应一处实现：
+ * 1. 读 `physics.tuning.pusher.retractSec` 而不是调参表 —— 诊断快照那一段刻意读的是
+ *    推板实例字段 `Pusher.durations`（见 `snapshot.ts` 的「一律读实际生效值」注释）。
+ *    `setTuning` **不校验键名**，所以「拼错键 ⇒ 两臂其实测同一个东西」只能靠这条回读抓住。
+ * 2. 必须走 `readStateFresh`（等 140 毫秒）而不是 `readState` —— `setTuning` 只调
+ *    `applyTuning()`，**不调 `publishDiagnostics()`**，快照要等下一帧才带上新的值。
+ *    实测（`scripts/_retract-restore.mjs`）：连写四次，第 1、2 次的立即读碰巧是新值，
+ *    第 3、4 次读到的是**上一帧的旧值**，一秒后才追上 ⇒ 立即读是竞态，会让「还原门」
+ *    在还原其实成功的情况下报红。
+ */
+const readRetractSec = async (page) =>
+  (await readStateFresh(page))?.physics?.tuning?.pusher?.retractSec ?? null;
+
 async function runProbe(page) {
   console.log('\n── 模式：probe（满盘稳定性 + 单枚币路径） ──');
   await startRun(page, 'ready');
@@ -798,23 +848,10 @@ async function runProbe(page) {
   );
 
   // ── ② 相位锁定的净输送 ──
-  // 采样必须锁在**同一相位**（每个循环开始、`offset ≈ 0` 的那一刻），
-  // 否则读到的是振荡量（振幅 = 推板行程 0.36 米，比净输送大一个半数量级）。
+  // 采样锁在**同一相位**（每个循环开始、`offset ≈ 0` 的那一刻）；为什么必须锁相位、
+  // 以及这份采样与 ③ 的正对照共用同一个实现，见 `samplePhaseLockedDrift`。
   const PHASE_SAMPLES = 5;
-  const phaseZs = [];
-  let phaseCycles = (await readState(page))?.pusher.cycles ?? 0;
-  const phaseDeadline = Date.now() + 40_000;
-  while (phaseZs.length < PHASE_SAMPLES && Date.now() < phaseDeadline) {
-    const state = await readState(page);
-    if ((state?.pusher?.cycles ?? 0) > phaseCycles) {
-      phaseCycles = state.pusher.cycles;
-      const coin = await playerCoin(page);
-      if (coin) phaseZs.push(coin.z);
-    }
-    await page.waitForTimeout(60);
-  }
-  const netDrift = phaseZs.length >= 2 ? phaseZs[phaseZs.length - 1] - phaseZs[0] : null;
-  const perCycle = netDrift !== null ? netDrift / (phaseZs.length - 1) : null;
+  const { zs: phaseZs, perCycle } = await samplePhaseLockedDrift(page, PHASE_SAMPLES, 40_000);
   // 上限取层高/10（×1.1 档 = 2.32 毫米/循环）：已观测读数在 0~0.5 毫米/循环之间，留 4.6 倍余量。
   // ⚠️ 这个上限是 **probe 默认盘面（预置 382 枚）的属性**，不是普适常数：S1a 实测薄床
   //    （clearBedTo(120)）时同一枚币能走 3.2 毫米/循环 ⇒ 换盘面要重推。
@@ -852,6 +889,67 @@ async function runProbe(page) {
     (afterPusher?.peakSpikeSpeed ?? 99) <= freeFallBudget,
     `压速 ${afterPusher?.spikeClamps} 次，峰值 ${afterPusher?.peakSpikeSpeed} 米/秒` +
       `（自由落体上限 ${freeFallBudget.toFixed(2)}）`,
+  );
+
+  /*
+   * ── ③ 正对照：把行程打破对称，②那条判据必须翻红 ──
+   *
+   * ② 写的是 `Math.abs(perCycle) <= driftLimit`，双向。但**双向只在两臂都跑过才算守住**：
+   * 出厂臂的实测净漂移是**负的**（−0.25 毫米/循环），所以谁把它改成单向的
+   * `perCycle <= driftLimit`，出厂臂照样绿 —— 而且**永远绿**，那是个恒真式。
+   * 只有这一臂能抓住它（这正是 10-07「无自推进 = A」裁决要求保留的正对照）。
+   *
+   * 破对称的方式就是 S13 那次事故的原样：`retract` 砍半（当年 0.9 → 0.45 实测
+   * 24.00 毫米/循环 ≈ 上限的十倍）。走 `setTuning({pusherRetractSec})` ⇒ 写的是
+   * **每帧现读**的 `Pusher.durations`（`Game.applyTuning`），不碰 `constants.ts`、不刷页面
+   * （刷页面会让进行中的验证批全部作废，见 `setCoinPhysics` 注释里的同一条理由）。
+   *
+   * 两件事必须自证，否则这一臂可能什么都没改就"通过"了：
+   *   · 采样前回读**实际生效值**（`readRetractSec`）—— `setTuning` 不校验键名，
+   *     拼错的键会静悄悄写进一个不存在的属性 ⇒ 两臂测的是同一个东西；
+   *   · 收尾还原并同样回读。`all` 模式（probe + endless + xixi）下**盘面**污染不是问题
+   *     （`Game.startRun` 会 `coins.releaseAll()` 重摆整盘），但**调参表不会自己复位** ⇒
+   *     不还原就是带着半行程跑完后面所有模式。
+   */
+  const retractFactory = await readRetractSec(page);
+  const retractBroken = retractFactory === null ? null : retractFactory / 2;
+  await setPusherRetractSec(page, retractBroken);
+  const retractLive = await readRetractSec(page);
+  const armTook =
+    retractBroken !== null && retractLive !== null && Math.abs(retractLive - retractBroken) < 1e-9;
+
+  // 币若已离场就补投一枚，并等它落稳：**在途**的币 z 还在落币走廊里，
+  // 拿它当第一个相位样本会把「下落」读成「输送」，正对照就成了为错误的理由通过。
+  if (!(await playerCoin(page))) {
+    await dropUntilAccepted(page, 0);
+    await page.waitForTimeout(2500);
+  }
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setPusherRunning?.(true));
+
+  // 3 个样本 = 2 个循环：破对称臂每循环约 24 毫米，2 个循环已是上限的二十倍，
+  // 不需要出厂臂那 5 个样本的分辨率；而周期只有约 1.95 秒（retract 砍半），采样更便宜。
+  const control = await samplePhaseLockedDrift(page, 3, 25_000);
+  check(
+    '③ 正对照：retract 砍半打破对称后，②那条判据必须翻红（|净漂移| > 层高/10）',
+    armTook && control.perCycle !== null && Math.abs(control.perCycle) > driftLimit,
+    !armTook
+      ? `破对称臂没生效：出厂 retract=${retractFactory}、写入目标 ${retractBroken}、实际生效 ${retractLive}` +
+        '（setTuning 不校验键名，这条回读就是防"拼错键 ⇒ 两臂测同一个东西"）'
+      : control.perCycle === null
+        ? `正对照没采到样本（只 ${control.zs.length} 个循环）⇒ 守卫未被证明，不能算通过`
+        : `破对称后每循环净漂移 ${(control.perCycle * 1000).toFixed(2)} 毫米 vs 上限 ` +
+          `${(driftLimit * 1000).toFixed(2)} 毫米（retract ${retractFactory} → ${retractLive} 秒，` +
+          `采到 ${control.zs.length} 个循环）`,
+  );
+
+  await setPusherRetractSec(page, retractFactory);
+  const retractRestored = await readRetractSec(page);
+  check(
+    '③ 正对照收尾：行程还原成出厂对称值（`all` 模式下后续模式不带半行程跑）',
+    retractFactory !== null &&
+      retractRestored !== null &&
+      Math.abs(retractRestored - retractFactory) < 1e-9,
+    `还原后 retract=${retractRestored}（出厂 ${retractFactory}）`,
   );
   return timeline;
 }
