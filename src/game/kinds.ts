@@ -11,8 +11,9 @@
  * 也是 `verify-game.mjs` 里「虚拟币种只改一处」用例的依据。
  */
 
-export type CoinKindId = 'bronze' | 'pattern' | 'payout' | 'bounty' | 'diamond' | 'chest';
+import type { CoinEffectId } from './effects';
 
+export type CoinKindId = 'bronze' | 'pattern' | 'payout' | 'bounty' | 'diamond' | 'chest' | 'debt';
 /** 兼容旧名（`CoinKind` 在 constants 里一直是 `keyof typeof COIN_KIND`）。 */
 export type CoinKind = CoinKindId;
 
@@ -21,15 +22,16 @@ export type CoinKind = CoinKindId;
  *
  * - `multiplied`：基数 × 热度 × 热区 × 加注；`gated` 为真时先过概率闸门（铜币、花纹）。
  * - `fixed`：越线返固定筹码，**不吃任何倍率**——防「用热度/加注刷固定值」的通道。
- * - `effect`：返 0 筹码，改由 ShowDirector 派发演出。
- *   ⚠️ **S16 起没有币种在用这个形态**（宝箱从 `effect` 改成了 `fixed` 50）。
- *   形态与分派（`Game.settleCrossing`、`economy.crossingReturn`）都**刻意保留**：
- *   删掉以后再加就要把三处一起重写，而它本身零成本。
+ * - `effect`：**返 0 筹码**，改由 `CoinEffects.dispatchCoin` 结算挂在币上的效果。
+ *   S16 起这条一度空转（宝箱改成固定 50），10-07 的 Stage 2 由**催债币**重新启用它 ——
+ *   所以它不是"预留的死分支"了，有真用户、也有真判据（见 `verify-game.mjs` 的 Stage 2 那组门）。
+ *   ⚠️ `effect` 的名字从 `show: 'chest'` 改成 `effect: CoinEffectId`：
+ *   原先演出名被硬编码在类型里，等于"币种能干什么"写在类型表外面一处。
  */
 export type KindPayout =
   | { mode: 'multiplied'; base: number; gated: boolean; gateChance: number }
   | { mode: 'fixed'; chips: number }
-  | { mode: 'effect'; show: 'chest' };
+  | { mode: 'effect'; effect: CoinEffectId };
 
 /**
  * 越线高潮的色调。**唯一真源**——`Hud.flashClimax` 与 `styles.css` 的
@@ -60,7 +62,7 @@ export type CoinKindSpec = {
 };
 
 /**
- * 六种币。**返值数值刻意放在这里**（而不是 `ENDLESS`）：
+ * 七种币（10-07 Stage 2 加了催债币）。**返值数值刻意放在这里**（而不是 `ENDLESS`）：
  * 「这个币种值多少」是币种自身的属性，数值与身份分家就是「5 处清单」的根源。
  * `ENDLESS` 只留模式级调参（买入、连落窗口、注入率等）。
  *
@@ -280,6 +282,23 @@ export const KINDS: Record<CoinKindId, CoinKindSpec> = {
     lockedPalette: { base: '#c98a3a', dark: '#7a4c17', ink: '#3b220a' },
     audioHz: 520,
     climax: { strength: 1, tone: 'gold' },
+  },
+  debt: {
+    id: 'debt',
+    label: '催债币',
+    // ★ Stage 2：`effect` 形态的第一个真用户 —— 越线**不返筹码**，反而按余额比例扣一笔
+    //   （同一张 `fineRatio` 表，见 `xixi.ts`；扣减走 `RunState.settleFine` 那条唯一出口，
+    //   所以三账本恒等式一个字不改）。它是**汇**不是源：不往盘面加币，`water` 为 0。
+    //   深度到 `HAZARD_AFTER_DROPS` 之后按 `HAZARD_EVERY_DROPS` 注入，越深的局越凶。
+    payout: { mode: 'effect', effect: 'debtCoin' },
+    glyph: '债',
+    // 红色是玩法里的"危险"色（与 `--danger` 同支），但它**不进 ClimaxTone**：
+    // 那个枚举四处联动（styles.css 的规则 + keyframes + Hud 的 remove 名单），
+    // 加一档要四处同改；催债币的"疼"由扣款文案与低音承载，不需要一次全屏闪。
+    glow: { color: '#d0674a', intensity: 0.55 },
+    lockedPalette: { base: '#7c3a2c', dark: '#38160f', ink: '#f2d9c8' },
+    audioHz: 180,
+    climax: null,
   },
 };
 

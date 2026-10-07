@@ -116,7 +116,7 @@
         <div id="cabinet-skin-list" class="skin-list"></div>
       </section>
 
-      <!-- 破产弹窗：无尽模式的核心产出，不是失败惩罚。 -->
+            <!-- 破产弹窗：无尽模式的核心产出，不是失败惩罚。 -->
       <section id="ruin-panel" hidden>
         <h2 id="ruin-title">破产</h2>
         <p id="ruin-taunt"></p>
@@ -127,6 +127,14 @@
           <button id="beg-button" type="button">跪求 xixi 大王大赏</button>
           <button id="quit-button" type="button">保留尊严，收工</button>
         </div>
+      </section>
+      <!-- 波间三选一（1c）：攒够本波票券之后立起来的一张选卡面板。
+           **不是破产窗**：语义上它是奖励，样式上刻意不复用 #ruin-panel 的规则，
+           但用同一套面板语言（硬边、铭牌、按钮），所以它看起来是同一台机器上的东西。 -->
+      <section id="draft-panel" hidden>
+        <h2 id="draft-title">波间三选一</h2>
+        <p id="draft-meta"></p>
+        <div id="draft-choices"></div>
       </section>
     </main>
     <script type="module" src="/src/main.ts"></script>

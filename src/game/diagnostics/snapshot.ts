@@ -13,6 +13,8 @@ import { round3 } from '../../utils/numeric';
 import { coinPhysics } from '../coinPhysics';
 import { ENDLESS, RULES, TABLE } from '../constants';
 import { ledgerBalances } from '../economy';
+import { DRAFT_COST, HAZARD_AFTER_DROPS, HAZARD_EVERY_DROPS, TICKET_COMBO_TIER, TICKET_EVERY_CROSSINGS, TICKET_JACKPOT } from '../waves';
+import { totalCoinEffectWater, totalWater } from '../effects';
 
 export function build(host: DiagnosticsHost) {
 const info = host.renderer().info;
@@ -168,6 +170,39 @@ return {
     referenceStake: ENDLESS.buyIn,
     // 本局已注入的大赏币枚数（注入率断言的分子）。
     bounties: snapshot.bounties,
+    /*
+     * ── 票券与波次（1b）：读数与**表**一起给 ──
+     * 判据一律读这里，不在脚本里抄 `12 / 5 / 2 / 1` 的第二份（与上面
+     * `bountyEveryDrops`、`referenceStake` 同一条理由）。
+     */
+    tickets: snapshot.tickets,
+    ticketEarned: snapshot.ticketEarned,
+    ticketSpent: snapshot.ticketSpent,
+    ticketBySource: host.run().ticketBySource,
+    crossings: snapshot.crossings,
+    wave: snapshot.wave,
+    waveTickets: snapshot.waveTickets,
+    waveTarget: snapshot.waveTarget,
+    pendingDraft: snapshot.pendingDraft,
+    draftsTaken: snapshot.draftsTaken,
+    ticketEveryCrossings: TICKET_EVERY_CROSSINGS,
+    /** 本局**当前生效**的间隔（「票孔」会把它压到下限）—— 注入率判据吃这个，不是吃表初值。 */
+    ticketEvery: host.run().ticketEvery,
+    ticketComboTier: TICKET_COMBO_TIER,
+    ticketJackpotChips: TICKET_JACKPOT,
+    draftCost: DRAFT_COST,
+    /*
+     * ── Stage 2：币种效果（催债币）──
+     * 一条对象而不是四个字段：`coinEffectReport()` 里有数组，调三次会得到三份不同的拷贝。
+     * 判据吃：`triggers === attributed === events.length`（归因门）与逐事件恒等
+     * `applied === min(requested, 那一刻的余额)`。表也原样吐出去，脚本不抄 `45 / 24`。
+     */
+    coinEffects: host.coinEffects().coinEffectReport(),
+    coinEffectWaterTotal: totalCoinEffectWater(),
+    /** 波间奖励那张表的水量合计（本轮恒为 0，池水门守的就是这个 0）。 */
+    draftWaterTotal: totalWater(),
+    hazardAfterDrops: HAZARD_AFTER_DROPS,
+    hazardEveryDrops: HAZARD_EVERY_DROPS,
   },
   pusher: {
     offset: host.pusher().offset,

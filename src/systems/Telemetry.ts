@@ -125,6 +125,23 @@ export type XixiEvent = {
   /** reward（`fine`）：**实扣**的筹码数（扣到 0 为止，所以可能小于罚款面值）。 */
   fined?: number;
   /**
+   * reward（`fine`）：这一次**该罚多少**（比例制的读数，`fineAmount(余额, 进度)`）。
+   *
+   * 比例制之后罚款不再是常量，判据要对的是
+   * `requested === round(余额 × fineRatio(进度))` 与 `fined + debtAdded === requested`
+   * ——少了这个字段就只能在 harness 里再抄一份 10%→40% 的表（本项目「同一算式抄多处」的老毛病）。
+   */
+  requested?: number;
+  /**
+   * reward（`fine`）：算 `requested` 时用的**那一刻**的余额与归一化进度（1a 比例制）。
+   *
+   * 带上输入才能做逐事件恒等 `requested === round(fineBalance × fineRatio(fineProgress))`：
+   * 滚筒转的 3~4 秒里盘面照常越线结算，场外任何时刻读到的余额都不是同一个数
+   * （10-01 实测「罚 6、筹码 169→208」），只能退化成区间判据。
+   */
+  fineBalance?: number;
+  fineProgress?: number;
+  /**
    * S5a 四同分档：`3` = 常规中奖，`4` = 大奖。只有 `win` 带它。
    * 判据靠它核「四同真的走了另一条分支」——不看这个字段的话，
    * 「大奖演成三同」在画面上完全看不出来（灯色一样、符号一样）。
@@ -132,7 +149,7 @@ export type XixiEvent = {
   tier?: 3 | 4;
   /**
    * reward（`fine`）：罚不掉而**转成欠款**的那一截（S5b）。
-   * 与 `fined` 分开记才对得了账：`fined + debtAdded` 在欠款到顶时会小于罚款面值，
+   * 与 `fined` 分开记才对得了账：`fined + debtAdded` 在欠款到顶时会小于 `requested`，
    * 而那正是「上限是承重结构」这件事唯一能被看见的时刻。
    */
   debtAdded?: number;

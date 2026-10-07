@@ -31,6 +31,16 @@
   --btn-face-2: rgba(9, 16, 12, 0.94);
   --mint: #6fd3a5;
   --danger: #d0674a;
+  /* Stage 3b · HUD 的统一语言。
+     收成一处的理由与 `--brass-rgb` 那批一样：这几个值原先散在 chip、招牌块、
+     小字读数三处各写一遍，改一处忘两处就是"同一台机器上两种玻璃"。
+     - `--text-min` 是**可读性下限**（G-字号 判据就钉这个数：#hud 内不许有更小的可见文本）；
+     - `--hud-*` 三条是"硬边面板"的组成：不透明深色面 + 双色描边 + 圆角 0~2px，
+       并且**不再用 backdrop-filter**（玻璃模糊与像素机柜是两种语言）。 */
+  --text-min: 11px;
+  --hud-face: var(--panel-solid);
+  --hud-edge: 2px solid var(--edge-hi);
+  --hud-edge-lo: 2px solid var(--edge-lo);
   color: var(--ink);
   background: #0a0f0c;
   font-family: "Avenir Next", Avenir, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
@@ -175,6 +185,18 @@ body {
   display: flex;
   align-items: stretch;
   gap: 10px;
+  /* G-遮挡（Stage 3a）：招牌屏投到屏幕空间之后占着顶部中间一块（出厂机位、
+     1280×720 实测 x 406~874 / y 7~103），顶部条要是横穿它，像素字就被压在玻璃条底下。
+     ⚠️ 这是**量出来的常数**，不是投影锚定 —— 视口或机位一变它就会失准（那种做法是 P2，
+     本轮明确不做）。G-遮挡判据守的是"出厂机位 + desktop 视口"这一格；
+     窄视口（390×844）与改动机位之后没有覆盖，要复测得把这条门挪到 shots/visual 里。 */
+  margin-block-start: var(--marquee-clearance, 0px);
+}
+
+@media (min-width: 900px) {
+  :root {
+    --marquee-clearance: 104px;
+  }
 }
 
 #level-chip {
@@ -196,10 +218,11 @@ body {
   min-width: 110px;
   max-width: 420px;
   padding: 7px 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel);
-  backdrop-filter: blur(8px);
+  /* Stage 3b：硬边面板，与 .hud-chip 同一组 token。 */
+  border: var(--hud-edge);
+  outline: var(--hud-edge-lo);
+  border-radius: 2px;
+  background: var(--hud-face);
 }
 
 #earned-block strong {
@@ -221,15 +244,16 @@ body {
   gap: 1px;
   min-width: 84px;
   padding: 7px 10px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel);
-  backdrop-filter: blur(8px);
+  /* Stage 3b：硬边面板（见 :root 那组 `--hud-*` 的理由）。 */
+  border: var(--hud-edge);
+  outline: var(--hud-edge-lo);
+  border-radius: 2px;
+  background: var(--hud-face);
 }
 
 .hud-label {
   color: var(--ink-faint);
-  font-size: 0.66rem;
+  font-size: var(--text-min);
   letter-spacing: 0.04em;
 }
 
@@ -310,15 +334,91 @@ body {
   box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.6);
 }
 
-/* 禁用：降饱和，不只降 opacity —— 灰掉的按钮才读作「不能按」，
-   半透明的按钮读作「还没加载完」。 */
+/* 禁用：降饱和 + 收 glow，**不减透明度**（`:313-314` 那句原话的执行点）。
+   G-disabled 判据静态扫 CSSOM，这条规则里再出现 `opacity` 就会红。 */
 :where(#app) button:disabled {
-  filter: saturate(0.25) brightness(0.8);
-  opacity: 0.55;
+  filter: saturate(0.2) brightness(0.62);
+  box-shadow: none;
   cursor: default;
 }
 
 /* ── 破产弹窗 ────────────────────────────────────────────────────────── */
+
+/* 波间三选一（1c）。
+   语义上它**不是**破产窗，所以不复用 #ruin-panel 的规则（那条是危险红）。
+   视觉上按 Stage 3b 的目标语言先写：硬边、双色描边、不透明深色底、圆角 0~2px ——
+   新面板不该是"下一个要被改掉的玻璃圆角"，那样 3b 就得多一次回归。 */
+#draft-panel {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 29;
+  width: min(88vw, 460px);
+  transform: translate(-50%, -50%);
+  padding: 16px 18px;
+  border: 2px solid var(--edge-hi);
+  outline: 2px solid var(--edge-lo);
+  border-radius: 2px;
+  background: var(--panel-solid);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.6);
+  text-align: center;
+}
+
+#draft-panel h2 {
+  margin: 0 0 6px;
+  color: var(--brass);
+  font-size: 1.05rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+}
+
+#draft-meta {
+  margin: 0 0 12px;
+  color: var(--ink-dim);
+  font-size: 0.8rem;
+}
+
+#draft-choices {
+  display: grid;
+  gap: 8px;
+}
+
+#draft-choices button {
+  padding: 10px 12px;
+  border: 2px solid var(--edge-hi);
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--btn-face-1), var(--btn-face-2));
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.82rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* Stage 3b · 候选卡的像素徽章（`render/pixelText.ts` 画的小画布，36×36 = 12×12 纹素 ×3）。
+   与招牌屏同一个来源：中文用系统字体在小画布上栅格化再整数放大，出来就是像素字，
+   不需要字体资产；`image-rendering: pixelated` 防止浏览器在展示时又给它插一遍值。 */
+.draft-badge {
+  display: inline-block;
+  width: 36px;
+  height: 36px;
+  margin-inline-end: 8px;
+  vertical-align: middle;
+  image-rendering: pixelated;
+}
+
+#draft-choices button:active {
+  transform: translateY(1px);
+}
+
+/* disabled 不用 opacity（与 :313-314 那段"灰阶 + 收 glow"的既有口径一致，
+   也是 Stage 3a 要立的那条规则在本文件里的第一个执行点）。 */
+#draft-choices button:disabled {
+  border-color: var(--edge-lo);
+  background: var(--panel-solid);
+  color: var(--ink-faint);
+  cursor: not-allowed;
+}
 
 #ruin-panel {
   position: absolute;
@@ -541,7 +641,7 @@ body {
   border-radius: 999px;
   background: rgba(8, 14, 11, 0.62);
   color: var(--ink-dim);
-  font-size: 0.68rem;
+  font-size: var(--text-min);
 }
 
 /* 越线得分：从币的屏幕位置飘向进度条。 */
@@ -642,14 +742,27 @@ body {
 }
 
 #resource-readout {
-  display: flex;
+  /* G-单读数（Stage 3a）：宽视口下**收起这块 DOM 读数**，余额的唯一真源是招牌屏。
+     同一件事在两个地方各显示一次，玩家不知道看哪个，而改数值时两处会各自漂。
+     ⚠️ 顺序很关键：这条 `display` 必须在下面那条窄视口的覆盖**之前**，
+     反过来写就会被同特异性的后一条吃掉（本文件已有一次 `background` 简写静默重置的教训）。 */
+  display: none;
   flex-direction: column;
   gap: 2px;
   padding: 8px 12px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--panel);
-  backdrop-filter: blur(8px);
+  /* Stage 3b：与 chip 同一组硬边 token（这块只在窄视口出现，见上面那条 G-单读数）。 */
+  border: var(--hud-edge);
+  outline: var(--hud-edge-lo);
+  border-radius: 2px;
+  background: var(--hud-face);
+}
+
+/* 窄视口反向保留 DOM 读数：小屏上招牌屏被压得很小，像素字看不清，
+   这时候"两处显示"换来的是可读性 —— 所以这是**按视口分工**，不是漏改。 */
+@media (max-width: 899px) {
+  #resource-readout {
+    display: flex;
+  }
 }
 
 #credits-value {
@@ -700,7 +813,37 @@ body {
 #reload-button small,
 #bet-button small {
   color: var(--ink-faint);
-  font-size: 0.6rem;
+  /* Stage 3b：这一层本该换成**计数灯**（亮点个数 = 剩余次数）。灯没做之前先把字号
+     抬到可读下限 —— G-字号 钉的是"#hud 内可见文本 ≥ 11px"，而"太简陋"的一半来源
+     就是这个 9.6px。两件事分开做，别把"还没做灯"写成"字号合法"。 */
+  font-size: var(--text-min);
+}
+
+/* Stage 3b · 计数灯（抓斗剩余次数，见 `Hud.setLights`）。亮 = 还有这次可用，暗 = 已用掉。
+   刻意做成**方块而不是圆**，与整机的硬边语言一致；颜色只有黄铜一档 ——
+   绿 / 蓝 / 红是玩法语义色（返币 / 钻石 / 危险），不拿来当装饰。 */
+#grapple-button small {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+}
+
+.light {
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--edge-lo);
+  background: rgba(242, 232, 210, 0.12);
+}
+
+.light-on {
+  border-color: var(--edge-hi);
+  background: var(--brass);
+  box-shadow: 0 0 6px var(--brass-glow);
+}
+
+.light-caption {
+  margin-inline-start: 4px;
 }
 
 #bet-button {
@@ -726,7 +869,7 @@ body {
 #boost-button small,
 #drop-button small {
   color: var(--ink-faint);
-  font-size: 0.66rem;
+  font-size: var(--text-min);
 }
 
 #drop-button {

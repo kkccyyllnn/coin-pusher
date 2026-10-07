@@ -449,18 +449,91 @@ export function reelFacesFor(outcome: SlotOutcome, detailRoll: number): IconId[]
 }
 
 /**
- * 惩罚：摇出胡萝卜四连时**扣本局筹码**的固定值（用户拍板：扣本局余额，不扣钱包）。
+ * 惩罚：摇出胡萝卜四连时**按余额比例**扣本局筹码（10-07 用户拍板：比例制，10%→40%）。
+ *
+ * ## 为什么从固定 6 枚改成比例
+ *
+ * 固定值在 S4 合并账户之后**失去了参照系**：合并之前 6 枚 ≈ 一次买入（20 枚）的 30%，
+ * 读作「一次就疼」；合并之后余额就是全部身家（harness 的标准注额 200），6 枚只剩 **3%**
+ * —— 同一笔罚款从"疼一下"退化成"没感觉"，而它承担的职责（把长期斜率拉回负）随之失效。
+ * 比例制把参照系换成**玩家当下有多少**：一次四连扣掉余额的 10%~40%，
+ * 一整局的期望扣款因此稳定在"四分之一身家"这个量级上，不随注额大小失真。
+ *
+ * ## ★ 一个必须点名的结构后果：`shortfall` 恒为 0（10-07 用户拍板 A）
+ *
+ * 上限是 40% ⇒ `amount ≤ 0.4 × 余额 < 余额` ⇒ `RunState.fineChips` 的 clamp **永远碰不到**
+ * ⇒ 返回的 `shortfall` 恒为 0 ⇒ `SaveStore.chargeFine`（罚款转欠款那条腿，S5b 建的）
+ * 在**正常玩法里不可达**，只剩"安全网"身份（比例上限万一被调到 > 100% 时才承重）。
+ * 旧基线「罚金实扣 ≈ 名义 28%」正是被 0 余额 clamp 打出来的 ⇒ 比例制之后它作废，
+ * 新事实是**实扣 ≡ 名义（100%）**、罚款产生的 debt ≡ 0。
+ * 判据因此不再"构造一个低余额场景去等 shortfall"，而是：
+ * ① 逐事件恒等 `applied === requested` 且 `debtAdded === 0`（这条就是"永不转债"的守卫）；
+ * ② clamp / 欠款上限那套机器改由**合成输入**直接驱动（`testHooks.applyFine`），
+ *   因为它已经不可能从玩法里到达 —— 留着不测等于把承重结构当死代码。
+ *
+ * ## 事件率（沿用旧推导，它没变）与量级
+ *
+ * XIXI 约 11 投集齐一次，每次摇奖 15% 是惩罚 → 约 **0.014 次/投**，一局 50~80 投约
+ * **0.7~1.1 次** ⇒ 一整局的期望扣款 ≈ 1 次 × 中段比例（约 25%）≈ **余额的四分之一**。
+ * 这个量级是**刻意的**（负 EV 降为软约束之后，长期斜率就靠这类事件拉回来），不是标定残差。
  *
  * - **不吃任何倍率**（不加注 / 不热度 / 不热区），与 payout / bounty 同规则。
- * - 扣到 0 为止：归零后由既有的沉降分支接管（`RunState.enterRuinSettle`），
- *   **不新开破产路径**。
+ * - **一次罚款不可能把余额打到 0**（上限 40%）⇒ 它不直接判死，只是把沉降提前；
+ *   归零仍然只由既有的沉降分支接管（`RunState.enterRuinSettle`），**不新开破产路径**。
  * - 走 `RunState.spendChips`（唯一的扣减入口），所以三账本恒等式一个字不改。
- *
- * 取 6 的推导：XIXI 约 11 投集齐一次，每次摇奖 15% 是惩罚 →
- * 约 **0.014 次/投**，一局 50~80 投约 **0.7~1.1 次**。6 枚 ≈ 一次买入（20 枚）的 30%，
- * 一次就疼、但不至于直接判死。**这个数随 §10.5 的标定一起复测。**
  */
-export const SLOT_PENALTY_CHIPS = 6;
+export const FINE_RATIO_FLOOR = 0.1;
+export const FINE_RATIO_CEIL = 0.4;
+
+/**
+ * 罚款深度：多少投把比例从下限拉满到上限。
+ *
+ * 取 90 = 实测局长中位数（S6 标定终稿：中位 93 投），也与设计目标「一条命 60~90 投」的
+ * 上沿重合 ⇒ **打到底**的一局正好走完整条坡，中途破产的人停在坡上对应的位置。
+ */
+export const FINE_RAMP_DROPS = 90;
+
+/**
+ * 进度 → 罚款比例。`progress` 是**归一化**深度（0 = 开局、1 = 已到封顶深度，越界会被夹）。
+ *
+ * ★ 参数刻意是"进度"而不是"波次"或"投数"：进度怎么算由调用方决定，于是这张 10%→40% 的表
+ * **永远只有一份**。1a 的调用方用投数（`drops / FINE_RAMP_DROPS`）；波次系统落地后改成波次
+ * —— 换的是调用方那一行，不是这张表（否则又是"同一算式抄多处"）。
+ */
+export function fineRatio(progress: number): number {
+  const t = clamp01(progress);
+  return FINE_RATIO_FLOOR + (FINE_RATIO_CEIL - FINE_RATIO_FLOOR) * t;
+}
+
+/**
+ * 罚款额（筹码）= 余额 × 当前比例，四舍五入到整数筹码。
+ *
+ * 负余额按 0 处理：欠着钱的人不该被罚出**负数**（那会变成入账）。
+ * 余额为 0 时返回 0 ⇒ 结算那边会走「一分罚不出」的文案分支，而不是凭空造一笔欠款。
+ */
+export function fineAmount(balance: number, progress: number): number {
+  return Math.round(Math.max(0, balance) * fineRatio(progress));
+}
+
+/** 一次罚款的报价：金额，**外加算它时用的两个输入**。 */
+export type FineQuote = { amount: number; balance: number; progress: number };
+
+/**
+ * 余额 + 进度 → 一次罚款的报价。
+ *
+ * 为什么连输入一起返回：比例制之后金额是**算出来的**，判据要核的是
+ * `amount === round(balance × fineRatio(progress))`；而余额在滚筒转的那 3~4 秒里还在动
+ * （盘面照常越线结算，10-01 实测过「罚 6、筹码 169→208」）⇒ 场外永远读不到"那一刻"的余额。
+ * 把输入随金额一起送进遥测，恒等式才能在**逐事件**口径上精确成立，
+ * 不用退化成区间/容差判据（那是本项目"薄样本 + 容差"假绿的常见来源）。
+ *
+ * `balance` 记的是**真正参与计算的那个数**（负余额已被夹到 0），不是原始读数 ——
+ * 否则 `amount === round(balance × ratio)` 在余额为负时会算不平。
+ */
+export function quoteFine(balance: number, progress: number): FineQuote {
+  const usable = Math.max(0, balance);
+  return { amount: fineAmount(usable, progress), balance: usable, progress };
+}
 
 /**
  * 每投允许的免费币预算（枚/投）——**这是被实测钉出来的红线**，不是拍脑袋。

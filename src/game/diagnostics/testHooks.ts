@@ -77,10 +77,15 @@ import {
   layoutValue,
 } from '../layout';
 import {
+  FINE_RATIO_CEIL,
+  FINE_RATIO_FLOOR,
+  FINE_RAMP_DROPS,
   SLOT_OUTCOME_KEYS,
   SLOT_OUTCOME_WEIGHTS,
   SLOT_SYMBOL_WEIGHTS,
   SLOT_TIER4_SYMBOLS,
+  fineAmount,
+  fineRatio,
   outcomeTotalWeight,
   outcomeWeightKey,
   reelFacesFor,
@@ -616,6 +621,46 @@ export function createTestHooks(host: TestHooksHost): ThreeGameTestHooks {
       mapIsScreen: material.map === texture,
       emissiveMapIsScreen: material.emissiveMap === texture,
       offsetX: Number(texture.offset.x.toFixed(4)),
+    };
+  },
+  /**
+   * 招牌屏在**屏幕空间**的包围盒（CSS 像素，相对视口）。G-遮挡判据吃它（Stage 3a）。
+   *
+   * 做法与 `Game.ts:2620` 那条 HUD 锚定同源：取面板几何的四角、`localToWorld`、
+   * `project(camera)`，再把 NDC 换到画布矩形里的像素。
+   * 刻意在页面里算完再返回纯数字 —— DOMRect 不能跨 evaluate 边界序列化。
+   */
+  marqueeScreenBox: () => {
+    const mesh = host.tableGroup()?.getObjectByName('marqueeScreen') as THREE.Mesh | undefined;
+    if (!mesh) return null;
+    const size = (mesh.geometry as THREE.PlaneGeometry).parameters;
+    const halfW = (size.width ?? 0) / 2;
+    const halfH = (size.height ?? 0) / 2;
+    const box = host.canvasBox();
+    const camera = host.camera();
+    const corners: Array<[number, number]> = [];
+    for (const [sx, sy] of [
+      [-1, -1],
+      [1, -1],
+      [1, 1],
+      [-1, 1],
+    ]) {
+      const point = new THREE.Vector3(sx * halfW, sy * halfH, 0);
+      mesh.localToWorld(point);
+      point.project(camera);
+      corners.push([
+        box.left + ((point.x + 1) / 2) * box.width,
+        box.top + ((1 - point.y) / 2) * box.height,
+      ]);
+    }
+    const xs = corners.map((c) => c[0]);
+    const ys = corners.map((c) => c[1]);
+    return {
+      minX: Math.min(...xs),
+      maxX: Math.max(...xs),
+      minY: Math.min(...ys),
+      maxY: Math.max(...ys),
+      corners,
     };
   },
   /**
@@ -1252,6 +1297,108 @@ export function createTestHooks(host: TestHooksHost): ThreeGameTestHooks {
     const out: string[][] = [];
     for (let i = 0; i < 25; i += 1) out.push(reelFacesFor(outcome, i / 25));
     return out;
+  },
+  /**
+   * 1a 比例制罚款的**表与算式**（只读）。
+   *
+   * 判据不许自己写 10% / 40% / 90 投的第二份抄本，也不许自己写线性插值 ——
+   * 一律调这里的 `ratioAt` / `amountFor`，它们就是 `xixi.ts` 那两个函数本身。
+   * 端点由判据用**字面量**钉住（0.1 / 0.4 是用户拍板的设计值，不是从实现读回来的数），
+   * 否则"改了表判据也跟着改"就成了自证。
+   */
+  fineRule: () => ({
+    ratioFloor: FINE_RATIO_FLOOR,
+    ratioCeil: FINE_RATIO_CEIL,
+    rampDrops: FINE_RAMP_DROPS,
+    ratioAt: (progress: number) => fineRatio(progress),
+    amountFor: (balance: number, progress: number) => fineAmount(balance, progress),
+  }),
+  /**
+   * 用**合成金额**走一遍罚款结算的两步（`RunState.fineChips` → `SaveStore.chargeFine`）。
+   *
+   * 存在的理由（10-07 用户拍板 A）：比例制上限 40% ⇒ 真实玩法里 `shortfall` 恒为 0，
+   * 「扣不掉转欠款 + 欠款上限 clamp」这套机器**从玩法到达不了**。要么把它当死代码放着不测，
+   * 要么直接喂一个超过余额的金额 —— 选后者：它是承重结构（S5b 的原始理由），
+   * 不测就等于把 clamp 与 debt 上限的回归敞着。
+   *
+   * ⚠️ 这两步是 `Game.ts` 里 SlotMachine deps 那份组合的**镜像**（同样
+   *   `fineChips` → `chargeFine` → `publishHud`）。镜像万一与真接线走散也不会静默：
+   *   真玩法那条由 xixi 模式的逐事件恒等门覆盖（`applied === requested` 且 `debtAdded === 0`）。
+   */
+  /**
+   * 直接触发一次**币种效果**（Stage 2 的催债币），返回两侧读数。
+   *
+   * 存在的理由与前两条同族：真让一枚催债币走完台面要几分钟物理，
+   * 而"扣款走的是唯一扣减口、并且留了归因"这件事本身是**结算逻辑**，可以定点验。
+   * 真实越线那条**接线**由 economy 批的逐局恒等门覆盖（危险币从第 45 投起自动注入）。
+   */
+  coinEffectTrigger: (effect: string) => {
+    const read = () => ({
+      chips: host.run().chips,
+      fines: host.run().fines,
+      spent: host.run().spent,
+      debt: host.save().debt,
+      earned: host.run().earned,
+    });
+    const before = read();
+    const triggersBefore = host.coinEffects().coinEffectReport().triggers;
+    host.coinEffects().dispatchCoin(effect as never);
+    host.publishHud();
+    return {
+      before,
+      after: read(),
+      report: host.coinEffects().coinEffectReport(),
+      /** 本次是否真的多了一条触发（`effect` 不认识时为 false —— 别把空操作读成生效）。 */
+      fired: host.coinEffects().coinEffectReport().triggers > triggersBefore,
+      statusLine: document.querySelector('#status-line')?.textContent ?? '',
+    };
+  },
+  applyFine: (amount: number) => {
+    const read = () => ({
+      chips: host.run().chips,
+      fines: host.run().fines,
+      spent: host.run().spent,
+      debt: host.save().debt,
+    });
+    const before = read();
+    const { applied, shortfall } = host.run().fineChips(amount);
+    const debtAdded = host.save().chargeFine(shortfall);
+    host.publishHud();
+    return {
+      requested: amount,
+      applied,
+      shortfall,
+      debtAdded,
+      before,
+      after: read(),
+      ceiling: host.save().debtCeiling,
+    };
+  },
+  /**
+   * 合成地走 N 次「一枚币越线」的票券入口（`RunState.noteCrossing`）。
+   *
+   * 存在的理由与 `applyFine` 同一条：**真攒 12 枚越线要等约 27 分钟的物理行程**
+   * （`TICKET_EVERY_CROSSINGS = 12`，而薄床下单枚币走完台面要四位数循环），
+   * 判据不能靠"恰好走到"。这里驱动的是**引擎自己那个函数**，不是另写一份计数逻辑，
+   * 所以它验的是状态机（发券、分源、待办标记），不是接线。
+   * ⚠️ 接线（`Game.settleCrossing` 真的会调它）由 economy 的逐局恒等门覆盖，不在这里。
+   */
+  noteCrossings: (count: number) => {
+    const run = host.run();
+    const n = Math.max(0, Math.floor(count));
+    for (let i = 0; i < n; i += 1) run.noteCrossing(0);
+    host.publishHud();
+    return {
+      asked: n,
+      crossings: run.crossings,
+      tickets: run.tickets,
+      ticketEarned: run.ticketEarned,
+      ticketSpent: run.ticketSpent,
+      ticketEvery: run.ticketEvery,
+      wave: run.wave,
+      waveTickets: run.waveTickets,
+      pendingDraft: run.pendingDraft,
+    };
   },
 };
 }

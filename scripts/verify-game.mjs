@@ -2126,17 +2126,17 @@ async function runEconomy(page) {
     const slotEvents = xixiEvents ?? [];
     const spins = slotEvents.filter((event) => event.phase === 'spin').length;
     const slotFines = slotEvents.reduce((sum, event) => sum + (event.fined ?? 0), 0);
-    /* #66A 的两个批级读数（**只打印、不进判据**，定档要另攒够 n）：
-       ① 「名义 vs 实扣」不在这里写 6 —— 面值真源是 `xixi.ts` 的 `SLOT_PENALTY_CHIPS`，
-          抄第二份就是「同一几何写两份」那个老坑。名义取本局**最大单笔** `fined + debtAdded`
-          （没被欠款上限截断的那笔就是面值；全被截断时会**低估** ⇒ 这一列只当方向读数）。
-       ② `granted === false` 在 `miss`（`SlotMachine.ts:377`）与 `fine`（`:397`）上恒为 false，
+    /* #66A 的两个批级读数：
+       ① 「名义 vs 实扣」——1a 比例制之后名义不再要反推：事件自带 `requested`
+          （= 那一刻的余额 × 表算出的比例）。旧写法取 `max(fined + debtAdded)` 反推，
+          在比例制下**只会拿到实扣**（debt 恒 0），于是"实扣/名义"变成 1 的恒等式自证。
+          ⚠️ 只有 1a 之后产生的遥测才有 `requested`；读不到就按**缺席**报，不拿 0 充数
+          （`requestedCount` 就是为这个存在的）。
+       ② `granted === false` 在 `miss`（`SlotMachine.ts:379`）与 `fine`（`:395`）上恒为 false，
           直接数它会把「没中奖」算成「存满被拒」⇒ 只数 `outcome === 'win'` 里 granted=false 的那批。 */
     const fineEvents = slotEvents.filter((event) => event.outcome === 'fine');
-    const penaltyFaceSeen = fineEvents.reduce(
-      (max, event) => Math.max(max, (event.fined ?? 0) + (event.debtAdded ?? 0)),
-      0,
-    );
+    const fineRequested = fineEvents.reduce((sum, event) => sum + (event.requested ?? 0), 0);
+    const fineRequestedCount = fineEvents.filter((event) => event.requested != null).length;
     const winEvents = slotEvents.filter((event) => event.outcome === 'win');
 
     for (const event of scoreEvents) {
@@ -2174,14 +2174,43 @@ async function runEconomy(page) {
       loans: final?.loans ?? 0,
       spins,
       slotFines,
-      /** #66A①：本局罚金次数、转欠款额、以及从实扣反推的面值（见上方注释的低估方向）。 */
+      /** #66A①：本局罚金次数、转欠款额、以及事件自带的**名义**总额（1a 之后不用反推）。 */
       fineCount: fineEvents.length,
       fineDebt: slotEvents.reduce((sum, event) => sum + (event.debtAdded ?? 0), 0),
-      penaltyFaceSeen,
+      fineRequested,
+      fineRequestedCount,
       /** #66A②：中奖里被拒收的次数（谓词 `isRefusedWin` 与 accept 的阳性对照**共用同一个**）。 */
       wins: winEvents.length,
       winRefused: winEvents.filter(isRefusedWin).length,
       ledgerOk: ledgerOk(ledger),
+      /*
+       * 1b/1c 的逐局读数。**接线证据**：`crossings` 由 `Game.settleCrossing` 加，
+       * 而 `crossed` 是从遥测的越线事件数出来的 ⇒ 两个独立真源。
+       * ⚠️ 这里只**打印**两列的对质读数，不拿它们做断言 —— 我还没现读确认 `crossed` 的口径
+       *   （它数的是全部币种还是只玩家币？`noteCrossing` 对每个越线都加一次），
+       *   而"先量再改"是本项目对未确认口径的标准处置（见记忆 feedback-verification-completeness-audit ⑫）。
+       */
+      crossings: final?.endless?.crossings ?? -1,
+      crossedReported: crossed,
+      tickets: final?.endless?.tickets ?? 0,
+      ticketEarned: final?.endless?.ticketEarned ?? 0,
+      ticketSpent: final?.endless?.ticketSpent ?? 0,
+      ticketEvery: final?.endless?.ticketEvery ?? 0,
+      ticketEveryInit: final?.endless?.ticketEveryCrossings ?? 0,
+      ticketCrossSource: final?.endless?.ticketBySource?.crossing ?? 0,
+      waveReached: final?.endless?.wave ?? 0,
+      draftsTaken: final?.endless?.draftsTaken ?? 0,
+      /**
+       * Stage 2 的**接线证据**：催债币从第 `hazardAfterDrops` 投起自动注入，
+       * 所以真打法里 `coinEffects.triggers` 会长出来。这里要的是"每次触发都留了归因"
+       * 在逐局口径上成立 —— 定点门（xixi 的 S2 那条）测不到这条链。
+       */
+      hazardTriggers: final?.endless?.coinEffects?.triggers ?? 0,
+      hazardAttributed: final?.endless?.coinEffects?.attributed ?? 0,
+      hazardEvents: final?.endless?.coinEffects?.events?.length ?? 0,
+      /** 注入尝试 / 拿到池位 —— 三条缺席原因靠它们分开（池满 vs 没走到线 vs 条件没满足）。 */
+      hazardAttempts: final?.endless?.coinEffects?.hazardAttempts ?? 0,
+      hazardSpawned: final?.endless?.coinEffects?.hazardSpawned ?? 0,
     });
     console.log(
       `  第 ${index + 1} 局：投 ${runs[index].drops} 枚 → 越线 ${crossed} 枚，` +
@@ -2195,21 +2224,124 @@ async function runEconomy(page) {
   }
 
   /* #66A 的批级读数（一行汇总，不改上面那行的格式 —— 外部解析器吃的是那行）。
-     只打印、不参与判据：定档要 n 与区间，这一列先回答"这两件事到底有没有数"。 */
+     ②仍然只打印（定档要 n 与区间）；①在 1a 之后**升格成判据**：名义是事件自带的，
+     不再是"从实扣反推"，所以 `Σ实扣 === Σ名义` 是一条能红的恒等式。 */
   {
     const fineCount = runs.reduce((sum, run) => sum + run.fineCount, 0);
     const fined = runs.reduce((sum, run) => sum + run.slotFines, 0);
     const fineDebt = runs.reduce((sum, run) => sum + run.fineDebt, 0);
-    const face = Math.max(...runs.map((run) => run.penaltyFaceSeen), 0);
+    const face = runs.reduce((sum, run) => sum + run.fineRequested, 0);
+    const faceStamped = runs.reduce((sum, run) => sum + run.fineRequestedCount, 0);
     const wins = runs.reduce((sum, run) => sum + run.wins, 0);
     const refused = runs.reduce((sum, run) => sum + run.winRefused, 0);
     const gamesWithFine = runs.filter((run) => run.fineCount > 0).length;
     console.log(
-      `  [info] #66A 读数（不进判据）：罚金 ${fineCount} 次 / ${gamesWithFine} 局有罚金 ⇒ ` +
-        `实扣 ${fined}、转欠款 ${fineDebt}、反推面值 ${face || '—（全批没罚过款）'} ⇒ 实扣/名义 ` +
-        `${face ? (fined / (face * fineCount)).toFixed(3) : '—'}（面值被欠款上限截断时这一列偏低）；` +
-        `win 拒收 ${refused}/${wins} = ${wins ? (refused / wins).toFixed(3) : '—'}（兜底频率分母是中奖数，不是投币数）`,
+      `  [info] #66A 读数：罚金 ${fineCount} 次 / ${gamesWithFine} 局有罚金 ⇒ ` +
+        `名义 Σ${face}（事件带 requested 的 ${faceStamped}/${fineCount} 笔）、实扣 Σ${fined}、` +
+        `转欠款 Σ${fineDebt} ⇒ 实扣/名义 ${face ? (fined / face).toFixed(3) : '—'}；` +
+        `win 拒收 ${refused}/${wins} = ${wins ? (refused / wins).toFixed(3) : '—'}（不进判据，兜底频率分母是中奖数，不是投币数）`,
     );
+    if (fineCount > 0 && faceStamped === fineCount) {
+      check(
+        '1a 比例制罚金：逐笔全额实扣（Σ实扣 === Σ名义）且罚款不进欠款（ΣdebtAdded === 0）',
+        fined === face && fineDebt === 0,
+        `${RUNS} 局里罚金 ${fineCount} 次：名义 Σ${face} vs 实扣 Σ${fined}（差 ${fined - face}），转欠款 Σ${fineDebt}`,
+      );
+    } else {
+      // **缺席**而非绿/红（本项目纪律：样本不足不表态）。
+      console.log(
+        `  [info] 1a 罚金恒等门**缺席**：${
+          fineCount === 0
+            ? '本批一笔罚金都没发生（约 0.014 次/投，小批正常）'
+            : `只有 ${faceStamped}/${fineCount} 笔带 requested ⇒ 遥测早于 1a 或字段丢了`
+        } ⇒ 不进 check`,
+      );
+    }
+  }
+  /*
+   * ── 1b/1c 的逐局恒等门（**接线证据**：这一批是真打法，票券全部由 `Game.settleCrossing`
+   *    → `RunState.noteCrossing` 这条路挣到，与 xixi 模式那三条合成驱动的判据互补）──
+   * 三条各自独立：① 恒等式 `tickets === earned − spent`；② 分源 `crossing === floor(crossings / every)`；
+   * ③ 每一局的 `ticketEvery` 必须还是表初值（票券的强化**只在本局**，跨局累积就是通胀）。
+   */
+  {
+    const identityBad = runs.filter(
+      (run) => run.tickets !== run.ticketEarned - run.ticketSpent,
+    );
+    const sourceBad = runs.filter(
+      (run) => run.ticketCrossSource !== Math.floor(run.crossings / run.ticketEvery),
+    );
+    const strengthened = runs.filter((run) => run.ticketEvery !== run.ticketEveryInit);
+    const hazardRuns = runs.filter((run) => run.hazardTriggers > 0);
+    const unattributed = runs.filter(
+      (run) =>
+        run.hazardTriggers !== run.hazardAttributed || run.hazardEvents !== run.hazardAttributed,
+    );
+    const earnedTotal = runs.reduce((sum, run) => sum + run.ticketEarned, 0);
+    const waves = runs.map((run) => run.waveReached).sort((a, b) => a - b);
+    check(
+      '1b 真打法接线：逐局票券恒等式平、分源数对得上、间隔没跨局累积',
+        identityBad.length === 0 &&
+        sourceBad.length === 0 &&
+        strengthened.length === 0 &&
+        earnedTotal > 0,
+        `${RUNS} 局共挣 ${earnedTotal} 张；恒等不平 ${identityBad.length} 局、分源不符 ${sourceBad.length} 局、` +
+          `间隔被带过局 ${strengthened.length} 局（每局 every=${runs.map((r) => r.ticketEvery).slice(0, 4).join('/')}…）；` +
+          `crossings vs 遥测越线 ${runs.map((r) => `${r.crossings}/${r.crossedReported}`).join(' ')}`,
+    );
+    /*
+     * `RunState.crossings`（由 `Game.settleCrossing` 加）与遥测的越线条数是**两个独立真源**，
+     * 它们必须逐局相等。口径不是推出来的：z 偏移修好那一批实测到 74/74、105/105、116/116，
+     * 其中两局各含催债币越线 ⇒ "effect 型币算不算一次越线"这个口径问题被数据答掉了（算）。
+     * 顺带钉住一条更狠的：票券分源数吃的分母就是这个 crossings，两边一漂移，注入率就成假数。
+     */
+    const counterBad = runs.filter((run) => run.crossings !== run.crossedReported);
+    check(
+      'S2/1b 口径对质：引擎越线数 === 遥测越线条数（含 effect 型币种的那几次）',
+      counterBad.length === 0,
+      `不平的局 ${counterBad.length}/${RUNS}：${runs
+        .filter((r) => r.crossings !== r.crossedReported)
+        .map((r) => `${r.crossings}/${r.crossedReported}`)
+        .join(' ') || '全部逐局相等'}`,
+    );
+    /*
+     * Stage 2 的**真打法覆盖**是一条存在性判据，不能混进恒等门里：
+     * 恒等式在"零次触发"时是**恒真**的（0 === 0），把它跟"确实遇到过"写在一条里，
+     * 批里一次都没出现催债币也照样报绿 —— 那就是把缺席读成通过。
+     * ⇒ 两条分开：有触发 ⇒ 逐局核对 `触发 === 归因 === 事件数`；零触发 ⇒ 报**缺席**。
+     */
+    if (hazardRuns.length > 0) {
+      check(
+        'S2 真打法接线：催债币在本批真出现过，且逐局 触发数 === 归因数 === 事件数',
+          unattributed.length === 0,
+          `${hazardRuns.length}/${RUNS} 局遇到催债币，共 ${runs.reduce((s, r) => s + r.hazardTriggers, 0)} 次触发；` +
+            `归因/事件数不等的局 ${unattributed.length} 局`,
+      );
+    } else {
+      console.log(
+        `  [info] S2 真打法接线**缺席**（不报绿也不报红）：本批 ${RUNS} 局一次催债币都没结算过。` +
+          `注入条件满足并尝试过 ${runs.reduce((s, r) => s + r.hazardAttempts, 0)} 次、` +
+          `其中拿到池位 ${runs.reduce((s, r) => s + r.hazardSpawned, 0)} 次 ⇒ ` +
+          (runs.reduce((s, r) => s + r.hazardAttempts, 0) === 0
+            ? '原因是**注入条件没满足**（投数没到 hazardAfterDrops，或取模没对上）'
+            : runs.reduce((s, r) => s + r.hazardSpawned, 0) === 0
+              ? '原因是**池满**：acquire() 全部返回 null'
+              : '币注进去了但**没走完台面**（局先结束）⇒ 要验结算只能靠 xixi 那条定点门，或者把注入点往前挪'),
+      );
+    }
+    // 1c 的波次到达**只报分布**：样本不足时报"缺席"，不拿点值当结论（计划 1d 原话）。
+    if (runs.length >= 20) {
+      const dist = waves.map((w) => `${w}`).join(' ');
+      console.log(
+        `  [info] 1c 波次到达分布 n=${runs.length}（定档用，不进判据）：${dist}｜` +
+          `领卡合计 ${runs.reduce((sum, run) => sum + run.draftsTaken, 0)} 张`,
+      );
+    } else {
+      console.log(
+        `  [info] 1c 波次到达分布**样本不足**（n=${runs.length} < 20）⇒ 不报分布、不报绿：` +
+          `本批 wave=${waves.join('/')}，drafts=${runs.reduce((sum, run) => sum + run.draftsTaken, 0)}`,
+      );
+    }
   }
   // 写盘读数（计划步 2b）：分母取**总投币数**，这样"投一枚币写几遍盘"是能直接读出来的数，
   // 不用再去猜评审那句"12+ 次串行写盘"。不进判据。
@@ -3075,7 +3207,7 @@ async function runXixi(page) {
     (e) => e.id === 'chest' && e.phase === 'registered',
   );
   check(
-    `箱箱箱：登记 chest 演出（承诺 ${chestSpec} 枚，宝箱越线返 0 筹码、兑现靠演出）`,
+    `箱箱箱：登记 chest 演出（承诺 ${chestSpec} 枚巨型宝箱；S16 起宝箱越线返**固定 50 筹码**，不再是 effect 币）`,
     chestReward?.granted === true &&
       chestReward?.delivered === chestSpec &&
       Boolean(chestRegistered),
@@ -3088,35 +3220,82 @@ async function runXixi(page) {
     20_000,
   );
 
-  // ── P10：胡萝卜四连 → 扣本局筹码（**三账本恒等式一字不改**）──
+  // ── 1a：胡萝卜四连 → 按余额比例扣本局筹码（**三账本恒等式一字不改**）──
   //
   // 罚的是**本局筹码**（用户拍板），走 `RunState.fineChips` → `spendChips`（唯一扣减入口），
   // 于是 `spent` 把它吸收、恒等式不动；另用 `fines` 单独对账「罚了几次、扣了多少」。
-  // 两条一起看才完整：只看 `chips` 分不清「扣了罚款」还是「投了一枚币」。
+  //
+  // ★ 1a 起**面值是算出来的**（余额 × 10%→40%），所以旧写法"从满盘那一次的实扣反推面值"
+  //   整个失效 —— 反推只能拿到 clamp 之后的数，而比例制下永远不 clamp。新判据核两件事：
+  //   ① 逐事件恒等 `requested === 引擎的表(fineBalance, fineProgress)`，两个输入**随事件落盘**。
+  //      为什么不让脚本自己去读余额：滚筒转的 3~4 秒里盘面照常越线结算，
+  //      10-01 实测「罚 6、筹码 169→208」⇒ 场外任何时刻读到的都不是那一刻的数，
+  //      硬要核就只能退化成区间/容差判据（本项目薄样本 + 容差假绿的常见来源）。
+  //   ② 输入接线本身用 `drops` 的**前后夹逼**核：真值必须落在 [前, 后]/ramp 之间。
+  //      下界抓"进度写死 0"（0 ≥ 前/ramp 在前 r>0 时不成立），上界抓"除错了分母"。
   const beforeFine = await readStateFresh(page);
+  // 欠款必须在**摇之前**取读数：罚款真的发生在这几秒里，事后再读两次都已经是事后值，
+  // 那样"增量 === 0"会恒成立（自证的假绿）。
+  const debtBeforeFine = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.debt?.());
   const fineReward = await spinAndWaitReward('fine');
-  /** 罚款面值：**从满盘那一次的实扣读数取**，不写 `SLOT_PENALTY_CHIPS` 的第二份抄本。 */
-  const penaltyFace = fineReward?.fined ?? 0;
   const afterFine = await readStateFresh(page);
+  /** 该罚多少：拿**事件自带**的那一对输入去问引擎的表（脚本里不出现 0.1/0.4/90 的插值）。 */
+  const fineAsk = await page.evaluate(
+    ({ balance, progress }) => {
+      const rule = window.__THREE_GAME_TEST_HOOKS__?.fineRule?.();
+      if (!rule) return null;
+      return {
+        amount: rule.amountFor(balance, progress),
+        rampDrops: rule.rampDrops,
+        curve: [-1, 0, 0.5, 1, 2].map((p) => rule.ratioAt(p)),
+      };
+    },
+    { balance: fineReward?.fineBalance ?? -1, progress: fineReward?.fineProgress ?? -1 },
+  );
   const finedDelta = (afterFine?.fines ?? 0) - (beforeFine?.fines ?? 0);
   const spentDelta = (afterFine?.spent ?? 0) - (beforeFine?.spent ?? 0);
-  // ⚠️ 这里原本断言的是「筹码**净**减少 ≥ 罚款」——判据本身是错的（实测红）：
-  // 摇奖那几秒盘面照常越线结算，读到的是「罚 6、筹码 169→208」。
-  // 净变化混进了盘面节奏，而经济本身没毛病（恒等式 208 = 20 + 194 − 6 两边都对得上）
-  // ⇒ 假红。改成**只走账本**：罚款必须逐笔落在 `spent` 上（唯一扣减入口），
-  // 且演出前后两端三账本恒等式都成立 —— 「扣的是本局筹码」被严格证明，
-  // 且与盘面节奏无关（这条判据从此不会再因为「恰好赚了一笔」而红）。
+  const fineRamp = fineAsk?.rampDrops ?? Number.NaN;
+  const progressLow = (beforeFine?.endless?.drops ?? 0) / fineRamp;
+  const progressHigh = (afterFine?.endless?.drops ?? 0) / fineRamp;
   check(
-    '胡萝卜四连：扣本局筹码（fined 可对账、fines 单调、spent ≥ fines、恒等式成立）',
-    fineReward?.outcome === 'fine' &&
+    '胡萝卜四连：面值 = 余额 × 表（逐事件恒等，扣的是本局筹码、恒等式成立）',
+      fineReward?.outcome === 'fine' &&
+      fineAsk !== null &&
+      fineReward?.requested === fineAsk.amount &&
+      fineReward?.fineBalance >= 0 &&
+      fineReward?.fineProgress >= progressLow &&
+      fineReward?.fineProgress <= progressHigh &&
       fineReward?.fined > 0 &&
       finedDelta === fineReward.fined &&
       spentDelta === finedDelta &&
       (afterFine?.spent ?? 0) >= (afterFine?.fines ?? 0) &&
       ledgerOk(beforeFine) &&
       ledgerOk(afterFine),
-    `罚 ${fineReward?.fined}（fines ${beforeFine?.fines}→${afterFine?.fines}，spent +${spentDelta}），` +
-      `筹码 ${beforeFine?.chips}→${afterFine?.chips}，${ledgerText(afterFine)}`,
+    `余额 ${fineReward?.fineBalance} × 进度 ${fineReward?.fineProgress?.toFixed(3)}` +
+      `（夹逼 ${progressLow.toFixed(3)}~${progressHigh.toFixed(3)}）⇒ 表算 ${fineAsk?.amount}，` +
+      `事件名义 ${fineReward?.requested} / 实扣 ${fineReward?.fined}` +
+      `（fines ${beforeFine?.fines}→${afterFine?.fines}，spent +${spentDelta}），${ledgerText(afterFine)}`,
+  );
+  // 表用**字面量**钉：0.10 / 0.25 / 0.40 是 10-07 用户拍板的设计值。
+  // 从引擎读回来再与引擎比 = 自证；写死端点才是"改了表 ⇒ 这条红"。
+  check(
+    '罚款表：progress 0→10%、0.5→25%、1→40%，越界夹住（端点是设计值字面量）',
+      fineAsk !== null &&
+      [0.1, 0.1, 0.25, 0.4, 0.4].every((want, i) => Math.abs(fineAsk.curve[i] - want) < 1e-9),
+    `ratioAt(-1/0/0.5/1/2) = ${fineAsk?.curve.map((r) => r.toFixed(4)).join(' / ')}，` +
+      `rampDrops=${fineAsk?.rampDrops}`,
+  );
+  // ★ 「永不转债」守卫（10-07 用户拍板 A）：比例上限 40% ⇒ 罚款永远扣得掉。
+  // 这条**看着恒绿**，但它守的是结构：把 `FINE_RATIO_CEIL` 抬到 > 1 就会红（变异对照见
+  // 计划 1d），而那时下面 S5b 那段合成输入反而变成可达路径 —— 两条一起看才是完整语义。
+  const debtAfterFine = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.debt?.());
+  check(
+    '永不转债：比例制下 fines 全额实扣（debtAdded === 0、debt 增量 0）',
+      fineReward?.debtAdded === 0 &&
+      fineReward?.fined === fineReward?.requested &&
+      (debtAfterFine?.debt ?? -1) === (debtBeforeFine?.debt ?? 0),
+    `名义 ${fineReward?.requested} → 实扣 ${fineReward?.fined}、转欠款 ${fineReward?.debtAdded}` +
+      `（debt ${debtBeforeFine?.debt}→${debtAfterFine?.debt}）`,
   );
   // 惩罚的图标必须是胡萝卜四连——`fine` 的停格画面在上面已经断言过，
   // 这里只核**事件里带的 faces 与画面同源**（两套读数不许对不上）。
@@ -3125,7 +3304,7 @@ async function runXixi(page) {
     fineReward?.faces?.length === 4 && fineReward.faces.every((icon) => icon === 'carrot'),
     `faces=${JSON.stringify(fineReward?.faces)}`,
   );
-  // ★ S5b 的「罚不掉转欠款」场景放在**本模式最后**（见函数末尾）：它要把余额压到面值以下，
+  // ★ S5b 那套机器（1a 之后是**合成输入**驱动，见函数末尾）会把本局余额清零、把欠款顶到上限，
   //   而那会让本局立刻不可投币 —— 放在中途会把后面的「落点亮槽 / 集齐触发」一起拖红
   //   （10-01 实测踩过：那两条读 `completed=null`、事件链 `[]`，红的是级联不是缺陷）。
 
@@ -3163,6 +3342,301 @@ async function runXixi(page) {
     accepted && JSON.stringify(inFlight?.xixi ?? []) === xixiBefore,
     `在途 xixi=${JSON.stringify(inFlight?.xixi)}（投出前 ${xixiBefore}）`,
   );
+
+  /*
+   * ── 1a 深度臂：进度接线要在**非零 drops** 上再验一次 ──
+   *
+   * 段首那条面值恒等门跑在"D/E 强制摇奖段"（那时一币未投，`drops === 0`）⇒ 夹逼的下界是 0，
+   * 而"进度写死 0"这种接线错在 `0 ≥ 0` 上是**抓不到的**（阈值离读数太近的另一种形态：
+   * 判据的判别力取决于它落在自变量的哪一段）。上面「在途币不登记」刚投出一枚 ⇒
+   * `drops = 1` ⇒ 下界 `1/90 > 0`，写死进度当场红。
+   * ★ 刻意放在这条而不是"集齐之后"：那条要等最坏 4 轮 × 200 循环 ≈ 27 分钟的物理行程，
+   *   而本条只需要"投出过一枚币"。判别力一样，代价差两个数量级。
+   */
+  const deepBefore = await readStateFresh(page);
+  const deepDrops = deepBefore?.endless?.drops ?? 0;
+  const deepRamp = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.fineRule?.()?.rampDrops ?? null,
+  );
+  if (deepDrops > 0 && typeof deepRamp === 'number') {
+    const deepFine = await spinAndWaitReward('fine');
+    const deepAfter = await readStateFresh(page);
+    const deepExpected = await page.evaluate(
+      ({ balance, progress }) => {
+        const rule = window.__THREE_GAME_TEST_HOOKS__?.fineRule?.();
+        return rule ? rule.amountFor(balance, progress) : null;
+      },
+      { balance: deepFine?.fineBalance ?? -1, progress: deepFine?.fineProgress ?? -1 },
+    );
+    check(
+      '1a 深度臂：投过币之后进度 = drops/ramp 且严格 > 0（抓"进度写死"的接线错）',
+        deepFine?.outcome === 'fine' &&
+        deepFine?.fineProgress > 0 &&
+        deepFine?.fineProgress >= deepDrops / deepRamp &&
+        deepFine?.fineProgress <= (deepAfter?.endless?.drops ?? 0) / deepRamp &&
+        deepFine?.requested === deepExpected &&
+        deepFine?.requested > 0 &&
+        deepFine?.fined === deepFine?.requested &&
+        deepFine?.debtAdded === 0,
+      `drops ${deepDrops}→${deepAfter?.endless?.drops}（ramp ${deepRamp}）⇒ 进度 ` +
+        `${deepFine?.fineProgress?.toFixed(4)}（夹逼 ${(deepDrops / deepRamp).toFixed(4)}~` +
+        `${((deepAfter?.endless?.drops ?? 0) / deepRamp).toFixed(4)}），余额 ${deepFine?.fineBalance} ⇒ ` +
+        `表算 ${deepExpected} / 事件名义 ${deepFine?.requested} / 实扣 ${deepFine?.fined}、转欠款 ${deepFine?.debtAdded}`,
+    );
+  } else {
+    // 缺席而非绿/红：没有投过币就没有深度臂可验（这条判据的全部意义就在"非零"那一段）。
+    console.log(
+      `  [info] 1a 深度臂**缺席**：drops=${deepDrops}、rampDrops=${JSON.stringify(deepRamp)} ⇒ ` +
+        `进度下界为 0，"写死进度"的接线错无处可抓`,
+    );
+  }
+
+  /*
+   * ── 1b/1c：票券恒等式 + 波次三选一 ──
+   *
+   * ★ 为什么是**合成驱动**（`noteCrossings` 钩子）而不是"投够 12 枚再等它越线"：
+   *   `TICKET_EVERY_CROSSINGS` 现在从引擎读（下面 `table.every`），而薄床下单枚币走完台面
+   *   要四位数循环（S1a）⇒ 真走到第一张票券要等约 27 分钟，且随盘面漂。
+   *   钩子驱动的是**引擎自己那个函数**（`RunState.noteCrossing`），不是另写一份计数，
+   *   所以这里验的是状态机（发券 / 分源 / 待办 / 花费 / 进波），不是接线。
+   * ⚠️ 接线（`Game.settleCrossing` 真会调它）不在这里，靠 economy 的逐局恒等门（1d）。
+   */
+  const table = await page.evaluate(() => {
+    const s = window.__THREE_GAME_DIAGNOSTICS__;
+    if (!s) return null;
+    return {
+      every: s.endless.ticketEvery,
+      tableEvery: s.endless.ticketEveryCrossings,
+      comboTier: s.endless.ticketComboTier,
+      draftCost: s.endless.draftCost,
+    };
+  });
+  const tickets = async () => (await readStateFresh(page))?.endless ?? null;
+  const ticketIdentityOk = (e) =>
+    e !== null && e.tickets === e.ticketEarned - e.ticketSpent;
+  const sourceOk = (e) =>
+    e !== null && e.ticketBySource.crossing === Math.floor(e.crossings / e.ticketEvery);
+  const before1b = await tickets();
+  // 先补到"下一个整数发券点"，这样第一张券的来源数是**精确可算的**（不是"大概会有一张"）。
+  const gap = table ? table.every - (before1b?.crossings ?? 0) % table.every : 0;
+  const step1 = await page.evaluate((n) => window.__THREE_GAME_TEST_HOOKS__?.noteCrossings?.(n) ?? null, gap);
+  const after1b = await tickets();
+  check(
+    '1b 票券恒等：挣一张券恰好花掉 every 枚越线（tickets === earned − spent、分源对得上）',
+      table !== null &&
+      step1 !== null &&
+      (after1b?.ticketEarned ?? 0) === (before1b?.ticketEarned ?? 0) + 1 &&
+      (after1b?.crossings ?? 0) === (before1b?.crossings ?? 0) + gap &&
+      ticketIdentityOk(after1b) &&
+      sourceOk(after1b) &&
+      after1b.pendingDraft === true,
+    `every=${table?.every}（表初值 ${table?.tableEvery}）投 ${gap} 次越线 ⇒ crossings ` +
+      `${before1b?.crossings}→${after1b?.crossings}，earned ${before1b?.ticketEarned}→${after1b?.ticketEarned}，` +
+      `tickets ${after1b?.tickets}（挣 ${after1b?.ticketEarned} / 花 ${after1b?.ticketSpent}），` +
+      `分源 ${JSON.stringify(after1b?.ticketBySource)}，pendingDraft=${after1b?.pendingDraft}`,
+  );
+  // 面板应当已经被 `CoinEffects.tick()` 立起来（下一帧），所以要等一帧再读 DOM。
+  const panel = await page.evaluate(() => {
+    const el = document.querySelector('#draft-panel');
+    const buttons = [...document.querySelectorAll('#draft-choices button')];
+    return {
+      exists: el !== null,
+      hidden: el?.hidden ?? true,
+      count: buttons.length,
+      meta: document.querySelector('#draft-meta')?.textContent ?? '',
+      status: document.querySelector('#status-line')?.textContent ?? '',
+      buttons: buttons.map((b) => ({
+        id: b.dataset.effect ?? '',
+        text: b.textContent ?? '',
+        disabled: b.disabled,
+      })),
+    };
+  });
+  const waveBefore = after1b?.wave ?? 0;
+  check(
+    '1c 三选一面板：攒够本波目标就立起来，按钮数 = 候选数、铭牌写着表上的价',
+      panel.exists &&
+      panel.hidden === false &&
+      panel.count > 0 &&
+      panel.buttons.every((b) => b.text.includes(`（${table.draftCost} 券）`)) &&
+      panel.meta.includes(`第 ${waveBefore} 波`) &&
+      panel.meta.includes(`${after1b?.waveTickets}/${after1b?.waveTarget}`),
+    `存在=${panel.exists} 显示=${!panel.hidden} 按钮 ${panel.count} 个 ` +
+      `${JSON.stringify(panel.buttons.map((b) => b.id))}，meta="${panel.meta}"`,
+  );
+  // 真点一次 DOM 按钮（走玩家那条路，不是钩子）：先看买不买得起，再看三个计数谁动了。
+  const affordable = panel.buttons.some((b) => !b.disabled);
+  const boostedBefore = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.boostQueue?.() ?? null,
+  );
+  const mechBefore = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.mechanisms?.() ?? null);
+  const picked = await page.evaluate(() => {
+    const button = [...document.querySelectorAll('#draft-choices button')].find((b) => !b.disabled);
+    if (!button) return null;
+    const id = button.dataset.effect ?? '';
+    button.click();
+    return id;
+  });
+  const afterPick = await tickets();
+  /** 归因文案要在**点之后**读：点之前那条还是上一次摇奖的话（Stage 2d 的"触发 === 归因"同理）。 */
+  const statusAfterPick = await page.evaluate(
+    () => document.querySelector('#status-line')?.textContent ?? '',
+  );
+  const boostedAfter = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.boostQueue?.() ?? null,
+  );
+  const mechAfter = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.mechanisms?.() ?? null);
+  /** 三种候选各自的"确实生效"读数 —— 有一条不动就是那张卡是假的。 */
+  const effectLanded = (() => {
+    if (picked === 'ticketLens') return afterPick.ticketEvery < (after1b?.ticketEvery ?? 0);
+    const before = picked === 'boostPack' ? boostedBefore : mechBefore;
+    const after = picked === 'boostPack' ? boostedAfter : mechAfter;
+    if (!before || !after) return false;
+    return JSON.stringify(after) !== JSON.stringify(before);
+  })();
+  check(
+    '1c 领卡：先付票再生效（spent += 价、wave +1、面板收掉、且那张卡真的动了某个读数）',
+      affordable &&
+      typeof picked === 'string' &&
+      picked.length > 0 &&
+      (afterPick?.ticketSpent ?? 0) === (after1b?.ticketSpent ?? 0) + table.draftCost &&
+      ticketIdentityOk(afterPick) &&
+      sourceOk(afterPick) &&
+      afterPick.wave === waveBefore + 1 &&
+      afterPick.draftsTaken === (after1b?.draftsTaken ?? 0) + 1 &&
+      afterPick.pendingDraft === false &&
+      statusAfterPick.includes('波间奖励') &&
+      (await page.evaluate(() => document.querySelector('#draft-panel')?.hidden === true)) &&
+      effectLanded,
+    `点了 "${picked}"：票券 ${after1b?.tickets}→${afterPick?.tickets}（spent ${after1b?.ticketSpent}→${afterPick?.ticketSpent}），` +
+      `波 ${waveBefore}→${afterPick?.wave}，领 ${afterPick?.draftsTaken} 张，` +
+      `every→${afterPick?.ticketEvery}，归因="${statusAfterPick.slice(0, 70)}"`,
+  );
+
+  /*
+   * ── Stage 2：效果币协议（催债币）的三条门 ──
+   *
+   * ① **协议本身**：`payout.mode === 'effect'` 的币种越线必须返 0 筹码，
+   *    而且**不吃任何倍率**（热度 / 热区 / 加注都不能把"扣钱"变成"赚更多"）。
+   *    这条不靠真币走完台面：直接问引擎的 `crossingReturn`，它是分派链的唯一算式真源。
+   * ② **结算与归因**（`coinEffectTrigger` 定点触发）：出账只走 `settleFine` 那条唯一扣减口 ⇒
+   *    `spent` 增量 == 实扣、`fines` 增量 == 实扣、`earned` 不动、`debt` 增量 == debtAdded；
+   *    并且逐事件能对回表（`requested === 表(balance, progress)`）、
+   *    `triggers === attributed === events.length`、HUD 里有那句归因。
+   *    ★ 最后这半句是 Stage 2d 的全部意义：**发生了而玩家看不见的效果，等于没写**。
+   * ③ **池水门**：两张表的 water 合计都必须为 0 —— 催债币是**汇**不是源，
+   *    而波间奖励三档换的是别的货币。这一条守的是"water: 0 是真话"，
+   *    不是"water 目前恰好没调过"：谁加了 `spawn`/`multMark` 档，这里当场红。
+   */
+  const debtReturn = await page.evaluate(() =>
+    window.__THREE_GAME_TEST_HOOKS__?.crossingReturn?.({
+      kind: 'debt',
+      combo: 8,
+      hot: true,
+      betMul: 4,
+      roll: 0,
+    }) ?? null,
+  );
+  check(
+    'S2 协议：effect 型币种越线返 0，且不吃热度/热区/加注任何一档倍率',
+      debtReturn !== null && debtReturn.chips === 0,
+    `crossingReturn(debt, combo 8, hot, ×4, roll 0) = ${JSON.stringify(debtReturn)}`,
+  );
+  const coinEffect = await page.evaluate(
+    () => window.__THREE_GAME_TEST_HOOKS__?.coinEffectTrigger?.('debtCoin') ?? null,
+  );
+  const lastEvent = coinEffect?.report?.events?.at(-1) ?? null;
+  const eventIdentity = await page.evaluate(
+    ({ balance, progress }) => {
+      const rule = window.__THREE_GAME_TEST_HOOKS__?.fineRule?.();
+      return rule ? rule.amountFor(balance, progress) : null;
+    },
+    { balance: lastEvent?.balance ?? -1, progress: lastEvent?.progress ?? -1 },
+  );
+  check(
+    'S2 结算与归因：扣款只进 spent/fines、earned 不动、逐事件对回表、触发数 === 归因数',
+      coinEffect !== null &&
+      coinEffect.fired === true &&
+      (coinEffect.after.spent - coinEffect.before.spent) === lastEvent.applied &&
+      (coinEffect.after.fines - coinEffect.before.fines) === lastEvent.applied &&
+      (coinEffect.after.earned - coinEffect.before.earned) === 0 &&
+      (coinEffect.after.debt - coinEffect.before.debt) === lastEvent.debtAdded &&
+      lastEvent.applied === lastEvent.requested &&
+      lastEvent.requested === eventIdentity &&
+      coinEffect.report.triggers === coinEffect.report.attributed &&
+      coinEffect.report.events.length === coinEffect.report.attributed &&
+      coinEffect.statusLine.includes('催债币'),
+    `实扣 ${lastEvent?.applied}（spent +${coinEffect ? coinEffect.after.spent - coinEffect.before.spent : '—'}、` +
+      `fines +${coinEffect ? coinEffect.after.fines - coinEffect.before.fines : '—'}、` +
+      `earned +${coinEffect ? coinEffect.after.earned - coinEffect.before.earned : '—'}、` +
+      `debt +${coinEffect ? coinEffect.after.debt - coinEffect.before.debt : '—'}）` +
+      `= 表算 ${eventIdentity}（余额 ${lastEvent?.balance} × 进度 ${lastEvent?.progress?.toFixed(4)}），` +
+      `触发 ${coinEffect?.report?.triggers} / 归因 ${coinEffect?.report?.attributed} / 事件 ${coinEffect?.report?.events?.length}，` +
+      `HUD="${(coinEffect?.statusLine ?? '').slice(0, 48)}"`,
+  );
+  const water = await page.evaluate(() => {
+    const s = window.__THREE_GAME_DIAGNOSTICS__;
+    return s
+      ? {
+          coin: s.endless.coinEffectWaterTotal,
+          draft: s.endless.draftWaterTotal,
+          hazardAfter: s.endless.hazardAfterDrops,
+          hazardEvery: s.endless.hazardEveryDrops,
+        }
+      : null;
+  });
+  check(
+    'S2 池水门：两张效果表的水量合计都是 0（催债币是汇不是源；奖励换的是别的货币）',
+      water !== null && water.coin === 0 && water.draft === 0,
+      `币种效果 Σwater=${water?.coin}、波间奖励 Σwater=${water?.draft}；` +
+        `危险注入表 第 ${water?.hazardAfter} 投起、每 ${water?.hazardEvery} 投一枚（判据读引擎，不抄数）`,
+  );
+
+  /*
+   * G-计数灯（Stage 3b）：抓斗"还剩几次"必须由**灯**表示，而不是 0.6rem 的小字。
+   * 三条一起断才不算自证：亮灯数 == 引擎的 `usesLeft`、总灯数 == 表的上限、
+   * 而且这个元素里**不再有**裸文本数字（否则"换了灯"只是把字藏起来又写一遍）。
+   */
+  const lights = await page.evaluate(() => {
+    const el = document.querySelector('#grapple-state');
+    if (!el) return null;
+    const m = window.__THREE_GAME_TEST_HOOKS__?.mechanisms?.() ?? null;
+    return {
+      lit: el.querySelectorAll('.light-on').length,
+      total: el.querySelectorAll('.light').length,
+      bareDigits: [...el.childNodes].some(
+        (n) => n.nodeType === 3 && /\d/.test(n.textContent ?? ''),
+      ),
+      engine: m ? (m.grapple ?? m.usesLeft?.grapple ?? null) : null,
+    };
+  });
+  check(
+    'G-计数灯：抓斗剩余次数用灯表示（亮数 = 引擎 usesLeft、总位 = 表上限、元素里没有裸数字）',
+      lights !== null &&
+      typeof lights.engine === 'number' &&
+      lights.engine >= 0 &&
+      lights.lit === lights.engine &&
+      lights.total > 0 &&
+      lights.lit <= lights.total &&
+      lights.bareDigits === false,
+    `亮 ${lights?.lit} / 总 ${lights?.total} 盏，引擎 usesLeft=${lights?.engine}，裸数字=${lights?.bareDigits}`,
+ );
+
+  /*
+   * `XIXI_FAST=1` ⇒ 跑到这里就收尾。**只为变异批存在**：1a 那四条门（面值恒等 / 表端点 /
+   * 永不转债 / 深度臂）全在上面，而下面「落床 / 集齐」段最坏要等 4 轮 × 200 循环 ≈ 27 分钟，
+   * 与本批改判无关（实测：不开 FAST 一轮 10~30 分钟，开 FAST 约 1 分钟）。
+   * ⚠️ 这不是"少跑一点也没关系"的开关 —— 用了它下面这些就**没跑**，所以：
+   *   ① 打印一行显式声明未覆盖面，合计条数也随之变小，不会被读成整模式绿；
+   *   ② 任何"用 FAST 结果宣布 xixi 模式通过"都是误读。默认不开；不开时这个分支根本不进入。
+   */
+  if (process.env.XIXI_FAST === '1') {
+    console.log(
+      '  [info] XIXI_FAST=1 ⇒ 本模式在 1a 四条门之后提前返回：未跑「落床点亮 / 集齐 completed / ' +
+        '演出窗口计数器 / 全程三账本恒等式 / XIXI 无异常 / S5b 合成输入 / S5a 四同」⇒ **本模式不算整批通过**',
+    );
+    return;
+  }
 
   // ── C：物理落点点亮并集齐（分散投币直到 completed 事件） ──
   //
@@ -3293,48 +3767,72 @@ async function runXixi(page) {
   );
 
   /*
-   * ── S5b：罚不掉的那一截转成欠款（放在本模式最后，理由见上面那条注释）──
+   * ── S5b 那套机器：1a 之后改由**合成输入**驱动（放在本模式最后，理由见上面那条注释）──
    *
-   * 前面那条满盘罚款场景里 `shortfall` 恒为 0 ⇒ 惩罚加强那半边永远不会被走到。
-   * 这里把余额压到面值以下，构造出 shortfall ≥ 1 的另一半。
-   *
-   * ★ 面值不写死：用上面满盘那一次实测到的 `fined` 当面值（满盘时 `fined == 面值`），
-   *   这样 `SLOT_PENALTY_CHIPS` 改了判据也不会假红 —— 与「注入率读 `bountyEveryDrops`」同一条纪律。
-   * ★ 压完余额**必须重开一局**（`setState('ready')`）：`initial` 是开局那一刻的余额快照，
-   *   在场外把余额从 200 改到 2 而不重开，局级恒等式就成了 `0 = 200 + 0 + 0 + 0 − 8`
-   *   —— 差额 −192 是**测试自己造的**，不是引擎的账错（10-01 实测踩过，那条判据当时就红了）。
-   *   重开之后 `initial = 2`，恒等式重新成立，`ledgerOk` 才真的在验东西。
-   * ★ 断的是**三笔的分派**：`fined + debtAdded == 面值`、`debt` 增量 == `debtAdded`、
-   *   `spent` 增量 == `fined`。任何一笔走错门（shortfall 也记进 spent、
-   *   或 debt 加了而事件里没带）都会当场红。
+   * ⚠️ 为什么不再是"真摇一把四连、祈祷它进债"：比例制上限 40% ⇒ `shortfall` 恒为 0
+   *   （10-07 用户拍板 A，见 `xixi.ts` 罚款那段「结构后果」）。旧写法靠 `setWallet(2)` 把余额
+   *   压到面值以下来构造 shortfall，可现在面值只有余额的 40% ⇒ 余额 2 时罚 1，
+   *   **玩法里再也构造不出 shortfall**。留而不测 = 把 clamp 与欠款上限的回归敞着，
+   *   所以这里直接喂一个超过余额的金额：测的仍是那两步（`fineChips` → `chargeFine`）本身，
+   *   只是输入从"玩法恰好走到"换成"合成"。
+   * ★ 金额一次给够（余额 + 上限 + 10）⇒ 一笔同时走完两条腿：
+   *   前半进 `spent`（applied = 余额），后半连"超出上限的那截"都被 clamp 到（debt 正好顶格）。
+   * ★ 压之前**必须重开一局**（`setState('ready')`）：`initial` 是开局那一刻的余额快照，
+   *   在场外改余额而不重开，局级恒等式就成了 `0 = 200 + 0 + 0 + 0 − 8` ——
+   *   差额是**测试自己造的**（10-01 实测踩过）。重开之后 `initial` = 新余额，`ledgerOk` 才真在验东西。
+   * ★ 收尾 `clearSave()`：这笔会把 debt 顶到**上限**，而 debt 是存档里的终身账 ——
+   *   不清就会分流掉后面 S5a 那几条判据的产出，红的是级联不是缺陷。
    */
-  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setWallet?.(2));
+  await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setWallet?.(30));
   await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.setState?.('ready'));
   const debtBefore = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.debt?.());
   const lowBefore = await readStateFresh(page);
-  const lowFine = await spinAndWaitReward('fine');
+  const syntheticAmount = (lowBefore?.chips ?? 0) + (debtBefore?.ceiling ?? 0) + 10;
+  const synth = await page.evaluate(
+    (amount) => window.__THREE_GAME_TEST_HOOKS__?.applyFine?.(amount) ?? null,
+    syntheticAmount,
+  );
   const lowAfter = await readStateFresh(page);
   const debtAfter = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.debt?.());
+  /** 到顶时应入账的那一截：剩余额度 = 上限 − 已有欠款（clamp 咬得动才证明上限是承重结构）。 */
+  const expectedDebtAdded = (debtAfter?.ceiling ?? 0) - (debtBefore?.debt ?? 0);
   check(
-    'S5b 胡萝卜四连：扣不掉的转成欠款（fined+debtAdded=面值、debt 增量=debtAdded、恒等式仍平）',
-    penaltyFace > 0 &&
-      lowFine?.outcome === 'fine' &&
-      (lowFine?.fined ?? -1) + (lowFine?.debtAdded ?? -1) === penaltyFace &&
-      (lowFine?.fined ?? 99) <= 2 &&
-      (lowFine?.debtAdded ?? 0) > 0 &&
-      (debtAfter?.debt ?? 0) - (debtBefore?.debt ?? 0) === lowFine.debtAdded &&
-      (lowAfter?.spent ?? 0) - (lowBefore?.spent ?? 0) === lowFine.fined &&
+    'S5b 机器（合成输入）：扣得掉的进 spent、扣不掉的进 debt、超出上限的那截被 clamp、恒等式仍平',
+      synth !== null &&
+      (lowBefore?.chips ?? 0) > 0 &&
+      synth.before.chips === lowBefore.chips &&
+      synth.requested === syntheticAmount &&
+      synth.applied === lowBefore.chips &&
+      synth.shortfall === syntheticAmount - synth.applied &&
+      synth.after.chips === 0 &&
+      synth.debtAdded === expectedDebtAdded &&
+      synth.debtAdded < synth.shortfall &&
+      (debtAfter?.debt ?? -1) - (debtBefore?.debt ?? 0) === synth.debtAdded &&
+      (lowAfter?.spent ?? 0) - (lowBefore?.spent ?? 0) === synth.applied &&
+      (lowAfter?.fines ?? 0) - (lowBefore?.fines ?? 0) === synth.applied &&
       ledgerOk(lowAfter),
-    `面值 ${penaltyFace}：实扣 ${lowFine?.fined}（spent +${(lowAfter?.spent ?? 0) - (lowBefore?.spent ?? 0)}）` +
-      ` + 转欠款 ${lowFine?.debtAdded}（debt ${debtBefore?.debt}→${debtAfter?.debt}，上限 ${debtAfter?.ceiling}），` +
+    `合成面值 ${syntheticAmount}：实扣 ${synth?.applied}（spent +${(lowAfter?.spent ?? 0) - (lowBefore?.spent ?? 0)}、` +
+      `fines +${(lowAfter?.fines ?? 0) - (lowBefore?.fines ?? 0)}）+ 转欠款 ${synth?.debtAdded}` +
+      `（debt ${debtBefore?.debt}→${debtAfter?.debt}，上限 ${debtAfter?.ceiling}，` +
+      `shortfall ${synth?.shortfall} ⇒ clamp 掉 ${synth ? synth.shortfall - synth.debtAdded : '—'}），` +
       `余额 ${lowBefore?.chips}→${lowAfter?.chips}，${ledgerText(lowAfter)}`,
   );
-  // ★ 欠款上限是**承重结构**（惩罚频率 15 % × 每笔都可能全额进债 ⇒ 没有上限 debt 会无界涨）。
-  // 到顶需要好几笔，这里不断言「已经到顶」，只断言不变量 `debt ≤ ceiling` 在每次罚款之后成立。
+  // ★ 欠款上限是**承重结构**（合成输入能把 debt 一路顶到顶，真玩法没有上限就会无界涨）。
   check(
-    'S5b 欠款不越过上限（debt ≤ ceiling；到顶时 chargeFine 按剩余额度生效）',
+    'S5b 欠款不越过上限（debt ≤ ceiling）',
     (debtAfter?.debt ?? 99) <= (debtAfter?.ceiling ?? 0),
     `debt ${debtAfter?.debt}，ceiling ${debtAfter?.ceiling}`,
+  );
+  // 收尾清档：把顶到上限的欠款清干净，别让后面的判据读到被分流的产出。
+  const clearedDebt = await page.evaluate(() => {
+    window.__THREE_GAME_TEST_HOOKS__?.clearSave?.();
+    window.__THREE_GAME_TEST_HOOKS__?.setState?.('ready');
+    return window.__THREE_GAME_TEST_HOOKS__?.debt?.() ?? null;
+  });
+  check(
+    'S5b 合成输入收尾：欠款清干净（不污染后面的判据）',
+    (clearedDebt?.debt ?? 99) === 0,
+    `debt=${clearedDebt?.debt}`,
   );
   /*
    * ── S5a 的四同分支判据也放在最后，理由与 S5b 同一条（而且更硬）──
@@ -3959,6 +4457,18 @@ async function runPerf(page, context) {
   // 把「贴图本身对不对」与「渲染对不对」一刀切开。
   const coins = await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.coinReport?.());
   const coinRows = Object.entries(coins ?? {});
+  /*
+   * 币种名单从引擎现读（10-07 Stage 2 加催债币时把这里三处硬编码的 `6 / 1 / 5` 换掉）：
+   * 原来写死"六种币、一种无字形、五种有字形"，加一个币种就要回来改三行 ——
+   * 而那三行**本来就是**"每个币种都有贴图"这句话的另一种说法。
+   * 现在名单、有无字形都由 `kinds.ts` 自己报，判据只断言
+   * 「贴图数 == 币种数」「有字形的那批尺寸 == 无字形的 ×2」「无字形的恰好就是引擎说没印字的那些」。
+   */
+  const kindTable = await page.evaluate(async () => {
+    const { COIN_KINDS, KINDS } = await import('/src/game/kinds.ts');
+    const noGlyph = COIN_KINDS.filter((kind) => KINDS[kind].glyph === '');
+    return { total: COIN_KINDS.length, noGlyph: noGlyph.length, withGlyph: COIN_KINDS.length - noGlyph.length };
+  });
   // 纹素尺寸**由引擎自报期望值**（`coinReport().expected`，来自 `coinTexels()`），
   // 脚本不写「铜币 16 / 字形 32」第二份公式 —— 分辨率倍率是可调旋钮
   // （`GameTuning.coinTexelScale`，默认 2×），把数字抄进测试就会在加旋钮那天开始骗人。
@@ -3968,14 +4478,14 @@ async function runPerf(page, context) {
   const glyphTexels = coins?.payout?.expected ?? 0;
   const plainTexels = coins?.bronze?.expected ?? 0;
   check(
-    '六种币都有币面贴图，纹素尺寸 = 引擎自报期望值（2 的幂，有字形 = 无字形 ×2）',
-    coinRows.length === 6 &&
+    `每种币都有币面贴图（贴图数 = 引擎报的 ${kindTable.total} 个币种），纹素尺寸 = 引擎自报期望值（2 的幂，有字形 = 无字形 ×2）`,
+    coinRows.length === kindTable.total &&
       coinRows.every(([, info]) => info.texels === info.expected && info.texels > 0) &&
       Number.isInteger(Math.log2(plainTexels)) &&
       glyphTexels === plainTexels * 2 &&
-      // 无字形的只有铜币一种，其余五种都带字形。
-      coinRows.filter(([, info]) => info.expected === plainTexels).length === 1 &&
-      coinRows.filter(([, info]) => info.expected === glyphTexels).length === 5,
+      // "谁印字、谁不印"由 `kinds.ts` 的 glyph 决定，这里只核对数量与它一致。
+      coinRows.filter(([, info]) => info.expected === plainTexels).length === kindTable.noGlyph &&
+      coinRows.filter(([, info]) => info.expected === glyphTexels).length === kindTable.withGlyph,
     `倍率 ${texelScale}×：` + coinRows.map(([kind, info]) => `${kind}=${info.texels}`).join(' '),
   );
   check(
@@ -3998,7 +4508,7 @@ async function runPerf(page, context) {
   const dim = coinRows.filter(([, info]) => texelLuma(info.quarter) < 60);
   check(
     '每个币种的纹样区都不是黑的（色值没有被转两次）',
-    coinRows.length === 6 && dim.length === 0,
+    coinRows.length === kindTable.total && dim.length === 0,
     coinRows.map(([kind, info]) => `${kind}:${info.quarter}(${texelLuma(info.quarter).toFixed(0)})`).join(' '),
   );
 
@@ -4282,7 +4792,17 @@ async function runAcceptance(page, context) {
       `碰撞体半长 ${pegColliderHalves.join('/')} 米`,
   );
 
-  // 1. 玩家第一次进入即可找到筹码余量与投币按钮（目标分已随战役摘除）
+  /*
+   * 1. 玩家第一次进入即可找到**投币/加注按钮**与**一处余额读数**（目标分已随战役摘除）。
+   *
+   * ⚠️ 这条门在 10-07 的 3a 改过形态，理由必须写下来：原来它断的是 `#credits-value` 的
+   *   矩形宽度 > 0，而 3a 把这块 DOM 读数在**宽视口**下收起了（余额的唯一真源改成招牌屏，
+   *   见 camera 模式的 G-单读数）。于是它红了 —— **红得对，但它守的是旧契约**。
+   *   现在按视口分工核对两条腿：宽视口这条 = 招牌屏的屏幕投影矩形有面积、且整个在视口内；
+   *   窄视口那条腿由本模式的 ⑭（390×844 量 `#resource-readout` 在不在视口里）负责。
+   *   两条合起来才等于"任何视口下总有一处余额可见"（OR 型判据要逐腿有归属，见记忆
+   *   feedback-parser-guards ⑯）。
+   */
   await startRun(page, 'ready');
   const hud = await page.evaluate(() => {
     const pick = (selector) => {
@@ -4291,16 +4811,30 @@ async function runAcceptance(page, context) {
       const box = element.getBoundingClientRect();
       return { text: element.textContent?.trim() ?? '', width: box.width, height: box.height };
     };
+    const m = window.__THREE_GAME_TEST_HOOKS__?.marqueeScreenBox?.() ?? null;
     return {
       credits: pick('#credits-value'),
       drop: pick('#drop-button'),
       bet: pick('#bet-button'),
+      marquee: m ? { w: m.maxX - m.minX, h: m.maxY - m.minY, left: m.minX, top: m.minY } : null,
+      viewport: { w: window.innerWidth, h: window.innerHeight },
     };
   });
+  const marqueeOnScreen =
+    hud.marquee !== null &&
+    hud.marquee.w > 40 &&
+    hud.marquee.h > 12 &&
+    hud.marquee.left >= 0 &&
+    hud.marquee.top >= 0 &&
+    hud.marquee.left + hud.marquee.w <= hud.viewport.w + 1 &&
+    hud.marquee.top + hud.marquee.h <= hud.viewport.h + 1;
   check(
-    '① 首屏可见筹码余量/投币按钮/加注按钮',
-    (hud.credits?.width ?? 0) > 0 && (hud.drop?.width ?? 0) > 0 && (hud.bet?.width ?? 0) > 0,
-    `筹码 ${hud.credits?.text}，加注 ${hud.bet?.text}`,
+    '① 首屏可见投币/加注按钮，且余额有一处可见读数（宽视口 = 招牌屏投影矩形）',
+      (hud.drop?.width ?? 0) > 0 && (hud.bet?.width ?? 0) > 0 && marqueeOnScreen,
+      `加注按钮 "${hud.bet?.text}"，招牌屏矩形 ${Math.round(hud.marquee?.w ?? 0)}×${Math.round(
+        hud.marquee?.h ?? 0,
+      )} 落在 ${hud.viewport.w}×${hud.viewport.h} 视口内 = ${marqueeOnScreen}；` +
+        `DOM 筹码读数宽 ${Math.round(hud.credits?.width ?? 0)}（宽视口刻意收起，窄视口由 ⑭ 那条量）`,
   );
 
   // 2. 一次有效投币只减 1、只生成 1 枚；冷却中的输入不扣筹码
@@ -6790,6 +7324,123 @@ async function runCamera(page, context) {
     page.evaluate((value) => window.__THREE_GAME_TEST_HOOKS__?.setCameraRig?.(value) ?? null, patch);
   const setTuning = (patch) =>
     page.evaluate((value) => window.__THREE_GAME_TEST_HOOKS__?.setTuning?.(value) ?? null, patch);
+
+  /*
+   * ── Stage 3a 的三条 UI 判据（都在**出厂机位**下量，机位改了再量是另一回事）──
+   *
+   * G-遮挡：招牌屏投到屏幕空间之后，顶部 HUD 的矩形不许与它相交。
+   *   这条是用户红框里那件事的直接形态 ——「marquee 像素字被 #hud-top 遮挡」，
+   *   历史上 `a306b92` 是绕开（挪文案）而不是修，所以它没有判据守着 ⇒ 这次补上。
+   * G-单读数：余额在宽视口下只许有一个可见读数（marquee 是唯一真源，
+   *   `#resource-readout` 退成小屏的备用读数）。
+   * G-disabled：`button:disabled` 的 CSS 规则里不许出现 `opacity`
+   *   —— `:313-314` 那条注释早就说过"灰掉的按钮才读作不能按"，但实现里留着 0.55，
+   *   注释与代码各说一套。这条把它钉成静态判据（不依赖"此刻恰好有个禁用按钮"）。
+   */
+  const occlusion = await page.evaluate(() => {
+    const box = window.__THREE_GAME_TEST_HOOKS__?.marqueeScreenBox?.() ?? null;
+    const rectOf = (selector) => {
+      const el = document.querySelector(selector);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+    };
+    const intersects = (a, b) =>
+      a !== null &&
+      b !== null &&
+      a.left < b.right &&
+      a.right > b.left &&
+      a.top < b.bottom &&
+      a.bottom > b.top;
+    const hudTop = rectOf('#hud-top');
+    const readout = rectOf('#resource-readout');
+    // ⚠️ `marqueeScreenBox` 给的是 {minX,maxX,minY,maxY}，不是 DOMRect。
+    // 第一版直接把它当矩形喂给 `intersects` ⇒ `box.left` 是 undefined ⇒ 比较全 false
+    // ⇒ **这条门恒绿**（跑出来"不相交"而打印的读数明明白白叠在一起）。归一化之后它才吃真数。
+    const marquee = box
+      ? { left: box.minX, right: box.maxX, top: box.minY, bottom: box.maxY }
+      : null;
+    const readoutStyle = document.querySelector('#resource-readout')
+      ? getComputedStyle(document.querySelector('#resource-readout')).display
+      : 'absent';
+    // 静态扫 CSSOM：任何命中 `button:disabled` 的规则里都不该有 opacity。
+    const opacityRules = [];
+    for (const sheet of document.styleSheets) {
+      let rules = null;
+      try {
+        rules = sheet.cssRules;
+      } catch {
+        continue; // 跨源样式表读不到，跳过而不是当成"没有"
+      }
+      for (const rule of rules ?? []) {
+        const text = rule.cssText ?? '';
+        if (rule.selectorText?.includes(':disabled') && /\bopacity\s*:/.test(text)) {
+          opacityRules.push(rule.selectorText);
+        }
+      }
+    }
+    return {
+      box,
+      hudTop,
+      readout,
+      readoutStyle,
+      overlapTop: intersects(marquee, hudTop),
+      overlapReadout: intersects(marquee, readout),
+      opacityRules,
+      viewport: { w: window.innerWidth, h: window.innerHeight },
+    };
+  });
+  check(
+    'G-遮挡：顶部 HUD 不与招牌屏的屏幕投影矩形相交',
+      occlusion.box !== null &&
+      occlusion.hudTop !== null &&
+      occlusion.overlapTop === false &&
+      occlusion.overlapReadout === false,
+    `招牌屏 ${JSON.stringify(occlusion.box && { x: [occlusion.box.minX.toFixed(0), occlusion.box.maxX.toFixed(0)], y: [occlusion.box.minY.toFixed(0), occlusion.box.maxY.toFixed(0)] })}、` +
+      `#hud-top ${JSON.stringify(occlusion.hudTop && { x: [occlusion.hudTop.left.toFixed(0), occlusion.hudTop.right.toFixed(0)], y: [occlusion.hudTop.top.toFixed(0), occlusion.hudTop.bottom.toFixed(0)] })} ` +
+      `⇒ 相交(top=${occlusion.overlapTop}, readout=${occlusion.overlapReadout})，视口 ${occlusion.viewport.w}×${occlusion.viewport.h}`,
+  );
+  check(
+    'G-单读数：宽视口下余额读数只剩招牌屏一处（#resource-readout 收起）',
+      occlusion.readoutStyle === 'none',
+    `#resource-readout display=${occlusion.readoutStyle}（视口宽 ${occlusion.viewport.w}）`,
+  );
+  check(
+    'G-disabled：button:disabled 的规则里不出现 opacity（灰阶 + 收 glow，不减透明度）',
+      occlusion.opacityRules.length === 0,
+      `还在用 opacity 的选择器：${occlusion.opacityRules.join(' / ') || '（无）'}`,
+  );
+  /*
+   * G-字号（Stage 3b）：HUD 里**可见文本**的 computed font-size 不许低于 11px。
+   *
+   * 这条抓的是那批 `0.6rem`（≈9.6px）的 `<small>`：机关剩余次数、成本、倍率说明全靠它们，
+   * 在小屏上就是一团马赛克。计划的替代方案是"计数灯"（亮点个数 = 剩余次数），
+   * 所以这条门红了就意味着 3b 还没做完 —— 不是判据坏了。
+   * ⚠️ 只看 `offsetParent !== null` 的可见节点，且要求它**自己**有文字
+   * （`childNodes` 里有 Text 且非空白），不然会数到一堆继承字号的空容器。
+   */
+  const smallText = await page.evaluate(() => {
+    const hud = document.querySelector('#hud');
+    if (!hud) return null;
+    const offenders = [];
+    for (const el of hud.querySelectorAll('*')) {
+      if (el.offsetParent === null && el.tagName !== 'BODY') continue;
+      const hasOwnText = [...el.childNodes].some(
+        (n) => n.nodeType === Node.TEXT_NODE && (n.textContent ?? '').trim().length > 0,
+      );
+      if (!hasOwnText) continue;
+      const size = parseFloat(getComputedStyle(el).fontSize);
+      if (Number.isFinite(size) && size < 11) {
+        offenders.push(`${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ''}:${size.toFixed(1)}`);
+      }
+    }
+    return offenders;
+  });
+  check(
+    'G-字号：#hud 内可见文本的 computed font-size 全部 ≥ 11px（0.6rem 那批 <small> 要换成计数灯）',
+      smallText !== null && smallText.length === 0,
+      `低于 11px 的节点：${(smallText ?? ['(没有 #hud)']).slice(0, 8).join(' ')}${smallText && smallText.length > 8 ? ' …' : ''}`,
+  );
 
   const near = (a, b, eps) => Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= eps;
   const vecNear = (a, b, eps) =>

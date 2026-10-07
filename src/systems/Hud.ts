@@ -2,7 +2,7 @@ import type { EndlessConfig } from '../game/endless';
 import type { BetTier } from '../game/economy';
 import type { ClimaxTone } from '../game/kinds';
 import type { FlyTier } from '../game/feedback';
-import { MECHANISM_COST } from './Mechanisms';
+import { MECHANISM_COST, MECHANISM_USES } from './Mechanisms';
 import type { RunSnapshot } from './RunState';
 import { closingLine, tauntFor } from './Taunts';
 
@@ -118,6 +118,43 @@ export class Hud {
   private setText(node: { textContent: string | null }, text: string): void {
     if (node.textContent === text) return;
     node.textContent = text;
+  }
+
+  /**
+   * 计数灯：把"还剩几次"画成一排亮点（Stage 3b），后面可以跟一句短语。
+   *
+   * ★ 只在**变化时**重建 DOM：这个方法每帧都被 `publishHud` 调到，
+   *   照 `setText` 的"变了才写"同一条纪律，用 `dataset.lights` 当指纹。
+   *   不这么做的话每帧 `replaceChildren` 会让按钮里的节点一直换身份，
+   *   hover/focus 与将来的动画都会被抽走。
+   */
+  private setLights(
+    node: HTMLElement | null,
+    count: number,
+    caption = '',
+    cap = MECHANISM_USES.grapple,
+  ): void {
+    if (!node) return;
+    const lit = Math.max(0, Math.floor(count));
+    // 总位数取 `max(表的上限, 当前剩余)`：「机关充能」这类构筑奖励可以把次数**加到超过开局档位**，
+    // 固定按表画就会少报（G-计数灯 就是这么抓到"亮 2 / 引擎 3"的 —— 灯少亮一盏是说谎的显示，
+    // 不是可以接受的近似）。
+    const total = Math.max(cap, lit);
+    if (node.dataset.lights === `${lit}/${total}/${caption}`) return;
+    node.dataset.lights = `${lit}/${total}/${caption}`;
+    const children: Array<HTMLElement> = [];
+    for (let i = 0; i < total; i += 1) {
+      const light = document.createElement('i');
+      light.className = i < lit ? 'light light-on' : 'light';
+      children.push(light);
+    }
+    if (caption) {
+      const label = document.createElement('span');
+      label.className = 'light-caption';
+      label.textContent = caption;
+      children.push(label);
+    }
+    node.replaceChildren(...children);
   }
 
   private setAttribute(
@@ -437,12 +474,11 @@ export class Hud {
 
     const canGrapple = snapshot.phase === 'playing' && snapshot.chips >= MECHANISM_COST.grapple;
     this.grappleButton.disabled = !canGrapple || mechanisms.grapple <= 0;
-    this.setText(
-      this.grappleState,
-      mechanisms.grapple <= 0
-        ? '本局已用完'
-        : `剩 ${mechanisms.grapple} 次 · 花 ${MECHANISM_COST.grapple} 筹码`,
-    );
+    // Stage 3b：**计数灯**而不是"剩 2 次 · 花 2 筹码"那行 0.6rem 小字。
+    // 灯的个数本身就是信息（不用读字），它也顺手满足了 G-字号 那条"可见文本 ≥ 11px"——
+    // 小字要么放大到占位、要么删掉，灯是第三条路。买不起时后面跟一句话说明原因，
+    // 因为"为什么不亮"不能只靠灯的颜色猜。
+    this.setLights(this.grappleState, mechanisms.grapple, `花 ${MECHANISM_COST.grapple} 筹码`);
 
     const canReload =
       (snapshot.phase === 'ready' || snapshot.phase === 'playing') && snapshot.chips >= MECHANISM_COST.reload;

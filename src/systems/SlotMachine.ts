@@ -6,7 +6,6 @@ import {
   REEL_STRIP,
   SLOT_FINE_COLOR,
   SLOT_MISS_COLOR,
-  SLOT_PENALTY_CHIPS,
   SLOT_SYMBOL_COLORS,
   SLOT_SYMBOL_GLYPHS,
   SLOT_SYMBOL_KIND,
@@ -14,6 +13,8 @@ import {
   reelFacesFor,
   reelStripIndex,
   rollSlotOutcome,
+  fineRatio,
+  type FineQuote,
   type SlotOutcome,
   type SlotSymbol,
   type SlotTier,
@@ -52,8 +53,10 @@ import type { Telemetry } from './Telemetry';
  * 奖励表（硬约束：**不走 `gainChips`**，越线返值仍是唯一筹码来源）：
  *   力 → `grantBoost()`（存满 → 改派 `BOOST_OVERFLOW_FALLBACK` 小型补货，**不空响**）
  *   塔 / 泉 / 钻 / 箱 → `ShowDirector.request(...)`（真币演出）
- *   胡萝卜四连 → 扣到 0 为止，扣不掉的转成欠款（`RunState.fineChips` + `SaveStore.chargeFine`，
- *              两笔都不动恒等式的形状：实扣进 `spent`，转出的进 `debt`）
+ *   胡萝卜四连 → **按余额比例**扣本局筹码（1a：10%→40%，算式在 `xixi.ts`）。
+ *              上限 40% ⇒ 永远扣得掉 ⇒ `shortfall` 恒为 0，S5b 那条转欠款腿
+ *              （`RunState.fineChips` + `SaveStore.chargeFine`）成了不可达的安全网；
+ *              两笔都不动恒等式的形状：实扣进 `spent`，转出的进 `debt`
  */
 
 type SlotDeps = {
@@ -69,16 +72,25 @@ type SlotDeps = {
   /** 加力就绪音效。 */
   onBoostReady: () => void;
   /**
-   * 胡萝卜四连的罚款：从余额里扣到 0 为止。
-   * 返回 `{applied, shortfall}` —— S5b 之后扣不掉的**不蒸发**，由 `chargeFine` 转成欠款。
+   * 这一次胡萝卜四连**该罚多少**（外加算它时用的余额与进度）。
+   *
+   * 比例制的算式在 `xixi.ts`（`quoteFine(balance, progress)`），这里只是一个取值口：
+   * SlotMachine 既不知道余额也不知道深度，所以由组合根（`Game`）把两个输入喂进去。
+   * 不把余额/进度当参数传进来让 SlotMachine 自己算，是因为那样算式就会在两个文件里各有一份。
+   * 返回值连**输入**一起带，是为了让遥测能记下"这一刻的余额与进度"——
+   * 滚筒转的那几秒盘面还在结算，场外读不到同一个数（详见 `quoteFine` 的注释）。
    */
-  fineChips: (amount: number) => { applied: number; shortfall: number };
+  fineQuote: () => FineQuote;
   /**
-   * 把罚不掉的那一截记进欠款（`SaveStore.chargeFine` 是 debt 的唯一写门之一）。
-   * 返回**实际入账额**（到上限时小于请求额，甚至为 0）——判据读的是这个数，
-   * 不是请求额：拿请求额断言就等于把 clamp 那一步藏起来不验。
+   * 胡萝卜四连的罚款：**一次调用做完两步**（实扣进 `spent`、扣不掉的 shortfall 进 `debt`）。
+   * 返回**实际生效**的三个数 —— 判据吃的是它们而不是请求额：
+   * 拿请求额断言就等于把 clamp 那一步藏起来不验（`SaveStore.chargeFine` 的上限同理）。
    */
-  chargeFine: (shortfall: number) => number;
+  settleFine: (amount: number) => { applied: number; shortfall: number; debtAdded: number };
+  /**
+   * 四同发生一次（1b 的票券源之一）。名额与账都由组合根去发，SlotMachine 不碰票券数。
+   */
+  onJackpot: () => void;
   /**
    * 四同「力」：排 N 发**连续加长行程**（`Pusher.queueJackpotPush`）。
    * 返回排完之后待用的总发数 —— 判据核的是这个数，理由同 `chargeFine`。
@@ -383,13 +395,14 @@ export class SlotMachine {
     }
 
     if (outcome.kind === 'fine') {
-      // ★ S5b：扣不掉的不再蒸发 ——  shortfall 转成欠款，「这一刻疼一下」变成「欠一笔要还」。
-      // 两笔分开记：`fined` 是**实扣的筹码**（进了 spent，账本看得见），
-      // `debtAdded` 是**转出去的那一截**（进 debt，未来的产出分流）。
-      // 遥测里两个都要有：只记一个就没法对账「罚 6 到底落在哪儿」，
-      // 而 `fined + debtAdded ≥ SLOT_PENALTY_CHIPS` 被上限 clamp 打破时也会露出来。
-      const { applied, shortfall } = this.deps.fineChips(SLOT_PENALTY_CHIPS);
-      const debtAdded = this.deps.chargeFine(shortfall);
+      // ★ 1a 比例制：罚款是**算出来的**（余额的 10%→40%，算式只在 `xixi.ts` 一份）。
+      // 遥测带四个数才够对账：`requested`（该罚多少）、`fined`（实扣，进 spent）、
+      // `debtAdded`（转出去的那一截，进 debt）、以及算 `requested` 用的余额与进度。
+      // 少任何一个，「这次该罚多少、落在哪儿」就只能靠区间猜。
+      // ⚠️ 上限 40% ⇒ `shortfall` 恒为 0 ⇒ `debtAdded` 恒为 0（S5b 那条转欠款腿成了安全网，
+      //    正常玩法里走不到）。这不是漏接线，是比例制的结构后果，判据把它当**不变量**守着。
+      const quote = this.deps.fineQuote();
+      const { applied, debtAdded } = this.deps.settleFine(quote.amount);
       this.deps.telemetry.recordXixi({
         phase: 'reward',
         outcome: 'fine',
@@ -398,16 +411,22 @@ export class SlotMachine {
         delivered: 0,
         fined: applied,
         debtAdded,
+        requested: quote.amount,
+        fineBalance: quote.balance,
+        fineProgress: quote.progress,
         t: this.deps.now(),
       });
+      // 文案里带上百分比：比例制之后同一个符号有时罚 8 有时罚 40，
+      // 不说清"扣的是余额的几成"玩家只会读成随机数（Stage 2 的归因硬判据同一条道理）。
+      const percent = Math.round(fineRatio(quote.progress) * 100);
       this.deps.notify(
         applied > 0 && debtAdded > 0
-          ? `老虎机：胡萝卜×4，罚 ${applied} 筹码，另 ${debtAdded} 记在账上`
+          ? `老虎机：胡萝卜×4，扣余额 ${percent}% —— 罚 ${applied} 筹码，另 ${debtAdded} 记在账上`
           : applied > 0
-            ? `老虎机：胡萝卜×4，罚 ${applied} 筹码`
+            ? `老虎机：胡萝卜×4，扣余额 ${percent}%（${applied} 筹码）`
             : debtAdded > 0
               ? `老虎机：胡萝卜×4，一分罚不出 —— 记 ${debtAdded} 欠款`
-              : '老虎机：胡萝卜×4，但你已经一分不剩、账也记满了',
+              : '老虎机：胡萝卜×4，但你现在罚不出整枚筹码',
       );
       return;
     }
@@ -441,6 +460,9 @@ export class SlotMachine {
      * 再引入任何相机位移要用户点头，所以这里用**闪色 + 时间轴 + 行程**表达强度。
      */
     if (tier === 4) {
+      // 1b：四同是票券的三个源之一（`TICKET_JACKPOT` 张）。发多少张由组合根决定，
+      // 这里只报告"发生了一次四同"——名额表在 `waves.ts`，抄第二份就又多一处真源。
+      this.deps.onJackpot();
       if (symbol === 'boost') {
         const strokes = this.deps.jackpotPush(RULES.jackpotBoostStrokes);
         this.deps.climax('white');

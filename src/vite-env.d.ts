@@ -174,6 +174,55 @@ interface ThreeGameDiagnostics {
     referenceStake: number;
     /** 本局已注入的大赏币枚数（注入率断言的分子）。 */
     bounties: number;
+    /**
+     * 票券与波次（1b）。**不进三账本恒等式**，所以是四个平行读数而不是一条新桶。
+     * 判据吃：`tickets === ticketEarned − ticketSpent`、`ticketBySource.crossing ===
+     * floor(crossings / ticketEveryCrossings)`、`ticketSpent === draftCost × draftsTaken`。
+     */
+    tickets: number;
+    ticketEarned: number;
+    ticketSpent: number;
+    ticketBySource: { crossing: number; combo: number; jackpot: number; effect: number };
+    crossings: number;
+    wave: number;
+    waveTickets: number;
+    /** 当前波的目标（引擎算好的，脚本不重演 `base + step × (n−1)`）。 */
+    waveTarget: number;
+    pendingDraft: boolean;
+    draftsTaken: number;
+    ticketEveryCrossings: number;
+    /** 本局**当前生效**的发券间隔（「票孔」会压到下限）；注入率判据吃这个。 */
+    ticketEvery: number;
+    ticketComboTier: number;
+    ticketJackpotChips: number;
+    draftCost: number;
+    /**
+     * Stage 2 币种效果（催债币）的读数。
+     * 归因门吃 `triggers === attributed && events.length === triggers`；
+     * 逐事件恒等门吃 `events[i].applied / requested / debtAdded`。
+     */
+    coinEffects: {
+      triggers: number;
+      attributed: number;
+      events: Array<{
+        id: string;
+        requested: number;
+        applied: number;
+        debtAdded: number;
+        balance: number;
+        progress: number;
+        t: number;
+      }>;
+      /** 催债币注入的**尝试**次数（条件满足就想注）与其中**成功**拿到池位的次数。 */
+      hazardAttempts: number;
+      hazardSpawned: number;
+    };
+    /** 币种效果表的水量合计（枚）。催债币是**汇**，这一列必须是 0。 */
+    coinEffectWaterTotal: number;
+    /** 波间奖励表的水量合计（枚）。本轮三档全为 0 ⇒ 池水门守的就是这个 0。 */
+    draftWaterTotal: number;
+    hazardAfterDrops: number;
+    hazardEveryDrops: number;
   };
   pusher: {
     offset: number;
@@ -743,6 +792,18 @@ interface ThreeGameTestHooks {
     offsetX: number;
   } | null;
   /**
+   * 招牌屏在屏幕空间的包围盒（CSS 像素、相对视口）。G-遮挡判据吃它（Stage 3a）。
+   * ⚠️ 形状是 `{minX,maxX,minY,maxY}` 而不是 DOMRect —— 判据要先归一化再比，
+   *   把它直接当矩形用会拿到 undefined ⇒ 比较恒 false ⇒ **门恒绿**（第一版就中过）。
+   */
+  marqueeScreenBox?(): {
+    minX: number;
+    maxX: number;
+    minY: number;
+    maxY: number;
+    corners: Array<[number, number]>;
+  } | null;
+  /**
    * 主动播一条招牌屏字幕（走玩法里同一个 `subtitle()` 入口）。
    *
    * 为的是让屏的**两行态**成为可测状态：它原本只有老虎机开奖 / 机关提示会触发，
@@ -985,6 +1046,10 @@ interface ThreeGameTestHooks {
       tier?: 3 | 4;
       /** 胡萝卜四连罚不掉而转成欠款的那一截（S5b，`fine` 才有）。 */
       debtAdded?: number;
+      /** 1a 比例制：这一次**该罚多少**，以及算它时用的余额与归一化进度（`fine` 才有）。 */
+      requested?: number;
+      fineBalance?: number;
+      fineProgress?: number;
       granted?: boolean;
       delivered?: number;
       t: number;
@@ -1150,6 +1215,70 @@ interface ThreeGameTestHooks {
    * 判据用它核「四同四连、三同差一格、杂牌两两不同」，不在测试里重写这段规则。
    */
   reelFaces?(kind: string, symbol?: string, tier?: 3 | 4): string[][];
+  /**
+   * 1a 比例制罚款的表与算式（只读）。判据调 `ratioAt` / `amountFor` 而不是自己插值，
+   * 端点值（0.1 / 0.4）由判据用字面量钉 —— 那样改了表判据才会红。
+   */
+  fineRule?(): {
+    ratioFloor: number;
+    ratioCeil: number;
+    rampDrops: number;
+    ratioAt(progress: number): number;
+    amountFor(balance: number, progress: number): number;
+  };
+  /**
+   * 用**合成金额**驱动罚款结算的两步（`fineChips` → `chargeFine`）。
+   * 存在理由：比例制上限 40% ⇒ 玩法里 `shortfall` 恒为 0，clamp 与欠款上限那套机器
+   * 从正常路径到达不了（10-07 用户拍板 A：留作安全网，但**必须被测**）。
+   */
+  /**
+   * 合成地走 N 次「一枚币越线」的票券入口（`RunState.noteCrossing`）。
+   * 存在理由与 `applyFine` 同一条：真攒够 `TICKET_EVERY_CROSSINGS` 枚越线要等约 27 分钟物理行程，
+   * 而驱动的是引擎自己那个函数 ⇒ 验的是状态机，不是接线（接线由 economy 的逐局恒等门覆盖）。
+   */
+  noteCrossings?(count: number): {
+    asked: number;
+    crossings: number;
+    tickets: number;
+    ticketEarned: number;
+    ticketSpent: number;
+    ticketEvery: number;
+    wave: number;
+    waveTickets: number;
+    pendingDraft: boolean;
+  };
+  /**
+   * 定点触发一次币种效果（Stage 2 的催债币），返回两侧读数与报告。
+   * 真越线那条接线不在这里，在 economy 的逐局恒等门。
+   */
+  coinEffectTrigger?(effect: string): {
+    before: { chips: number; fines: number; spent: number; debt: number; earned: number };
+    after: { chips: number; fines: number; spent: number; debt: number; earned: number };
+    report: {
+      triggers: number;
+      attributed: number;
+      events: Array<{
+        id: string;
+        requested: number;
+        applied: number;
+        debtAdded: number;
+        balance: number;
+        progress: number;
+        t: number;
+      }>;
+    };
+    fired: boolean;
+    statusLine: string;
+  } | null;
+  applyFine?(amount: number): {
+    requested: number;
+    applied: number;
+    shortfall: number;
+    debtAdded: number;
+    before: { chips: number; fines: number; spent: number; debt: number };
+    after: { chips: number; fines: number; spent: number; debt: number };
+    ceiling: number;
+  };
   /**
    * 币的几何派生量（S13）：**验证脚本的唯一真源**。
    *

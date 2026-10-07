@@ -54,6 +54,7 @@ import { PhysicsWorld } from '../systems/PhysicsWorld';
 import { RunState } from '../systems/RunState';
 import { SaveStore } from '../systems/SaveStore';
 import { SlotMachine } from '../systems/SlotMachine';
+import { CoinEffects } from '../systems/CoinEffects';
 import {
   applyCabinetSkin,
   buildCabinetShell,
@@ -88,7 +89,8 @@ import { betTier, crossingReturn } from './economy';
 import { endlessLevel, type EndlessConfig } from './endless';
 import { crossingFeedback, type FeedbackCounts } from './feedback';
 import { isOnDeckVolume } from './layout';
-import { xixiSlot } from './xixi';
+import { FINE_RAMP_DROPS, quoteFine, xixiSlot } from './xixi';
+import { HAZARD_AFTER_DROPS, HAZARD_EVERY_DROPS, TICKET_JACKPOT } from './waves';
 
 /** 高于此高度视为「在途」，收尾时先等它们落到台面。 */
 const IN_FLIGHT_Y = 0.55;
@@ -188,6 +190,8 @@ export class Game {
    */
   private readonly spray: CoinSpray;
   private readonly slotMachine: SlotMachine;
+  /** 波间三选一（1c）：票券的汇与构筑奖励的落地，DOM 与分支都在那个系统里。 */
+  private readonly coinEffects: CoinEffects;
   /**
    * XIXI 四槽亮灭（P5）。**不进 RunState**：它是跨局持续的收集进度
    * （存档 `coin-pusher:save:v4` 的 xixi 字段），每局重置的是账本，不是收集线。
@@ -271,6 +275,15 @@ export class Game {
     run: () => this.run,
     sampleCoins: this.sampleCoins.bind(this),
     save: () => this.save,
+    // G-遮挡（Stage 3a）：把招牌屏投到屏幕空间需要一块画布矩形（相机已经有取值口了：
+    // 上面 `camera: () => this.camera`）。投影本身在 `diagnostics/testHooks.ts` 里算 ——
+    // 不进 Game.ts 是因为 0d 立的规矩（Game 只允许减少），也因为这条判据只在验证时读。
+    canvasBox: () => {
+      const rect = this.renderer.domElement.getBoundingClientRect();
+      return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+    },
+    /** Stage 2 判据读它：币种效果的触发/归因两侧计数与逐事件。 */
+    coinEffects: () => this.coinEffects,
     scene: () => this.scene,
     sceneDrawCalls: () => this.sceneDrawCalls,
     seedOverride: () => this.seedOverride,
@@ -300,6 +313,8 @@ export class Game {
     anomalyCount: () => this.anomalyCount,
     anomalySamples: () => this.anomalySamples,
     audio: () => this.audio,
+    /** Stage 2 判据读它：币种效果（催债币）的触发/归因两侧计数与逐事件。 */
+    coinEffects: () => this.coinEffects,
     bedCoins: () => this.bedCoins,
     begsThisRun: () => this.begsThisRun,
     betIndex: () => this.betIndex,
@@ -518,7 +533,7 @@ export class Game {
     this.renderer.toneMappingExposure = this.tuning.exposure;
 
     // ★ 币面分辨率倍率必须在**建币池之前**写进全局 —— `CoinPool` 构造时就按
-    // `coinTexels()` 把六种币的贴图烘出来了，晚一步设就是「第一局还是糊的」。
+    // `coinTexels()` 把每种币的贴图烘出来了，晚一步设就是「第一局还是糊的」。
     setCoinTexelScale(this.tuning.coinTexelScale);
 
     this.input = new InputController(
@@ -567,14 +582,22 @@ export class Game {
       // （唯一扣减入口，另记 `fines` 供对账）；扣不掉的 shortfall 交给
       // `SaveStore.chargeFine` 转成欠款。**两笔都不新增恒等式项**：
       // `spent` 吸收实扣，`debt` 是未来产出的分流承诺、不是余额的进出。
-      fineChips: (amount) => this.run.fineChips(amount),
-      chargeFine: (shortfall) => {
-        const applied = this.save.chargeFine(shortfall);
-        // 欠款行要当场改文案：惩罚发生在滚筒停格那一刻，等下一帧 publishHud 也来得及，
-        // 但 HUD 的 debt 行只在显式调用时才重算 —— 不推就是「罚了款而债没动」的假象。
+      // ⚠️ 1a 比例制之后上限 40% ⇒ shortfall 恒为 0 ⇒ 第二步在正常玩法里**走不到**
+      //   （用户 10-07 拍板 A：留作安全网，判据把"永不转债"当不变量守，机器本身由
+      //   `testHooks.applyFine` 用合成输入驱动）。详见 `xixi.ts` 罚款那段的结构后果注释。
+      // 1a 起罚款是**比例制**（余额的 10%→40%，随本局投币数爬升），算式只在 `xixi.ts` 一份，
+      // 这里只把两个输入喂进去 —— 组合根不重抄表，判据从遥测的 `requested` 读回同一个数。
+      // 进度口径 = `drops / FINE_RAMP_DROPS`（归一化）：波次系统落地后换的只是这一行，表不动。
+      fineQuote: () => quoteFine(this.run.chips, this.run.drops / FINE_RAMP_DROPS),
+      // 两步（实扣 + shortfall 转欠款）合成一次调用，见 `RunState.settleFine` 那段"三份抄本"的话。
+      // 这里只多干一件事：推一次 HUD —— 欠款行只在显式调用时重算，不推就是"罚了款而债没动"的假象。
+      settleFine: (amount) => {
+        const result = this.run.settleFine(amount);
         this.publishHud();
-        return applied;
+        return result;
       },
+      /** 1b 四同 ⇒ 票券：名额表只在 `waves.ts` 一份，这里只是把事件接到账上。 */
+      onJackpot: () => this.run.earnTicket('jackpot', TICKET_JACKPOT),
       /** S5a 四同「力」：排 N 发连续加长行程（与玩家按钮的「去重一发」是两个动作）。 */
       jackpotPush: (strokes) => this.pusher.queueJackpotPush(strokes),
       /** S5a 四同的闪色：复用越线反馈那条**同一个** `triggerClimax`，不另开一条闪光通道。 */
@@ -582,6 +605,24 @@ export class Game {
       onReveal: (outcome) => this.audio.slotReveal(outcome.kind),
       // 转动的机械声要覆盖整段转动（3.4~4.0 秒），所以把时长传下去让音效排程。
       onSpinStart: (seconds) => this.audio.slotSpin(seconds),
+    });
+    // 波间三选一（1c）：候选表在 `game/effects.ts`，这里只给它接线。
+    // `root` 用 document：面板与 #ruin-panel 同级，DOM 缺席时系统自己退化成不显示。
+    this.coinEffects = new CoinEffects({
+      run: () => this.run,
+      mechanisms: () => this.mechanisms,
+      rng: () => this.rng(),
+      notify: (message) => this.announce(message),
+      refresh: () => this.publishHud(),
+      // 币种效果（催债币）与老虎机罚款**共用一条出账口**：同一张比例表、同一个 settleFine。
+      fineQuote: () => quoteFine(this.run.chips, this.run.drops / FINE_RAMP_DROPS),
+      settleFine: (amount) => {
+        const result = this.run.settleFine(amount);
+        this.publishHud();
+        return result;
+      },
+      now: () => this.elapsed,
+      root: document,
     });
     // XIXI 进度从存档恢复：跨局持续，破产不清零。
     this.xixi = [...this.save.snapshot.xixi];
@@ -792,6 +833,8 @@ export class Game {
     this.coins.syncAll();
     this.processOutcomes();
     this.updateRunState(delta);
+    // 票券攒够 ⇒ 立起三选一面板（不暂停仿真，理由见 CoinEffects 的文件头）。
+    this.coinEffects.tick();
     this.updateRefill(delta);
     this.laneMarker.position.x = intent.laneX;
     this.updateHotZone(delta);
@@ -1616,6 +1659,12 @@ export class Game {
     this.flash(this.spitterMaterial, 0.42);
     // 每 N 投注入一枚金色大赏币（方差的主杠杆）。
     if (this.run.drops % ENDLESS.bountyEveryDrops === 0) this.spawnBounty();
+    // Stage 2：深度够了之后机器开始吐**催债币**（越线不返筹码、反而按余额比例扣一笔）。
+    // 门槛用**投数**而不是波次，理由写在 `waves.ts` 的 `HAZARD_AFTER_DROPS` 那段：
+    // 波次要靠玩家点三选一才前进，自动批一次都不会点 ⇒ 拿波次当门等于"实测里永远看不到它"。
+    if (this.run.drops >= HAZARD_AFTER_DROPS && this.run.drops % HAZARD_EVERY_DROPS === 0) {
+      this.spawnHazard();
+    }
     return true;
   }
 
@@ -1637,8 +1686,36 @@ export class Game {
     return true;
   }
 
-  private tryBoost(): boolean {
-    if (this.pusher.pendingBoost) return false;
+  /**
+   * 注入一枚催债币（Stage 2 的汇）。
+   *
+   * 与 `spawnBounty` 同一个形状：同尺寸、同碰撞体，靠币面与自发光区分 ⇒ 不动物理，
+   * 也就不动任何一条已标定的推进/回收判据。区别全在结算：它越线**返 0 筹码**，
+   * 由 `CoinEffects.dispatchCoin` 反向扣一笔（走 `settleFine` 那条唯一扣减口）。
+   *
+   * ⚠️ 这里**不注票券**：它是抽水，不是发钱。水量门（`effects.ts` 的 water）为 0 说的就是这件事。
+   */
+  private spawnHazard(): boolean {
+    const coin = this.coins.acquire();
+    // 尝试与成功都记（`CoinEffects.noteHazardAttempt` 那段说了为什么三条缺席原因要能分开）。
+    this.coinEffects.noteHazardAttempt(coin !== null);
+    if (!coin) return false;
+    const x = (this.rng() - 0.5) * 2 * TABLE.drop.halfLane;
+    /*
+     * ★ 刻意注在**得分线前 0.20~0.45 米**，而不是像大赏币那样铺满整条纵深。
+     * 依据是实测而不是感觉：economy 批的三个归因读数给出
+     * 「7 次尝试 / 7 次拿到池位 / 0 次结算」⇒ 币进去了但一局走完也没到过线，
+     * 而**一枚从不越线的催债币作为机制等于不存在**（它的规则只存在于代码里）。
+     * 下界 0.20 米是留给**反应窗口**的：扫板与抓斗得来得及把它排掉，
+     * 否则"可以规避"就只是注释上的承诺（Stage 2 的规避可达判据要能验这一条）。
+     */
+    const z = TABLE.scoreLineZ - (0.2 + this.rng() * 0.25);
+    coin.spawn('debt', x, TABLE.pusherTopY + 0.5, z, this.rng() * Math.PI * 2, false);
+    this.hud.setStatus('催债币注入：这枚越线不返筹码，会按余额比例扣钱 —— 扫板/抓斗能把它排掉');
+    return true;
+  }
+
+  private tryBoost(): boolean {    if (this.pusher.pendingBoost) return false;
     if (!this.run.canUseBoost) return false;
     if (!this.run.useBoost()) return false;
 
@@ -1794,6 +1871,10 @@ export class Game {
   private settleCrossing(coin: Coin): void {
     const kind = coin.kind;
     const combo = this.run.nextCombo(this.elapsed);
+    // 票券的两个盘面源（每 N 枚越线、连落到档）在同一个入口判 —— 越线只有这一处发生，
+    // 所以「票券从哪来」不会有一条藏在 HUD 或演出里的旁路。传 combo 而不是让它自己读，
+    // 是因为连落数只在 `nextCombo()` 那一刻算得准（返值也吃它），再算一遍就是第二个口袋。
+    this.run.noteCrossing(combo.combo);
     // 热区：币在亮条范围内越线，返值翻倍。
     const hot = this.isInHotZone(coin.position.x);
     const outcome = crossingReturn({
@@ -1887,11 +1968,12 @@ export class Game {
     if (outcome.chips > 0 && (kind === 'payout' || kind === 'bounty')) this.audio.payoutReturn();
     if (combo.combo >= 3) this.hud.showCombo(combo.combo, COIN_KIND[kind].label);
 
-    // 效果型币种（宝箱）：越线返 **0 筹码**，改派一场投放演出。
+    // 效果型币种（Stage 2 的催债币）：越线返 **0 筹码**，结算交给 `CoinEffects.dispatchCoin`。
     // 0 是硬值——这里绝不能写成负数，否则三账本恒等式会立刻报。
-    // 派发目标写在 `kinds.ts` 的 `payout.show` 里，这里不再手写币种名单。
+    // 出账在 `dispatchCoin` 里面走 `RunState.settleFine`（唯一扣减口），
+    // 所以"加一种会扣钱的币"不需要动恒等式，也不需要在这里写币种名单。
     const payoutRule = kindSpec(kind).payout;
-    if (payoutRule.mode === 'effect') this.shows.request(payoutRule.show);
+    if (payoutRule.mode === 'effect') this.coinEffects.dispatchCoin(payoutRule.effect);
 
     // 高潮反馈：读分级结果（连落 ≥ 5 的**白闪**优先于币种自身的高潮定义）。
     // 只驱动 HUD 闪色 —— 镜头抖动已在 S16 按用户要求删除（见 `triggerClimax`）。

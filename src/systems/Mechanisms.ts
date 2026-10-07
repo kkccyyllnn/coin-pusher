@@ -113,6 +113,19 @@ export class Mechanisms {
     return this.uses[id];
   }
 
+  /**
+   * 加几次使用（1c 的「机关充能」候选）。
+   *
+   * 参数刻意是 `Exclude<MechanismId, 'reload'>`：后装填本来就是无限次
+   * （`usesLeft('reload')` 返回 +Infinity），给它"充能"是一个会静默成功的空操作。
+   * 返回实际加上的次数，让调用方能把"没加上"如实讲出来 —— 与 `chargeFine` 同一口径。
+   */
+  grantUses(id: Exclude<MechanismId, 'reload'>, amount: number): number {
+    const n = Math.max(0, Math.floor(amount));
+    this.uses[id] += n;
+    return n;
+  }
+
   /** 只读巡检用：把活跃币里满足条件的挑出来（回调返回 true 会 despawn，所以这里返回 false）。 */
   private collect(predicate: (coin: Coin) => boolean): Coin[] {
     const picked: Coin[] = [];
