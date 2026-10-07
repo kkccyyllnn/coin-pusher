@@ -415,6 +415,9 @@ export class SlotMachine {
     const { symbol } = outcome;
     const glyph = SLOT_SYMBOL_GLYPHS[symbol];
     const tier = outcome.tier;
+    // 文案要和滚筒上的画面同号：三同写「三同＋差一格」，四同才写四连。
+    // 改之前这里不分档一律写四个字形 —— 与 `reelFacesFor` 当时「所有 win 都四连」是同一个错的两个面。
+    const banner = tier === 4 ? glyph.repeat(4) : `${glyph.repeat(3)}＋差一格`;
 
     /*
      * ── S5a 四同大奖 ──
@@ -453,7 +456,7 @@ export class SlotMachine {
           delivered: strokes,
           t: this.deps.now(),
         });
-        this.deps.notify(`老虎机：${glyph}${glyph}${glyph}${glyph}！！连续 ${strokes} 发加长行程`);
+        this.deps.notify(`老虎机：${banner}！！连续 ${strokes} 发加长行程`);
         return;
       }
       if (symbol === 'diamond') this.deps.climax('blue');
@@ -473,7 +476,7 @@ export class SlotMachine {
           t: this.deps.now(),
         });
         this.deps.onBoostReady();
-        this.deps.notify(`老虎机：${glyph}${glyph}${glyph}${glyph}！加力 +1`);
+        this.deps.notify(`老虎机：${banner}！加力 +1`);
         return;
       }
 
@@ -498,8 +501,8 @@ export class SlotMachine {
       });
       this.deps.notify(
         fallback.ok
-          ? `老虎机：${glyph}${glyph}${glyph}${glyph}！加力已存满 → 改派补货 ${fallback.promised} 枚`
-          : `老虎机：${glyph}${glyph}${glyph}${glyph}，加力已存满且${fallback.reason}`,
+          ? `老虎机：${banner}！加力已存满 → 改派补货 ${fallback.promised} 枚`
+          : `老虎机：${banner}，加力已存满且${fallback.reason}`,
       );
       return;
     }
@@ -524,8 +527,8 @@ export class SlotMachine {
     });
     this.deps.notify(
       result.ok
-        ? `老虎机：${glyph}${glyph}${glyph}${glyph}！${SLOT_SYMBOL_LABELS[symbol]}演出奉上`
-        : `老虎机：${glyph}${glyph}${glyph}${glyph}，但${result.reason}`,
+        ? `老虎机：${banner}！${SLOT_SYMBOL_LABELS[symbol]}演出奉上`
+        : `老虎机：${banner}，但${result.reason}`,
     );
   }
 

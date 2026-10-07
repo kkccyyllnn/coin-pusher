@@ -1132,14 +1132,24 @@ interface ThreeGameTestHooks {
    */
   slotOdds?(samples?: number): {
     samples: number;
-    counts: Record<'win' | 'fine' | 'miss', number>;
+    /** 键 = `SLOT_OUTCOME_WEIGHTS` 的键（win3/win4/fine/miss），桶由表自己开。 */
+    counts: Record<string, number>;
     symbols: Record<string, number>;
+    /** 结果权重表本身：判据拿实测比例与它对账，不在测试里抄第二份数。 */
+    weights: Record<string, number>;
+    totalWeight: number;
+    symbolCount: number;
+    /** 符号名单（判据逐符号核停格画面时读它，不抄五个符号）。 */
+    symbolList: string[];
+    /** 四同池成员，以及枚举里真的摇到过的四同符号。 */
+    tier4Symbols: string[];
+    tier4SymbolsSeen: Record<string, number>;
   };
   /**
    * 停格画面的枚举：给定结果，`reelFacesFor` 会给出四个滚筒各显示什么图标。
-   * 判据用它核「win/fine 四连、miss 两两不同」，不在测试里重写这段规则。
+   * 判据用它核「四同四连、三同差一格、杂牌两两不同」，不在测试里重写这段规则。
    */
-  reelFaces?(kind: string, symbol?: string): string[][];
+  reelFaces?(kind: string, symbol?: string, tier?: 3 | 4): string[][];
   /**
    * 币的几何派生量（S13）：**验证脚本的唯一真源**。
    *

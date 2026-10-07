@@ -1231,6 +1231,8 @@ export function createTestHooks(host: TestHooksHost): ThreeGameTestHooks {
       totalWeight: outcomeTotalWeight(),
       /** 符号池大小由引擎给：判据断「无死项」时读它，不写 5。 */
       symbolCount: SLOT_SYMBOL_WEIGHTS.length,
+      /** 符号名单本身（判据要「逐符号」核画面时读它，不在测试里抄第二份五个符号）。 */
+      symbolList: SLOT_SYMBOL_WEIGHTS.map((entry) => entry.symbol),
       /** 四同池成员与**枚举里真的摇到过的符号**：判据据此核「池里没有死项、池外没人混进来」。 */
       tier4Symbols: [...SLOT_TIER4_SYMBOLS],
       tier4SymbolsSeen,
@@ -1238,7 +1240,7 @@ export function createTestHooks(host: TestHooksHost): ThreeGameTestHooks {
   },
   /**
    * 停格画面的枚举：给定结果，`reelFacesFor` 沿 `detailRoll` 轴扫一遍。
-   * 判据用它核「win/fine 四连、miss 两两不同」，不在测试里重写这段规则。
+   * 判据用它核「四同四连、三同差一格、杂牌两两不同」，不在测试里重写这段规则。
    */
   reelFaces: (kind: string, symbol?: string, tier?: SlotTier) => {
     const outcome: SlotOutcome =

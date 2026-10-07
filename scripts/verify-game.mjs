@@ -2717,27 +2717,74 @@ async function runXixi(page) {
     `池 ${tier4Want.join('/')}，枚举到 ${tier4Seen.join('/') || '无'}，四同 ${odds?.counts?.win4} 次`,
   );
 
-  const facesFor = (kind, symbol) =>
+  const facesFor = (kind, symbol, tier) =>
     page.evaluate(
-      ([k, s]) => window.__THREE_GAME_TEST_HOOKS__?.reelFaces?.(k, s) ?? null,
-      [kind, symbol],
+      ([k, s, t]) => window.__THREE_GAME_TEST_HOOKS__?.reelFaces?.(k, s, t) ?? null,
+      [kind, symbol, tier],
     );
-  const winFaces = (await facesFor('win', 'tower')) ?? [];
+  const win3Faces = (await facesFor('win', 'tower', 3)) ?? [];
+  const win4Faces = (await facesFor('win', 'tower', 4)) ?? [];
   const fineFaces = (await facesFor('fine')) ?? [];
   const missFaces = (await facesFor('miss')) ?? [];
   const fourSame = (row) => row.length === 4 && row.every((icon) => icon === row[0]);
   const missVariety = new Set(missFaces.map((row) => row.join(','))).size;
+  /*
+   * 「差一格」必须**真的差一格**：环带上与目标相邻的那一枚。
+   * 相邻关系从 `iconReport().ids` 取（那就是 `REEL_STRIP` 本身），惩罚图标从 `fineFaces` 取
+   * —— 两个都不在脚本里抄第二份，否则改图集顺序时这条会假绿。
+   */
+  const stripIds = (await page.evaluate(() => window.__THREE_GAME_TEST_HOOKS__?.iconReport?.()?.ids ?? [])) ?? [];
+  const fineIcon = fineFaces[0]?.[0];
+  const shapeCounts = (row) => {
+    const counts = new Map();
+    for (const icon of row) counts.set(icon, (counts.get(icon) ?? 0) + 1);
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  };
+  const nearMissShaped = (row) => {
+    const c = shapeCounts(row);
+    return row.length === 4 && c.length === 2 && c[0][1] === 3 && c[1][1] === 1;
+  };
+  const nearMissAdjacent = (row) => {
+    const c = shapeCounts(row);
+    if (c.length !== 2) return false;
+    const [major, odd] = [c[0][0], c[1][0]];
+    if (!fineIcon || odd === fineIcon) return false; // 「差一格」不能长成惩罚的样子
+    const a = stripIds.indexOf(major);
+    const b = stripIds.indexOf(odd);
+    const len = stripIds.length;
+    if (a < 0 || b < 0 || len < 3) return false;
+    return (a - b + len) % len === 1 || (b - a + len) % len === 1;
+  };
+  // 逐符号都成立才算数：只验塔一个，别的符号画错形状照样绿。
+  // 符号名单读引擎的 `slotOdds().symbolList`，脚本里不抄第二份五个符号。
+  const allSymbols = odds?.symbolList ?? [];
+  const win3BySymbol = {};
+  for (const symbol of allSymbols) win3BySymbol[symbol] = (await facesFor('win', symbol, 3)) ?? [];
+  const win3AllShaped = Object.values(win3BySymbol).every(
+    (rows) => rows.length > 0 && rows.every((row) => nearMissShaped(row) && nearMissAdjacent(row)),
+  );
   check(
-    '停格画面自证：win/fine 四连；杂牌四格两两不同、不含胡萝卜、画面不重复',
-    winFaces.length > 0 &&
-      winFaces.every(fourSame) &&
+    '停格画面自证：四同四连 / 三同「差一格」且差的那格在环带上相邻 / 杂牌四格两两不同、不含惩罚图标、画面不重复',
+    stripIds.length >= 3 &&
+      Boolean(fineIcon) &&
+      win4Faces.length > 0 &&
+      win4Faces.every(fourSame) &&
+      win3Faces.length > 0 &&
+      win3Faces.every(nearMissShaped) &&
+      win3Faces.every(nearMissAdjacent) &&
+      // 名单与池大小两个引擎读数必须互相印证（少一个符号 ⇒ 这里就红，而不是静默少验一个）
+      allSymbols.length === odds?.symbolCount &&
+      win3AllShaped &&
       fineFaces.every(fourSame) &&
-      fineFaces.every((row) => row[0] === 'carrot') &&
+      fineFaces.every((row) => row[0] === fineIcon) &&
       missFaces.every((row) => row.length === 4 && new Set(row).size === 4) &&
-      missFaces.every((row) => !row.includes('carrot')) &&
+      missFaces.every((row) => !row.includes(fineIcon)) &&
       missVariety >= 5,
-    `win=${winFaces[0]?.join('')} fine=${fineFaces[0]?.join('')} ` +
-      `杂牌 ${missFaces.length} 次采样 / ${missVariety} 种不同画面`,
+    `四同=${win4Faces[0]?.join('')} 三同=${win3Faces[0]?.join('')}（相邻核对用图集顺序 ${stripIds.join('')}） ` +
+      `${allSymbols.length} 个符号的三同各自 ${Object.entries(win3BySymbol)
+        .map(([s, r]) => `${s}:${r[0]?.join('')}`)
+        .join(' ')} ` +
+      `fine=${fineFaces[0]?.join('')} 杂牌 ${missFaces.length} 次采样 / ${missVariety} 种不同画面`,
   );
 
   // ── D/E：先做强制摇奖（此时一币未投，earned 必须一直是 0） ──
