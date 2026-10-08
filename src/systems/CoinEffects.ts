@@ -1,4 +1,11 @@
-import { EFFECT_POOL, EFFECT_SPECS, COIN_EFFECT_SPECS, type CoinEffectId, type EffectId } from '../game/effects';
+import {
+  COIN_EFFECT_IDS,
+  COIN_EFFECT_SPECS,
+  EFFECT_POOL,
+  EFFECT_SPECS,
+  type CoinEffectId,
+  type EffectId,
+} from '../game/effects';
 import { DRAFT_COST, waveTarget } from '../game/waves';
 import { fineRatio, type FineQuote } from '../game/xixi';
 import { createPixelTextSurface, type PixelTextSurface } from '../render/pixelText';
@@ -9,7 +16,12 @@ import type { Mechanisms } from './Mechanisms';
 /** 一次币种效果的结算记录（Stage 2d 的归因对账吃的是**逐事件**，不是总数）。 */
 export type CoinEffectEvent = {
   id: CoinEffectId;
-  /** 该扣多少（比例制算出来的名义额）。 */
+  /**
+   * 这一条结算的是哪一档。判据按它选字段，**不再假设"每次触发都有一笔罚款"** ——
+   * 2c 之后有两条 act，`applied` 对票币就是恒 0，看数的人需要知道自己在读哪一档。
+   */
+  act: 'fine' | 'ticket';
+  /** 该扣多少（比例制算出来的名义额）；`ticket` 档恒 0。 */
   requested: number;
   applied: number;
   debtAdded: number;
@@ -20,7 +32,19 @@ export type CoinEffectEvent = {
    */
   balance: number;
   progress: number;
+  /** `ticket` 档：真的发出去几张（用 `ticketBySource.effect` 的前后差量出来，不是表里的期望值）。 */
+  ticketsGranted: number;
   t: number;
+};
+
+/** 单条效果币的分账（计划 2d 原话："触发计数 === 归因计数，**逐效果**对账"）。 */
+export type CoinEffectTally = {
+  triggers: number;
+  attributed: number;
+  /** 注入尝试次数（含 `coins.acquire()` 拿到 null 的那次 —— 缺席要能归因）。 */
+  attempts: number;
+  /** 其中真的把币放上盘面的次数。 */
+  spawned: number;
 };
 
 /** 面板上一张候选的显示数据（`label` / `glyph` / `note` 全部来自 `effects.ts`，这里不重写文案）。 */
@@ -70,16 +94,20 @@ export class CoinEffects {
   private readonly meta: HTMLElement | null;
   private current: DraftChoice[] = [];
   visible = false;
-  /** 币种效果：触发过几次（只增）。 */
-  private triggers = 0;
-  /** 其中留下 HUD 归因的有几条 —— 与 `triggers` 相等才说明"发生了且看得见"。 */
-  private attributed = 0;
+  /** 逐事件流水（每条自带 `id` 与 `act`）；`tally` 是它的计数视图，两份都由这一个人的手写成。 */
   private coinEffectEvents: CoinEffectEvent[] = [];
   /** 每张候选的像素徽章面（Stage 3b 的 pixelText 消费者；面板关掉后会被 dispose）。 */
   private badges: PixelTextSurface[] = [];
-  /** 催债币注入：尝试次数与其中真正拿到池位次数的读数（缺席要能归因）。 */
-  hazardAttempts = 0;
-  hazardSpawned = 0;
+  /**
+   * 币种效果的分账，**按效果 id 键着**（计划 2d）。
+   *
+   * 为什么不留一个总数口袋：两条效果币都往 `triggers` 上加时，"这局遇到催债币"
+   * 那条存在性判据就变成"这局遇到过**某条**效果"——那是把两条规则混读成一条。
+   * 名单来自 `COIN_EFFECT_IDS`（`effects.ts` 的真源），加一档不用回来补键。
+   */
+  private readonly tally = new Map<CoinEffectId, CoinEffectTally>(
+    COIN_EFFECT_IDS.map((id) => [id, { triggers: 0, attributed: 0, attempts: 0, spawned: 0 }]),
+  );
 
   constructor(private readonly deps: CoinEffectsDeps) {
     this.panel = (deps.root.querySelector('#draft-panel') as HTMLElement | null) ?? null;
@@ -242,6 +270,14 @@ export class CoinEffects {
     // 面板收起来就别留着三块画布占内存：下一次 open 会重建（候选本来也是新的）。
     for (const badge of this.badges) badge.dispose();
     this.badges = [];
+    /*
+     * ★ 候选节点也要一起摘掉。`hidden` 只挡住鼠标：`element.click()` 与键盘焦点仍能打到
+     * 一张**已经作废**的卡（实测：economy 机器人点了 23 次、引擎只记 12 张 —— 那 11 次
+     * 全打在收起后的旧按钮上，被 `pick()` 的 `!visible` 挡回去）。留着它们等于让 DOM
+     * 说"这里有三张可选卡"而真相是"没有"，这是本项目零容忍的那类画面/账不一致。
+     */
+    this.choices?.replaceChildren();
+    this.current = [];
   }
 
   /**
@@ -250,51 +286,85 @@ export class CoinEffects {
    * 分派链从 `Game.settleCrossing` 进来，**币种名单不在那里写**（`kinds.ts` 的
    * `payout.effect` 才是真源）——那正是 S16 之前"币种能干什么"散在分派处的老毛病。
    *
-   * ★ 两条硬规矩：
+   * ★ 三条硬规矩：
    *   ① 出账只走 `settleFine`（唯一扣减口）⇒ 三账本恒等式不需要为新币种改一个字；
-   *   ② 每次触发**必须**留一条 HUD 归因，并且 `triggers` 与 `attributed` 一起计数 ——
+   *   ② 入账只走 `RunState.earnTicket`（票券唯一的源入口）⇒ 它同样碰不到筹码账；
+   *   ③ 每次触发**必须**留一条 HUD 归因，并且按效果 id 把 `triggers` 与 `attributed` 一起记 ——
    *      两者相等是 Stage 2d 的判据内容，不相等就是"发生了而玩家看不见"。
    */
   dispatchCoin(effect: CoinEffectId): void {
     const spec = COIN_EFFECT_SPECS[effect];
-    this.triggers += 1;
-    if (spec.act !== 'fine') {
-      // 目前只有 `fine` 一种 act。走到没实现的分支要出声，不能静默当"已处理"。
-      this.deps.notify(`币种效果 ${spec.label} 没有实现分支（不该发生）`);
-      return;
-    }
-    const quote = this.deps.fineQuote();
-    const { applied, debtAdded } = this.deps.settleFine(quote.amount);
-    this.coinEffectEvents.push({
+    const tally = this.tally.get(effect);
+    if (tally) tally.triggers += 1;
+    const event: CoinEffectEvent = {
       id: effect,
-      requested: quote.amount,
-      applied,
-      debtAdded,
-      balance: quote.balance,
-      progress: quote.progress,
+      act: spec.act,
+      requested: 0,
+      applied: 0,
+      debtAdded: 0,
+      // `balance` / `progress` 是**罚款档的输入**，票币档不填（0 = 这一档没有这两个量），
+      // 免得读数里出现一个看着像"票币也读了余额"的值。
+      balance: 0,
+      progress: 0,
+      ticketsGranted: 0,
       t: this.deps.now(),
-    });
-    const percent = Math.round(fineRatio(quote.progress) * 100);
-    this.deps.notify(
-      debtAdded > 0
-        ? `催债币越线：不返筹码，扣余额 ${percent}%（${applied} 筹码），另 ${debtAdded} 记在账上`
-        : `催债币越线：不返筹码，扣余额 ${percent}%（${applied} 筹码）`,
-    );
-    this.attributed += 1;
+    };
+    switch (spec.act) {
+      case 'fine': {
+        const quote = this.deps.fineQuote();
+        const { applied, debtAdded } = this.deps.settleFine(quote.amount);
+        event.requested = quote.amount;
+        event.applied = applied;
+        event.debtAdded = debtAdded;
+        event.balance = quote.balance;
+        event.progress = quote.progress;
+        const percent = Math.round(fineRatio(quote.progress) * 100);
+        this.coinEffectEvents.push(event);
+        this.deps.notify(
+          debtAdded > 0
+            ? `催债币越线：不返筹码，扣余额 ${percent}%（${applied} 筹码），另 ${debtAdded} 记在账上`
+            : `催债币越线：不返筹码，扣余额 ${percent}%（${applied} 筹码）`,
+        );
+        break;
+      }
+      case 'ticket': {
+        // 凭据取**差量**而不是表里的期望值：表说给 1 张、`earnTicket` 真给了几张，
+        // 是两个口袋。读 `ticketBySource.effect` 的前后差，恒等式才有第二条腿可核。
+        const run = this.deps.run();
+        const before = run.ticketBySource.effect;
+        run.earnTicket('effect', spec.payload.tickets ?? 0);
+        event.ticketsGranted = run.ticketBySource.effect - before;
+        this.coinEffectEvents.push(event);
+        this.deps.notify(
+          event.ticketsGranted > 0
+            ? `票币越线：不返筹码，票券 +${event.ticketsGranted}（现在 ${run.tickets} 张可用）`
+            : `票币越线：不返筹码，但这次一张券也没发出去（${spec.payload.tickets}）`,
+        );
+        break;
+      }
+      default: {
+        // 表里写了第三种 act 而这里没分支 —— 出声，不能静默当"已处理"。
+        this.deps.notify(`币种效果 ${spec.label} 没有实现分支（不该发生）`);
+        return;
+      }
+    }
+    if (tally) tally.attributed += 1;
     this.deps.refresh();
   }
 
   /**
-   * 记一次催债币注入尝试（`Game.spawnHazard` 调）。
+   * 记一次效果币注入尝试（`Game.spawnEffectCoin` 按表调，效果 id 由调用方给）。
    *
-   * 为什么要把"尝试"和"成功"都记下来：批里报"0 次结算"有三种完全不同的原因 ——
+   * 为什么要把"尝试"和"成功"都记下来、还要按 id 分开：批里报"0 次结算"有三种完全不同的原因 ——
    * ① 注入条件根本没满足（投数不够 / 取模没对上）；② 条件满足了但 `coins.acquire()`
    * 返回 null（池满）；③ 币注进去了但没走完台面（局先结束）。
    * 只报"结算 0 次"分不出这三条，而那三条的处置完全不同。这是"缺席要能归因"的最低配置。
    */
-  noteHazardAttempt(spawned: boolean): void {
-    this.hazardAttempts += 1;
-    if (spawned) this.hazardSpawned += 1;
+  noteInjectAttempt(effect: CoinEffectId, spawned: boolean): void {
+    const tally = this.tally.get(effect);
+    if (!tally) return;
+    tally.attempts += 1;
+    if (spawned) tally.spawned += 1;
   }
 
   /** 判据读数：面板立着没、当前候选是谁、池子里有没有拿不到 DOM。 */
@@ -307,27 +377,36 @@ export class CoinEffects {
     };
   }
 
-  /** 币种效果的逐事件与两侧计数（归因门吃 `triggers === attributed === events.length`），外加注入尝试的归因读数。 */
+  /** 币种效果的逐事件与**逐效果**计数（归因门吃每个 id 上的 `triggers === attributed === 该 id 的事件数`）。 */
   coinEffectReport(): {
-    triggers: number;
-    attributed: number;
+    byEffect: Record<CoinEffectId, CoinEffectTally & { events: number }>;
     events: CoinEffectEvent[];
-    hazardAttempts: number;
-    hazardSpawned: number;
   } {
-    return {
-      triggers: this.triggers,
-      attributed: this.attributed,
-      events: this.coinEffectEvents.map((event) => ({ ...event })),
-      hazardAttempts: this.hazardAttempts,
-      hazardSpawned: this.hazardSpawned,
-    };
+    const byEffect = Object.fromEntries(
+      COIN_EFFECT_IDS.map((id) => {
+        const tally = this.tally.get(id) ?? { triggers: 0, attributed: 0, attempts: 0, spawned: 0 };
+        return [
+          id,
+          {
+            ...tally,
+            events: this.coinEffectEvents.filter((event) => event.id === id).length,
+          },
+        ];
+      }),
+    ) as Record<CoinEffectId, CoinEffectTally & { events: number }>;
+    return { byEffect, events: this.coinEffectEvents.map((event) => ({ ...event })) };
   }
 
-  /** 每局开始清一次：币种效果的计数与事件都是**本局**口径。 */
+  /**
+   * 每局开始清一次（调用点在 `Game.startRun`，紧跟 `mechanisms.reset()`）。
+   *
+   * ⚠️ 少了这个调用点，分账就变成**会话累计**，
+   * 而判据把逐局读数当本局数在求和 —— 10-07 就是因为要算「注入了几枚、排掉了几枚」才发现的。
+   */
   resetCoinEffects(): void {
-    this.triggers = 0;
-    this.attributed = 0;
+    for (const id of COIN_EFFECT_IDS) {
+      this.tally.set(id, { triggers: 0, attributed: 0, attempts: 0, spawned: 0 });
+    }
     this.coinEffectEvents = [];
   }
 }

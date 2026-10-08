@@ -303,7 +303,9 @@ body {
 :where(#app) button {
   padding: 8px 14px;
   border: 1px solid var(--edge-hi);
-  border-radius: 8px;
+  /* Stage 3b：硬边化到 2px。之前只改了面板，按钮与胶囊整批漏掉 ——
+     用浏览器现读才发现（`#hud` 内可见元素里还有 10 个角 >2px），所以现在有 G-硬边 守着。 */
+  border-radius: 2px;
   box-shadow:
     inset 0 1px 0 rgb(var(--brass-rgb) / 0.18),
     0 0 0 1px var(--edge-lo),
@@ -632,13 +634,15 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 999px;
+  /* Stage 3b：胶囊收回方块（与计数灯同源）。999px 的胶囊与机柜的硬边是两种语言，
+     而这条整批漏在"只改面板"里 —— 由 G-硬边 现读 computed radius 守着。 */
+  border-radius: 2px;
   transform: translate(-50%, -50%);
 }
 
 #mark-note {
   padding: 3px 9px;
-  border-radius: 999px;
+  border-radius: 2px;
   background: rgba(8, 14, 11, 0.62);
   color: var(--ink-dim);
   font-size: var(--text-min);
@@ -679,7 +683,7 @@ body {
   z-index: 40;
   padding: 4px 10px;
   border: 1px solid var(--brass);
-  border-radius: 999px;
+  border-radius: 2px;
   background: rgba(12, 20, 16, 0.92);
   color: var(--brass-hi);
   font-size: 0.72rem;
@@ -692,7 +696,7 @@ body {
   align-self: center;
   margin-top: 6px;
   padding: 5px 14px;
-  border-radius: 999px;
+  border-radius: 2px;
   color: var(--brass-hi);
   background: rgb(var(--brass-rgb) / 0.16);
   font-size: 0.86rem;
@@ -727,7 +731,8 @@ body {
   margin: 8px 0 auto;
   padding: 6px 14px;
   border-left: 3px solid var(--mint);
-  border-radius: 0 6px 6px 0;
+  /* 状态条是**左边一条铭牌带**的不对称形状，圆角也收成 2px（G-硬边 逐角核，只查左上会漏这条）。 */
+  border-radius: 0 2px 2px 0;
   background: rgba(12, 20, 16, 0.62);
   color: var(--ink-dim);
   font-size: 0.78rem;
@@ -803,7 +808,7 @@ body {
   align-items: center;
   gap: 1px;
   padding: 7px 10px;
-  border-radius: 9px;
+  border-radius: 2px;
   font-size: 0.78rem;
   touch-action: none;
 }
@@ -813,9 +818,9 @@ body {
 #reload-button small,
 #bet-button small {
   color: var(--ink-faint);
-  /* Stage 3b：这一层本该换成**计数灯**（亮点个数 = 剩余次数）。灯没做之前先把字号
-     抬到可读下限 —— G-字号 钉的是"#hud 内可见文本 ≥ 11px"，而"太简陋"的一半来源
-     就是这个 9.6px。两件事分开做，别把"还没做灯"写成"字号合法"。 */
+  /* Stage 3b：这一层的"剩余次数"已经换成**计数灯**（抓斗，见 `Hud.setLights` 与 G-计数灯），
+     成本与说明仍是文本 —— 价格画成灯读不出"花 2 筹码"是什么意思。留下来的文本一律吃可读下限：
+     G-字号 钉的就是"#hud 内可见文本 ≥ 11px"，而"太简陋"的一半来源正是这个 9.6px。 */
   font-size: var(--text-min);
 }
 
@@ -846,6 +851,41 @@ body {
   margin-inline-start: 4px;
 }
 
+/* Stage 3b · 铭牌：机关行按钮的名字是 `pixelText` 画的（整数倍放大，不接 DPR）。
+   `image-rendering: pixelated` 保证 CSS 尺寸与画布不一致时也不糊。 */
+.nameplate {
+  display: block;
+  image-rendering: pixelated;
+}
+
+/* 画布里的字机器读不到，所以 DOM 那段文本**不删**，只从视觉上收起来：
+   读屏与判据照样读得到（`G-铭牌` 的第三条断言就是在核这件事）。 */
+.pixel-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* 窄视口（< 900px）回到 DOM 文本：铭牌比两个字宽，四颗按钮并排会把机关行顶出屏幕
+   （实测 390 视口下 `#drop-button` 的右边到 437 ⇒ accept ⑭ 红）。
+   与余额读数同一条取舍：**屏放不下时可读性优先于统一语言**，不是忘了做。 */
+@media (max-width: 899px) {
+  .nameplate {
+    display: none;
+  }
+
+  .pixel-hidden {
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip-path: none;
+  }
+}
+
 #bet-button {
   border-color: var(--brass);
 }
@@ -861,7 +901,7 @@ body {
   align-items: center;
   gap: 2px;
   padding: 12px 20px;
-  border-radius: 12px;
+  border-radius: 2px;
   font-size: 1rem;
   touch-action: none;
 }

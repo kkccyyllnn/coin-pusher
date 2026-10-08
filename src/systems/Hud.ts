@@ -3,6 +3,7 @@ import type { BetTier } from '../game/economy';
 import type { ClimaxTone } from '../game/kinds';
 import type { FlyTier } from '../game/feedback';
 import { MECHANISM_COST, MECHANISM_USES } from './Mechanisms';
+import { createPixelTextSurface } from '../render/pixelText';
 import type { RunSnapshot } from './RunState';
 import { closingLine, tauntFor } from './Taunts';
 
@@ -107,13 +108,52 @@ export class Hud {
   /** 后装填的提示只跟配置走、不跟帧走 ⇒ 算一次，别每帧拼同一个模板。 */
   private readonly reloadHint = `花 ${MECHANISM_COST.reload} 筹码 · 注入 3 枚`;
 
+  constructor() {
+    this.mountNameplates();
+  }
+
+  /**
+   * 铭牌（Stage 3b 的最后一格）：机关行每颗按钮的名字改走 `pixelText` 的**像素字**。
+   *
+   * 之前 HUD 是"像素机柜 + 抗锯齿正文"两种语言并排 —— 用户红框里"太简陋"的一半来源。
+   * ★ 三个数都**从 DOM 现读**，不在这里抄第二份：
+   *   文案 = `span.textContent`（`index.html` 是唯一真源，读屏也读它），
+   *   颜色 = computed `color`（面板配色一改，铭牌自己跟上）。
+   * ⚠️ DOM 那段文本**不删**，只收进 `.pixel-hidden`（画布里的字机器读不到，
+   *   删掉等于把无障碍与"判据能读到字"一起丢）—— 这是 G-铭牌 第三条断言在守的东西。
+   * ⚠️ 只在构造时挂一次：这些名字一局内不变，而 `update()` 每帧被调，
+   *   不能让它每帧碰画布（同 `setLights` 的"变了才写"是同一条纪律）。
+   */
+  private mountNameplates(): void {
+    const SCALE = 3;
+    /** 小画布上的字号与格宽：整数倍放大后 = 27px 高、字与字 27px 宽，与按钮铭牌的尺寸吻合。 */
+    const FONT_PX = 9;
+    const CELL_PX = 9;
+    for (const button of [...document.querySelectorAll('#mechanism-row button')]) {
+      const name = button.querySelector('span');
+      const text = name?.textContent?.trim() ?? '';
+      if (!name || text.length === 0) continue;
+      const surface = createPixelTextSurface({
+        width: text.length * CELL_PX * SCALE,
+        height: (FONT_PX + 2) * SCALE,
+        scale: SCALE,
+      });
+      surface.canvas.className = 'nameplate';
+      surface.canvas.setAttribute('aria-hidden', 'true');
+      surface.draw({ text, fontPx: FONT_PX, fill: getComputedStyle(name).color });
+      name.classList.add('pixel-hidden');
+      button.insertBefore(surface.canvas, name);
+    }
+  }
+
   /**
    * 文本真的变了才写 DOM（沿用本文件既有的 `lastComboShown` / `lastBoostCharges` 脏检查范式）。
    *
    * `update()` 每帧被调用，而这些字符串在绝大多数帧里逐字不变；值仍然**全部**从传进来的
    * snapshot 现算 ⇒ 这不是"界面自己存了一份状态"的第二真源，只是省掉重复的 set。
    * ⚠️ 故意**不节流**：读 DOM 文本的判据（`save-migration.spec.ts:281-282`、
-   *    `verify-game.mjs:4061-4077`）要求"这一帧的值这一帧就能读到"。
+   *    `verify-game.mjs` 的 accept ① —— 它现读 `#credits-value` 的文本，行号会漂所以按门名指）
+   *    要求"这一帧的值这一帧就能读到"。
    */
   private setText(node: { textContent: string | null }, text: string): void {
     if (node.textContent === text) return;

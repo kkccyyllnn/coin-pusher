@@ -164,6 +164,11 @@ interface ThreeGameDiagnostics {
     drops: number;
     chipsPeak: number;
     bestEarned: number;
+    /**
+     * 上一条收工写进存档的成绩记录（1b：票券那一列在这里）。
+     * `ticketEarned` 是**可选键** —— 老存档的记录没这个键，见 `SaveStore.RunRecord` 的注释。
+     */
+    lastRunRecord: { earned: number; drops: number; begs: number; ticketEarned?: number } | null;
     ruinVisible: boolean;
     /** 大赏币注入间隔（每多少投 1 枚）。测试读它，避免写死数字。 */
     bountyEveryDrops: number;
@@ -202,27 +207,52 @@ interface ThreeGameDiagnostics {
      * 逐事件恒等门吃 `events[i].applied / requested / debtAdded`。
      */
     coinEffects: {
-      triggers: number;
-      attributed: number;
+      /** 分账按效果 id 键着（计划 2d 的原话是"逐效果对账"）：总数口袋会把两条规则混读成一条。 */
+      byEffect: Record<
+        string,
+        {
+          triggers: number;
+          attributed: number;
+          /** 注入的**尝试**次数（条件满足就想注）与其中**成功**拿到池位的次数。 */
+          attempts: number;
+          spawned: number;
+          events: number;
+        }
+      >;
       events: Array<{
         id: string;
+        /** 这一条结算的是哪一档（`'fine'` / `'ticket'`）—— 看数的人要能分清在读哪张规则。 */
+        act: string;
         requested: number;
         applied: number;
         debtAdded: number;
         balance: number;
         progress: number;
+        /** `ticket` 档：真的发出去几张（由 `ticketBySource.effect` 的差量得出，不是表里的期望）。 */
+        ticketsGranted: number;
         t: number;
       }>;
-      /** 催债币注入的**尝试**次数（条件满足就想注）与其中**成功**拿到池位的次数。 */
-      hazardAttempts: number;
-      hazardSpawned: number;
     };
-    /** 币种效果表的水量合计（枚）。催债币是**汇**，这一列必须是 0。 */
+    /** 币种效果表的水量合计（枚）。催债币与票币都是**换**而不是给 ⇒ 这一列必须是 0。 */
     coinEffectWaterTotal: number;
     /** 波间奖励表的水量合计（枚）。本轮三档全为 0 ⇒ 池水门守的就是这个 0。 */
     draftWaterTotal: number;
-    hazardAfterDrops: number;
-    hazardEveryDrops: number;
+    /**
+     * 注入表按 id 列出（`effects.ts` 的 `inject` 三个键 + 由 `payout.effect` 反查到的币种）。
+     * 表互证门逐行读它，脚本侧不抄 `45 / 24`；`kind === null` 的那一行就是
+     * "effects.ts 与 kinds.ts 两份名单脱钩"的直接证据（每条效果币都得有一个币面替它说话）。
+     * 它取代旧的 `hazardAfterDrops` / `hazardEveryDrops` 两个字段 —— 那是脚本侧的抄件，
+     * 2c 加了第二条效果币之后它连"说的是哪条"都答不清。
+     */
+    coinEffectTable: Array<{
+      id: string;
+      act: string;
+      water: number;
+      kind: string | null;
+      afterDrops: number;
+      everyDrops: number;
+      aheadOfLine: [number, number];
+    }>;
   };
   pusher: {
     offset: number;
@@ -1248,25 +1278,32 @@ interface ThreeGameTestHooks {
     pendingDraft: boolean;
   };
   /**
-   * 定点触发一次币种效果（Stage 2 的催债币），返回两侧读数与报告。
+   * 定点触发一次币种效果（Stage 2 的催债币 / 票币），返回两侧读数与逐效果分账。
    * 真越线那条接线不在这里，在 economy 的逐局恒等门。
    */
   coinEffectTrigger?(effect: string): {
-    before: { chips: number; fines: number; spent: number; debt: number; earned: number };
-    after: { chips: number; fines: number; spent: number; debt: number; earned: number };
-    report: {
-      triggers: number;
-      attributed: number;
-      events: Array<{
-        id: string;
-        requested: number;
-        applied: number;
-        debtAdded: number;
-        balance: number;
-        progress: number;
-        t: number;
-      }>;
+    before: {
+      chips: number;
+      fines: number;
+      spent: number;
+      debt: number;
+      earned: number;
+      tickets: number;
+      ticketEarned: number;
+      ticketEffect: number;
     };
+    after: {
+      chips: number;
+      fines: number;
+      spent: number;
+      debt: number;
+      earned: number;
+      tickets: number;
+      ticketEarned: number;
+      ticketEffect: number;
+    };
+    /** 与 diagnostics 那份**同一个类型**（派生，不抄第二份形状）。 */
+    report: ThreeGameDiagnostics['endless']['coinEffects'];
     fired: boolean;
     statusLine: string;
   } | null;

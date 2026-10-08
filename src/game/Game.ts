@@ -87,10 +87,12 @@ import { cabinetSkinById, coinSkinById } from './cosmetics';
 import { coinPhysics } from './coinPhysics';
 import { betTier, crossingReturn } from './economy';
 import { endlessLevel, type EndlessConfig } from './endless';
+import { COIN_EFFECT_IDS, COIN_EFFECT_SPECS, type CoinEffectId } from './effects';
 import { crossingFeedback, type FeedbackCounts } from './feedback';
 import { isOnDeckVolume } from './layout';
+import { kindForEffect } from './kinds';
 import { FINE_RAMP_DROPS, quoteFine, xixiSlot } from './xixi';
-import { HAZARD_AFTER_DROPS, HAZARD_EVERY_DROPS, TICKET_JACKPOT } from './waves';
+import { TICKET_JACKPOT } from './waves';
 
 /** 高于此高度视为「在途」，收尾时先等它们落到台面。 */
 const IN_FLIGHT_Y = 0.55;
@@ -1659,11 +1661,16 @@ export class Game {
     this.flash(this.spitterMaterial, 0.42);
     // 每 N 投注入一枚金色大赏币（方差的主杠杆）。
     if (this.run.drops % ENDLESS.bountyEveryDrops === 0) this.spawnBounty();
-    // Stage 2：深度够了之后机器开始吐**催债币**（越线不返筹码、反而按余额比例扣一笔）。
-    // 门槛用**投数**而不是波次，理由写在 `waves.ts` 的 `HAZARD_AFTER_DROPS` 那段：
+    // Stage 2：深度够了之后机器开始吐**效果币**（催债币扣钱、票币发券）。
+    // 名单、起注投数、节奏、落点带全在 `effects.ts` 的 `inject` 表里 —— 这里只遍历它，
+    // 不在分派处再写一份 if（那正是 P6 之前"币种能干什么散在几处"的老毛病）。
+    // 门槛用**投数**而不是波次，理由也写在那段：
     // 波次要靠玩家点三选一才前进，自动批一次都不会点 ⇒ 拿波次当门等于"实测里永远看不到它"。
-    if (this.run.drops >= HAZARD_AFTER_DROPS && this.run.drops % HAZARD_EVERY_DROPS === 0) {
-      this.spawnHazard();
+    for (const id of COIN_EFFECT_IDS) {
+      const { afterDrops, everyDrops } = COIN_EFFECT_SPECS[id].inject;
+      if (this.run.drops >= afterDrops && this.run.drops % everyDrops === 0) {
+        this.spawnEffectCoin(id);
+      }
     }
     return true;
   }
@@ -1687,31 +1694,32 @@ export class Game {
   }
 
   /**
-   * 注入一枚催债币（Stage 2 的汇）。
+   * 按 `effects.ts` 的表注入一枚**效果币**（Stage 2 的汇与券源共用这一个口）。
    *
    * 与 `spawnBounty` 同一个形状：同尺寸、同碰撞体，靠币面与自发光区分 ⇒ 不动物理，
    * 也就不动任何一条已标定的推进/回收判据。区别全在结算：它越线**返 0 筹码**，
-   * 由 `CoinEffects.dispatchCoin` 反向扣一笔（走 `settleFine` 那条唯一扣减口）。
+   * 由 `CoinEffects.dispatchCoin` 按 `act` 分派（`fine` 走 `settleFine` 那条唯一扣减口，
+   * `ticket` 走 `RunState.earnTicket('effect', N)` 那条唯一发券口）。
    *
-   * ⚠️ 这里**不注票券**：它是抽水，不是发钱。水量门（`effects.ts` 的 water）为 0 说的就是这件事。
+   * ⚠️ 两条的**筹码**水量都是 0（水量门数的就是筹码），但这不等于"没给东西"：
+   * 票币给的是另一种货币，它由票券恒等式 `tickets === earned − spent` 守，不挤筹码红线。
+   * 落点带由表给（每条效果币各一条），为什么不一样写在 `effects.ts` 的 `aheadOfLine` 那段。
    */
-  private spawnHazard(): boolean {
+  private spawnEffectCoin(effect: CoinEffectId): boolean {
+    // 效果 id 没配到币种 = `effects.ts` 与 `kinds.ts` 两份名单脱钩。
+    // 这条由 xixi 的映射门逐 id 断言它非空；真撞上时这里**什么都不注入**，
+    // 绝不套一个错的币面骗人（币面与规则不一致是本项目零容忍的那类 bug）。
+    const kind = kindForEffect(effect);
+    if (!kind) return false;
     const coin = this.coins.acquire();
-    // 尝试与成功都记（`CoinEffects.noteHazardAttempt` 那段说了为什么三条缺席原因要能分开）。
-    this.coinEffects.noteHazardAttempt(coin !== null);
+    // 尝试与成功都记，且按效果 id 分开（`CoinEffects.noteInjectAttempt` 那段说了为什么三条缺席原因要能分开）。
+    this.coinEffects.noteInjectAttempt(effect, coin !== null);
     if (!coin) return false;
+    const { aheadOfLine, spawnNote } = COIN_EFFECT_SPECS[effect].inject;
     const x = (this.rng() - 0.5) * 2 * TABLE.drop.halfLane;
-    /*
-     * ★ 刻意注在**得分线前 0.20~0.45 米**，而不是像大赏币那样铺满整条纵深。
-     * 依据是实测而不是感觉：economy 批的三个归因读数给出
-     * 「7 次尝试 / 7 次拿到池位 / 0 次结算」⇒ 币进去了但一局走完也没到过线，
-     * 而**一枚从不越线的催债币作为机制等于不存在**（它的规则只存在于代码里）。
-     * 下界 0.20 米是留给**反应窗口**的：扫板与抓斗得来得及把它排掉，
-     * 否则"可以规避"就只是注释上的承诺（Stage 2 的规避可达判据要能验这一条）。
-     */
-    const z = TABLE.scoreLineZ - (0.2 + this.rng() * 0.25);
-    coin.spawn('debt', x, TABLE.pusherTopY + 0.5, z, this.rng() * Math.PI * 2, false);
-    this.hud.setStatus('催债币注入：这枚越线不返筹码，会按余额比例扣钱 —— 扫板/抓斗能把它排掉');
+    const z = TABLE.scoreLineZ - (aheadOfLine[0] + this.rng() * (aheadOfLine[1] - aheadOfLine[0]));
+    coin.spawn(kind, x, TABLE.pusherTopY + 0.5, z, this.rng() * Math.PI * 2, false);
+    this.hud.setStatus(spawnNote);
     return true;
   }
 
@@ -2243,7 +2251,14 @@ export class Game {
      *   脏钱的约束没有丢：它现在长在 `SaveStore.spendable`（买图鉴的门槛）上，
      *   等价性见 `economy.spendableOf` 的代入验算。
      */
-    const record = this.save.recordRun(snapshot.earned, snapshot.drops, this.begsThisRun);
+    // 1b：票券跟着进成绩记录（`RunRecord.ticketEarned`）。取的是**这份 snapshot** 的数，
+    // 也就是收工那一刻 —— 之后的迟到越线只进账本、不进成绩单（上面那段注释说的同一条口径）。
+    const record = this.save.recordRun(
+      snapshot.earned,
+      snapshot.drops,
+      this.begsThisRun,
+      snapshot.ticketEarned,
+    );
     this.summaryVisible = true;
     this.hud.showRuin({
       earned: snapshot.earned,
@@ -2324,6 +2339,7 @@ export class Game {
     this.coins.syncAll();
 
     this.mechanisms.reset();
+    this.coinEffects.resetCoinEffects(); // 币种效果计数是**本局**口径（下面那条注释要求每局重清，之前没接上调用点）
     // 在途演出与摇奖必须随本局作废：不中止的话，上一局的塔/喷泉会把剩余承诺数
     // 吐进**这一局**的开局盘面（实测重开后 318 变 324 枚）。
     this.shows.abort();

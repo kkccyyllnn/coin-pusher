@@ -104,10 +104,13 @@ export function totalWater(): number {
  *   ① 它往盘面加不加币（加 = 进 `water`，要过池水门）；
  *   ② 它动账本的哪一边（进账 / 出账 —— 出账走 `RunState.settleFine` 那一条唯一扣减口）。
  *
- * ⚠️ 这一档**刻意不是** `spawn`：`debtCoin` 不往盘面放币，它是把"某枚已经存在的币"
- *   标成催债币后由**深度**注入的汇。计划 2b 说的"新效果默认走不进池通道"在这条上成立。
+ * ⚠️ 这一档**刻意不是** `spawn`：两条效果币都不往盘面"加钱"。`debtCoin` 是把越线那枚币
+ *   变成一笔按比例算的扣款，`ticketCoin` 是把它换成**另一种货币**（票券）。
+ *   计划 2b 说的"新效果默认走不进池通道"在这两条上都成立：`water` 数的是"进筹码账几枚"，
+ *   而它们的筹码账增量都是 0。票券那条有自己的恒等式 `tickets === earned − spent`
+ *   （`RunState.earnTicket` 的四个源之一，见 `waves.ts`），不需要挤筹码的红线。
  */
-export type CoinEffectId = 'debtCoin';
+export type CoinEffectId = 'debtCoin' | 'ticketCoin';
 
 export type CoinEffectSpec = {
   id: CoinEffectId;
@@ -115,9 +118,42 @@ export type CoinEffectSpec = {
   /** HUD 归因文案（Stage 2d：触发计数 === 归因计数）。 */
   note: string;
   trigger: 'onCross';
-  act: 'fine';
-  /** 每次触发注入盘面的免费币（枚）。`debtCoin` 是 0 —— 它是汇，不是源。 */
+  /**
+   * `fine` = 按余额比例扣一笔（走 `settleFine` 那条唯一扣减口）；
+   * `ticket` = 发 N 张票券（`RunState.earnTicket('effect', N)`，不进筹码账）。
+   */
+  act: 'fine' | 'ticket';
+  /** 每次触发注入盘面的免费币（枚）。两条效果币都是 0 —— 它们是换，不是给。 */
   water: number;
+  /** 载荷：`ticket` 吃 `tickets`；`fine` 的额度由深度算，不在表里。 */
+  payload: { tickets?: number };
+  /**
+   * 深度注入表（`Game.dropCoin` 的注入口**遍历这张表**，不在那里写第二份 `if`）。
+   *
+   * 门槛为什么用**投数**而不是波次（这段理由从 `waves.ts` 搬来，数字也一起搬了）：
+   * 波次要靠玩家点三选一才前进，自动批（economy / bot-playtest）一次都不会点
+   * ⇒ 拿波次当门 = 效果币在任何无人值守的批里**永远不出现**，
+   * 那组判据就只能在设计上成立、在实测上缺席。深度用投数，自动批也就覆盖得到。
+   */
+  inject: {
+    /** 从第几投开始注入（0 = 第一投起就吐）。 */
+    afterDrops: number;
+    /** 开始之后每多少投一枚。 */
+    everyDrops: number;
+    /**
+     * 落点带：`z = TABLE.scoreLineZ − [lo, hi]` 之间均匀取一点（米）。
+     *
+     * ★ **罚的币要留反应窗口，奖的币不用** —— 所以两条带的下界不一样：
+     * `debtCoin` 取 0.20（这 0.20 米是"玩家还能用机关把它排掉"的那点余量；
+     * 但它现在与机关触达带不相交，那条缺口记在 `PLAN.md` 未收尾 ⑥，要拍甲/乙）；
+     * `ticketCoin` 取 0.05（它越线是**给**东西，早兑现只是早点看得见，不需要窗口。
+     * 反过来如果它也埋在 0.20 之外，实测只有约四分之一注进去的币能在本局走完台面 ⇒
+     * 大多数发券机会永远不发生，那就是"机制只存在于代码里"）。
+     */
+    aheadOfLine: [number, number];
+    /** 注入那一刻的 HUD 文案（与 `note` 分开：`note` 说"这枚币的规则"，这条说"它刚进来了"）。 */
+    spawnNote: string;
+  };
 };
 
 export const COIN_EFFECT_SPECS: Record<CoinEffectId, CoinEffectSpec> = {
@@ -128,8 +164,38 @@ export const COIN_EFFECT_SPECS: Record<CoinEffectId, CoinEffectSpec> = {
     trigger: 'onCross',
     act: 'fine',
     water: 0,
+    payload: {},
+    inject: {
+      // 45 = 设计带「一条命 60~90 投」的下沿之前：前半局是干净的，后半局机器开始吐扣款币。
+      // 24 = 一局里大约吐 4~6 枚的密度（n=20 实测注入 61 枚 / 20 局 ≈ 3 枚/局，比这更凶会盖过沉降本身）。
+      afterDrops: 45,
+      everyDrops: 24,
+      aheadOfLine: [0.2, 0.45],
+      spawnNote: '催债币注入：这枚越线不返筹码，会按余额比例扣钱',
+    },
+  },
+  ticketCoin: {
+    id: 'ticketCoin',
+    label: '票币',
+    note: '越线不返筹码，改发 1 张票券（券是另一种货币，不进筹码账）',
+    trigger: 'onCross',
+    act: 'ticket',
+    water: 0,
+    payload: { tickets: 1 },
+    inject: {
+      // 20 投起 = 比催债币早得多：构筑仪式要在前半局就被看见（玩家先学会"券能换东西"）。
+      // 40 投一枚是**点缀级**的加法：按 n=20 的兑现率它每局约 1~2 张，
+      // 对着「越线每 12 枚一张」那条主源（≈20 张/局）是 +5~10 %，不动定档的结论。
+      afterDrops: 20,
+      everyDrops: 40,
+      aheadOfLine: [0.05, 0.2],
+      spawnNote: '票币注入：这枚越线不返筹码，会给你 1 张票券',
+    },
   },
 };
+
+/** 效果 id 的有序名单（判据与注入表都按它遍历，脱钩会立刻红在映射门上）。 */
+export const COIN_EFFECT_IDS = Object.keys(COIN_EFFECT_SPECS) as CoinEffectId[];
 
 /** 全币种效果的水量合计（池水门读它，不抄数字）。 */
 export function totalCoinEffectWater(): number {

@@ -189,10 +189,29 @@ export class RunState {
   /** 本局累计越线枚数（票券大源的分母；与 `drops` 不同轴，别混用）。 */
   crossings = 0;
   /**
+   * 每一张"越线源"票券发出那一刻的 `{at: 当时的本局越线数, every: 当时生效的间隔}`。
+   *
+   * 存在的理由：判据要能**逐事件**核"这张券是该发的"，而不是拿 `floor(C/every)` 去猜一个界 ——
+   * 「票孔」会在局中把间隔改小，界怎么推都差一个边角（10-07 就有一局落在我推的界外，
+   * 而我把那个推导证不出来）。记下来之后判据只问一句：`at % every === 0` 且条数 == `ticketBySource.crossing`。
+   */
+  crossingTicketLog: { at: number; every: number }[] = [];
+  /**
    * 本局的发券间隔（枚/张），初值 = `TICKET_EVERY_CROSSINGS`，「票孔」候选能把它减到
    * `TICKET_INTERVAL_FLOOR`。**只在本局有效** ⇒ 强化不会跨局累积（那才是真正的通胀源）。
    */
   ticketEvery = TICKET_EVERY_CROSSINGS;
+  /**
+   * 本局内**实际**被「票孔」减掉的总枚数（`tightenTicketInterval` 累加）。
+   * 存在的理由只有一个：让"本局的窗口起点"能被算出来，而不是靠脚本猜采样时刻 ——
+   * 判据原本在局与局之间读 `ticketEvery` 当"开局值"，而 `endRun()` 第一次收工并不建新的
+   * `RunState`（`Game.ts:2203/2207`），于是它量到的是上一局的末值（实测 12→10 / 10→8 的假红）。
+   */
+  ticketEveryTightened = 0;
+  /** 本局的发券间隔**起点**（= 末值 + 本局减掉的总和）⇒ 由引擎盖章，脚本不再猜时刻。 */
+  get ticketEveryStart(): number {
+    return this.ticketEvery + this.ticketEveryTightened;
+  }
   /** 攒够了但还没领：波间三选一的待办标记。 */
   pendingDraft = false;
   /** 本局领过几张候选（`ticketSpent === DRAFT_COST × draftsTaken` 的对账口径）。 */
@@ -418,7 +437,10 @@ export class RunState {
    */
   noteCrossing(combo: number): void {
     this.crossings += 1;
-    if (this.crossings % this.ticketEvery === 0) this.earnTicket('crossing', 1);
+    if (this.crossings % this.ticketEvery === 0) {
+      this.crossingTicketLog.push({ at: this.crossings, every: this.ticketEvery });
+      this.earnTicket('crossing', 1);
+    }
     // 到档那张只在"恰好踩到档"那一刻发，且每串一次：`combo` 从 1 开始单调爬，
     // 所以 `=== TICKET_COMBO_TIER` 天然只命中一次；新串开始（回到 1）才重新允许领。
     if (combo === TICKET_COMBO_TIER && !this.comboTierPaid) {
@@ -481,6 +503,7 @@ export class RunState {
     const next = Math.max(TICKET_INTERVAL_FLOOR, this.ticketEvery - wanted);
     const applied = this.ticketEvery - next;
     this.ticketEvery = next;
+    this.ticketEveryTightened += applied;
     return applied;
   }
 

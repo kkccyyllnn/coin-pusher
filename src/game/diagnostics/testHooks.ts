@@ -18,6 +18,7 @@ import {
   toRad,
 } from '../../render/cameraRig';
 import { iconReport } from '../../render/iconTexture';
+import type { CoinEffectId } from '../effects';
 import { marqueeScreen } from '../../render/marqueeScreen';
 import { isLitMaterial } from '../../render/ToonMaterial';
 import {
@@ -1326,11 +1327,11 @@ export function createTestHooks(host: TestHooksHost): ThreeGameTestHooks {
    *   真玩法那条由 xixi 模式的逐事件恒等门覆盖（`applied === requested` 且 `debtAdded === 0`）。
    */
   /**
-   * 直接触发一次**币种效果**（Stage 2 的催债币），返回两侧读数。
+   * 直接触发一次**币种效果**（Stage 2 的催债币 / 票币），返回两侧读数。
    *
-   * 存在的理由与前两条同族：真让一枚催债币走完台面要几分钟物理，
-   * 而"扣款走的是唯一扣减口、并且留了归因"这件事本身是**结算逻辑**，可以定点验。
-   * 真实越线那条**接线**由 economy 批的逐局恒等门覆盖（危险币从第 45 投起自动注入）。
+   * 存在的理由与前两条同族：真让一枚效果币走完台面要几分钟物理，
+   * 而"结算走的是那一条唯一出口、并且留了归因"这件事本身是**结算逻辑**，可以定点验。
+   * 真实越线那条**接线**由 economy 批的逐局恒等门覆盖（效果币按 `effects.ts` 的表自动注入）。
    */
   coinEffectTrigger: (effect: string) => {
     const read = () => ({
@@ -1339,17 +1340,23 @@ export function createTestHooks(host: TestHooksHost): ThreeGameTestHooks {
       spent: host.run().spent,
       debt: host.save().debt,
       earned: host.run().earned,
+      /** 票券侧（`ticketCoin` 那条腿吃它）：筹码五个字段对它一律不动。 */
+      tickets: host.run().tickets,
+      ticketEarned: host.run().ticketEarned,
+      ticketEffect: host.run().ticketBySource.effect,
     });
     const before = read();
-    const triggersBefore = host.coinEffects().coinEffectReport().triggers;
-    host.coinEffects().dispatchCoin(effect as never);
+    const id = effect as CoinEffectId;
+    const triggersBefore = host.coinEffects().coinEffectReport().byEffect[id]?.triggers ?? 0;
+    host.coinEffects().dispatchCoin(id);
     host.publishHud();
+    const report = host.coinEffects().coinEffectReport();
     return {
       before,
       after: read(),
-      report: host.coinEffects().coinEffectReport(),
+      report,
       /** 本次是否真的多了一条触发（`effect` 不认识时为 false —— 别把空操作读成生效）。 */
-      fired: host.coinEffects().coinEffectReport().triggers > triggersBefore,
+      fired: (report.byEffect[id]?.triggers ?? 0) > triggersBefore,
       statusLine: document.querySelector('#status-line')?.textContent ?? '',
     };
   },

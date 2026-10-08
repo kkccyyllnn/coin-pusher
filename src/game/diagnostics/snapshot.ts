@@ -13,8 +13,9 @@ import { round3 } from '../../utils/numeric';
 import { coinPhysics } from '../coinPhysics';
 import { ENDLESS, RULES, TABLE } from '../constants';
 import { ledgerBalances } from '../economy';
-import { DRAFT_COST, HAZARD_AFTER_DROPS, HAZARD_EVERY_DROPS, TICKET_COMBO_TIER, TICKET_EVERY_CROSSINGS, TICKET_JACKPOT } from '../waves';
-import { totalCoinEffectWater, totalWater } from '../effects';
+import { DRAFT_COST, TICKET_COMBO_TIER, TICKET_EVERY_CROSSINGS, TICKET_JACKPOT } from '../waves';
+import { COIN_EFFECT_IDS, COIN_EFFECT_SPECS, totalCoinEffectWater, totalWater } from '../effects';
+import { kindForEffect } from '../kinds';
 
 export function build(host: DiagnosticsHost) {
 const info = host.renderer().info;
@@ -158,6 +159,16 @@ return {
     drops: snapshot.drops,
     chipsPeak: snapshot.chipsPeak,
     bestEarned: host.save().snapshot.bestEarned,
+    /**
+     * 收工写进存档的那条成绩记录（1b 的票券一列在这儿）。
+     *
+     * ★ 为什么要把**内存对象**也吐出来：判据拿它与 `localStorage` 里解析回来的 `runs[0]` 对质
+     *   （两条独立路径：引擎当场写的 vs 序列化往返一遍读回的）。只看 JSON 那一份抓不到
+     *   "字段根本没写"（两边都缺就恒绿），只看内存那一份抓不到"写了但落盘/载入被吞"。
+     * ⚠️ 这是**上一条收工**的记录（`recordRun` 在 `endRun` 里跑），局中还挂着上一局的那条 ⇒
+     *   判据只在收工之后取，别拿它当"本局"读数。
+     */
+    lastRunRecord: host.save().snapshot.runs[0] ?? null,
     ruinVisible: host.hud().ruinVisible,
     // 大赏币注入间隔。测试读这里而不是写死数字：P8 重新标定时
     // 硬编码的 15/30 会让断言变成假失败，而它其实只是配置。
@@ -179,6 +190,8 @@ return {
     ticketEarned: snapshot.ticketEarned,
     ticketSpent: snapshot.ticketSpent,
     ticketBySource: host.run().ticketBySource,
+    /** 每张越线源票券发出那一刻的 `{at, every}` —— 逐事件核"这张该不该发"（见 `RunState.crossingTicketLog`）。 */
+    crossingTicketLog: host.run().crossingTicketLog,
     crossings: snapshot.crossings,
     wave: snapshot.wave,
     waveTickets: snapshot.waveTickets,
@@ -188,21 +201,37 @@ return {
     ticketEveryCrossings: TICKET_EVERY_CROSSINGS,
     /** 本局**当前生效**的间隔（「票孔」会把它压到下限）—— 注入率判据吃这个，不是吃表初值。 */
     ticketEvery: host.run().ticketEvery,
+    /** 本局的间隔**起点**（末值 + 本局实际减掉的总和）：判据用它核"强化不跨局"，不再靠脚本猜采样时刻。 */
+    ticketEveryStart: host.run().ticketEveryStart,
+    ticketEveryTightened: host.run().ticketEveryTightened,
     ticketComboTier: TICKET_COMBO_TIER,
     ticketJackpotChips: TICKET_JACKPOT,
     draftCost: DRAFT_COST,
     /*
-     * ── Stage 2：币种效果（催债币）──
+     * ── Stage 2：币种效果（催债币 + 票币）──
      * 一条对象而不是四个字段：`coinEffectReport()` 里有数组，调三次会得到三份不同的拷贝。
-     * 判据吃：`triggers === attributed === events.length`（归因门）与逐事件恒等
-     * `applied === min(requested, 那一刻的余额)`。表也原样吐出去，脚本不抄 `45 / 24`。
+     * 判据吃：**逐效果** `triggers === attributed === events`（归因门）与逐事件恒等
+     * `applied === min(requested, 那一刻的余额)`。
      */
     coinEffects: host.coinEffects().coinEffectReport(),
     coinEffectWaterTotal: totalCoinEffectWater(),
     /** 波间奖励那张表的水量合计（本轮恒为 0，池水门守的就是这个 0）。 */
     draftWaterTotal: totalWater(),
-    hazardAfterDrops: HAZARD_AFTER_DROPS,
-    hazardEveryDrops: HAZARD_EVERY_DROPS,
+    /*
+     * 注入表原样吐给脚本（`effects.ts` 的 `inject` + 由 `payout.effect` 反查到的币种）。
+     * 旧的两个字段 `hazardAfterDrops` / `hazardEveryDrops` 是脚本侧的抄件，2c 加了第二条
+     * 效果币之后它们连"说的是哪条"都答不清 ⇒ 换成按 id 列的表：判据不抄 `45 / 24`，
+     * 而 `kind === null` 那一行就是"两张表脱钩"的直接证据（映射门逐 id 断言它非空）。
+     */
+    coinEffectTable: COIN_EFFECT_IDS.map((id) => ({
+      id,
+      act: COIN_EFFECT_SPECS[id].act,
+      water: COIN_EFFECT_SPECS[id].water,
+      kind: kindForEffect(id) ?? null,
+      afterDrops: COIN_EFFECT_SPECS[id].inject.afterDrops,
+      everyDrops: COIN_EFFECT_SPECS[id].inject.everyDrops,
+      aheadOfLine: COIN_EFFECT_SPECS[id].inject.aheadOfLine,
+    })),
   },
   pusher: {
     offset: host.pusher().offset,

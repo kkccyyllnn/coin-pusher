@@ -167,6 +167,8 @@ const UI_NEG_ARMS = {
   glass: 'G-无玻璃：给 `#hud-top` 加回 `backdrop-filter: blur()`',
   color: 'G-调色板：往 HUD 里加 12 族新的声明底色',
   lights: 'G-计数灯：把亮灯数与引擎 usesLeft 拧开一格（显示说谎）',
+  nameplate: 'G-铭牌：把机关行的像素铭牌画布摘掉（只剩抗锯齿 DOM 文本）',
+  radius: 'G-硬边：给顶部条加回 8px 圆角（玻璃时代的那圈弧度）',
 };
 
 async function applyUiNegArm(page) {
@@ -233,6 +235,18 @@ async function applyUiNegArm(page) {
         extra.className = 'light light-on';
         document.querySelector('#grapple-state')?.appendChild(extra);
         return document.querySelector('#grapple-state') ? 'ok（多亮一盏）' : 'no-grapple-state';
+      }
+      case 'nameplate': {
+        const plates = [...document.querySelectorAll('#mechanism-row canvas.nameplate')];
+        for (const plate of plates) plate.remove();
+        // 摘不掉就是铭牌本来不在（那条门本来就该红）——把这件事说出来，别让人误读成"臂没生效"。
+        return plates.length > 0 ? `ok（摘掉 ${plates.length} 枚铭牌画布）` : 'no-nameplate-found';
+      }
+      case 'radius': {
+        const bar = document.getElementById('hud-top');
+        if (!bar) return 'no-hud-top';
+        bar.style.borderRadius = '8px';
+        return 'ok（顶部条加回 8px 圆角 ⇒ 四个角都该被抓到）';
       }
       default:
         return 'unknown-arm';
@@ -417,6 +431,7 @@ const readTelemetry = (page) =>
           laneSamples: [],
           laneEvents: [],
           cycles: [],
+          drainEvents: [],
           drain: { reason: null, startedAt: null, earnedAtStart: 0, settledAt: null, earnedAtSettle: 0 },
         },
     );
@@ -648,7 +663,10 @@ async function playRun(page, { drops = ECON_RUN_DROPS_CAP, lanes, waitEnd = true
    * 那批读数测的是"没人玩构筑时的自然深度"，不是波次目标可达性。
    */
   const draftOn = process.env.ECON_DRAFT === '1';
-  let draftsClicked = 0;
+  /** DOM 读数证实"真的领到了一张"的次数（与引擎 `draftsTaken` 是两个真源）。 */
+  let draftsPickedByDom = 0;
+  /** 点了但没买成的次数（票券不够）——不能算成功，更不能让它把本局的投数预算烧光。 */
+  let draftsRejected = 0;
 
   // 冷启动兜底：首投必须**真的被接受**（见 `primeFirstDrop` 的说明）。
   await primeFirstDrop(page, pickLanes[0]);
@@ -679,18 +697,45 @@ async function playRun(page, { drops = ECON_RUN_DROPS_CAP, lanes, waitEnd = true
     if (state?.phase !== 'drainOut') {
       // 领卡优先于投币：面板立着的时候玩家也在"先决定下一步"，而且它不花仿真时间。
       if (draftOn && state?.endless?.pendingDraft === true) {
-        const picked = await page.evaluate(() => {
+        const outcome = await page.evaluate(() => {
+          // ★ 只点**真的立着**的面板：引擎的 `pendingDraft` 与 DOM 的面板可见是两件事
+          //   （领完之后引擎立刻把 pending 清掉，而按钮可能还是上一批的那几个）。
+          //   10-07 实测：不加这个条件时机器人点了 23 次、引擎只记 12 张 —— 那 11 次打在收起后的旧按钮上。
+          const panel = document.getElementById('draft-panel');
+          if (!panel || panel.hidden) return { took: false, why: 'no-panel' };
           const button = [...document.querySelectorAll('#draft-choices button')].find(
             (b) => !b.disabled,
           );
-          if (!button) return null;
-          const id = button.dataset.effect ?? '';
+          if (!button) return { took: false, why: 'unaffordable' };
+          /*
+           * 「成功」的凭据取 **HUD 那句归因**（`#status-line`），不取引擎计数器
+           *   ⇒ 与 `endless.draftsTaken` 是两个真源：一个走渲染文本，一个走账。
+           * ⚠️ 前两版都取错了元素，两次都表现为"DOM 证实 0 张 vs 引擎 N 张"：
+           *   ① 取 `#draft-meta` 的"花 N"、在 `click()` 之后**同步**读 ⇒ 那时还没 `sync()`；
+           *   ② 等两个 RAF 再读**同一个元素** —— 更糟：`pick()` 成功即 `close()`，而 `sync()` 只在
+           *      面板可见时被调用 ⇒ 那句读数从此**冻结在买之前的值**，等多久都等不到。
+           *      n=2 批实测 `DOM 0 / 引擎 11 / 拒买 11` —— 那十一次"拒买"就是十一次成功。
+           *   归因句是 `pick()` 里**同步**写的（`apply()` → `deps.notify`），所以同一次 evaluate 里
+           *   前后一差就是凭据，不依赖任何帧节拍，也不依赖面板还立着。
+           */
+          const said = () => document.getElementById('status-line')?.textContent ?? '';
+          const before = said();
           button.click();
-          return id;
+          const after = said();
+          const took = after !== before && after.includes('波间奖励');
+          return { took, why: took ? 'took' : 'rejected', after: after.slice(0, 56) };
         });
-        if (picked) draftsClicked += 1;
-        // 没领成（买不起 / 面板还没立起来）就继续正常投币，不在这条腿上等死。
-        continue;
+        if (outcome.took) {
+          draftsPickedByDom += 1;
+          continue;
+        }
+        /*
+         * ⚠️ 买不起（或面板还没立起来）就**交回正常投币路径**。
+         * 原来这里无条件 `continue`，而紧邻的注释写的是"没领成…就继续正常投币"—— 代码没做它说的事。
+         * 后果实测过一次（n=2 第 1 局）：`pendingDraft` 一直为真而票券不够 ⇒ 机器人一圈**一枚币都没投**
+         * 就把本局的投数预算烧光 ⇒ 0 投 + timeout ⇒ ⑤/⑥/② 三条一起红，红的是机器人不是游戏。
+         */
+        draftsRejected += 1;
       }
       // 这个 20 秒是**死循环兜底**，不是局长来源：每圈都以「推板多走一个循环」为进度条件，
       // 所以投币节奏本身已经是仿真对齐的。局长口径只在 `waitForRunEnd` 里定。
@@ -708,8 +753,9 @@ async function playRun(page, { drops = ECON_RUN_DROPS_CAP, lanes, waitEnd = true
       ...capped,
       end: 'cap',
       loans,
-    /** 本局机器人领了几次卡（`ECON_DRAFT=1` 才可能非 0）——"这条腿跑没跑"的直接证据。 */
-    draftsClicked,
+    /** 本局机器人领了几张卡（`ECON_DRAFT=1` 才可能非 0）——"这条腿跑没跑"的直接证据。 */
+    draftsPickedByDom,
+    draftsRejected,
       runSeconds: Math.max(0, (capped?.elapsed ?? runStart) - runStart),
     };
   }
@@ -719,8 +765,9 @@ async function playRun(page, { drops = ECON_RUN_DROPS_CAP, lanes, waitEnd = true
     boostResolved,
     end,
     loans,
-    /** 本局机器人领了几次卡（`ECON_DRAFT=1` 才可能非 0）——"这条腿跑没跑"的直接证据。 */
-    draftsClicked,
+    /** 本局机器人领了几张卡（`ECON_DRAFT=1` 才可能非 0）——"这条腿跑没跑"的直接证据。 */
+    draftsPickedByDom,
+    draftsRejected,
     runSeconds: Math.max(0, (state?.elapsed ?? runStart) - runStart),
   };
 }
@@ -2208,6 +2255,101 @@ async function runEconomy(page) {
 
   // ── ① 真物理：账本恒等式 + 终身余额守恒 + 越线构成采样 ──
   const runs = [];
+  /*
+   * 效果币的 id / kind 从**表与行为**里认出来，不抄字符串：`DrainEvent.kind` 是裸 `string`，
+   * 手抄写错不会有任何东西报错，只会让"规避腿"永久数到 0（探针自己坏了却看起来像被测代码坏了）。
+   * 2c 之后有两条效果币 ⇒ 按 `act` 认（`fine` = 会扣钱的那条，`ticket` = 发券的那条），
+   * 而不是按"表里只有一条 effect 型币种"这种唯一性假设 —— 唯一性本身已经改成逐条断言。
+   */
+  const effectTables = await page.evaluate(async () => {
+    const kinds = await import('/src/game/kinds.ts');
+    const effects = await import('/src/game/effects.ts');
+    const byAct = {};
+    for (const id of effects.COIN_EFFECT_IDS) {
+      const spec = effects.COIN_EFFECT_SPECS[id];
+      const kind = kinds.COIN_KINDS.find((k) => {
+        const payout = kinds.kindSpec(k).payout;
+        return payout.mode === 'effect' && payout.effect === id;
+      });
+      byAct[spec.act] = { id, kind: kind ?? null };
+    }
+    return {
+      ids: [...effects.COIN_EFFECT_IDS],
+      byAct,
+      /** 模块侧的表（判据拿它与**运行时快照**那份对质 —— 一条走 import、一条走 diagnostics 出口）。 */
+      moduleTable: effects.COIN_EFFECT_IDS.map((id) => {
+        const spec = effects.COIN_EFFECT_SPECS[id];
+        return {
+          id,
+          act: spec.act,
+          water: spec.water,
+          label: spec.label,
+          afterDrops: spec.inject.afterDrops,
+          everyDrops: spec.inject.everyDrops,
+          aheadOfLine: [...spec.inject.aheadOfLine],
+        };
+      }),
+      labels: Object.fromEntries(
+        kinds.COIN_KINDS.map((k) => [k, kinds.kindSpec(k).label]),
+      ),
+    };
+  });
+  const fineEffect = effectTables.byAct.fine ?? null;
+  const ticketEffect = effectTables.byAct.ticket ?? null;
+  const debtKindId = fineEffect?.kind ?? null;
+  check(
+    'S2 探针自检：效果币的 kind 是从 kinds.ts 的行为认出来的（不是手抄字符串），且每种 act 恰好一条',
+    debtKindId !== null &&
+      ticketEffect?.kind != null &&
+      // `byAct` 是 `byAct[spec.act] = ...` 逐条赋值出来的 ⇒ 两条效果撞同一个 act 会**静默覆盖**。
+      // 所以这里比的不是"总共两条"（那是把数量钉死，加第三条就假红），而是**act 的种数 === 效果的条数**。
+      Object.keys(effectTables.byAct).length === effectTables.ids.length,
+    `认出 fine→${JSON.stringify(fineEffect)}、ticket→${JSON.stringify(ticketEffect)}` +
+      `（drain 事件按 fine 的 kind 数"被回落洞无损排掉"的枚数；按 ticket 的 kind 数发券那枚）；` +
+      `表里的效果 id ${JSON.stringify(effectTables.ids)}、act ${JSON.stringify(Object.keys(effectTables.byAct))}`,
+  );
+  // 表互证：`snapshot.ts` 吐给脚本的那份（走 `kindForEffect` 反查）与模块侧直接读的这份
+  // 是两条路径。脱钩的形状有两种，都要能红：币种没配上（`kind === null`）、
+  // 以及**注入表被人在快照里改了数**（起注投数 / 节奏 / 落带逐键对，一个都不放过）。
+  const snapshotTable = await page.evaluate(
+    () => window.__THREE_GAME_DIAGNOSTICS__?.endless?.coinEffectTable ?? [],
+  );
+  const keyOf = (row) =>
+    `${row.id}|${row.act}|${row.water}|${row.afterDrops}|${row.everyDrops}|${row.aheadOfLine.join(',')}`;
+  const modByKey = Object.fromEntries(effectTables.moduleTable.map((row) => [row.id, keyOf(row)]));
+  const snapByKey = Object.fromEntries(snapshotTable.map((row) => [row.id, keyOf(row)]));
+  /*
+   * **按 id 配对**再比，而不是把两份字符串排序后逐位比：逐位比只能说"有几处不一样"，
+   * 说不出**是哪条效果币**与两边各是什么值 —— 而这正是归因要的两样东西。
+   * ⚠️ 顺带记一次我自己的误判：我先前以为"改一条却报 2 处"是排序假象，
+   *   现读臂 C 之后确认那次报 2 是**对的**（`+1` 写在 `COIN_EFFECT_IDS.map` 里，两行都受影响）。
+   *   ⇒ 结论：计数没坏，坏的是"数字没带来源"；所以这里改成点名 id + 打两侧的值。
+   */
+  const diffIds = [
+    ...new Set([...Object.keys(modByKey), ...Object.keys(snapByKey)]),
+  ].filter((id) => modByKey[id] !== snapByKey[id]);
+  const orphans = snapshotTable.filter((row) => row.kind === null || row.kind === undefined);
+  // 币面标签与效果标签必须同源：`催债币` 的币上写着别的名字 = 画面与规则不一致。
+  const labelMismatch = snapshotTable.filter((row) => {
+    const moduleRow = effectTables.moduleTable.find((item) => item.id === row.id);
+    return !moduleRow || effectTables.labels[row.kind] !== moduleRow.label;
+  });
+  check(
+    'S2 表互证：注入表走快照出口与直接 import 两条路径逐键同值，且每条效果币都配到了币面、标签同源',
+    Object.keys(modByKey).length > 0 &&
+      diffIds.length === 0 &&
+      orphans.length === 0 &&
+      labelMismatch.length === 0 &&
+      snapshotTable.length === effectTables.ids.length,
+    `模块侧 ${Object.keys(modByKey).length} 条 / 快照侧 ${snapshotTable.length} 条` +
+      `｜按键不同的 id ${JSON.stringify(diffIds)}` +
+      (diffIds.length
+        ? `（第一处：模块侧 ${JSON.stringify(modByKey[diffIds[0]])} vs 快照侧 ${JSON.stringify(snapByKey[diffIds[0]])}）`
+        : '') +
+      `｜没配到币面的效果 ${JSON.stringify(orphans.map((row) => row.id))}` +
+      `｜币面标签与效果标签不同源的 ${JSON.stringify(labelMismatch.map((row) => row.id))}` +
+      '｜"币面与规则不一致"是本项目零容忍的那类骗人 bug（同"币面不许印面值"）',
+  );
   const crossingSamples = [];
   let totalCrossings = 0;
   let totalDrops = 0;
@@ -2243,11 +2385,39 @@ async function runEconomy(page) {
       await simTick(page, 400);
     }
     const ledger = await ledgerOf();
-    const { scoreEvents, cycles, xixiEvents } = await readTelemetry(page);
+    const { scoreEvents, cycles, xixiEvents, drainEvents = [], showEvents = [] } = await readTelemetry(page);
     const crossed = cycles.length ? cycles[cycles.length - 1].coins : 0;
+    /*
+     * ★ 恒等式的两边必须**在同一次 evaluate 里读**（10-07 n=2 批的教训，实测 120/121）。
+     * 上面那两份读数之间隔着 `quitRun()` + `simTick(400)`：机器还在走，在途的币照样越线，
+     * 于是"引擎计数取早一刻、遥测数组取晚一刻"必然差 0~N —— 两个读数都没错，
+     * 错在拿**两个时刻**去做一条只在**同一时刻**成立的恒等（与 ⑩ 塔演出采样、⑪ 循环边界采样同族）。
+     * 现在两边都从 hooks **现读**（`snapshot()` 走 `RunState.snapshot()`、`telemetry()` 走事件数组），
+     * 一次 evaluate 拿全。取这一刻是安全的：`quitRun` = `endRun`，第一次收工不换掉 RunState（⑫ 现读过），
+     * 而遥测要到下一次 `startRun` 才清 ⇒ 两份都还是本局的。
+     */
+    const paired = await page.evaluate(() => {
+      const hooks = window.__THREE_GAME_TEST_HOOKS__;
+      // 内存里那条记录（引擎刚写的）与 localStorage 里解析回来的那条，取自**同一次 evaluate**。
+      const engineRecord = window.__THREE_GAME_DIAGNOSTICS__?.endless?.lastRunRecord ?? null;
+      let savedRecord = null;
+      try {
+        const raw = window.localStorage.getItem('coin-pusher:save:v6');
+        savedRecord = (raw ? JSON.parse(raw)?.runs?.[0] : null) ?? null;
+      } catch {
+        savedRecord = null;
+      }
+      return {
+        crossings: hooks?.snapshot?.()?.crossings ?? -1,
+        scoreEvents: (hooks?.telemetry?.()?.scoreEvents ?? []).length,
+        engineRecord,
+        savedRecord,
+      };
+    });
     /* 摇奖与罚金按「每投」归一化才可比：R6② 把 win 拆成 3 同 / 4 同之后，
        大奖次数与罚金次数都得除掉局长。`Telemetry.reset()` 在 `startRun()` 里调用
-       （`Game.ts:1778`）⇒ 这个数组本来就是每局清零的，直接取本局的、不用差分。
+       （现读在 `Game.ts:2337`；原先这里写的 1778 已经被前面的重构推下去了 ⇒ 锚点按现读改）
+       ⇒ 这个数组本来就是每局清零的，直接取本局的、不用差分。
        ⚠️ 只做**读数**不做判据：spin 事件在沉降中被 `shows.abort()` 作废时，
        这里与 `diagnostics.endless.fines` 会差（`Game.ts:1666-1670`）。 */
     const slotEvents = xixiEvents ?? [];
@@ -2309,6 +2479,20 @@ async function runEconomy(page) {
       /** #66A②：中奖里被拒收的次数（谓词 `isRefusedWin` 与 accept 的阳性对照**共用同一个**）。 */
       wins: winEvents.length,
       winRefused: winEvents.filter(isRefusedWin).length,
+      /**
+       * ② `P(加力已满)`：分母换成**力中奖**（`symbol === 'boost'`），并按 tier 再切一刀。
+       * 理由不是"更细"，是**口径不同**：`xixi.ts:266` 的算式写的是
+       * `P(三同且摇到力) × P(加力已满) × 3`，那个 `P(已满)` 的条件是"这是一次力中奖"，
+       * 而上面那列 `win 拒收` 的分母是**全部中奖 ⇒ 两者差一个 P(力|中奖)**（约 26/45）。
+       * `granted:false` 只在两个分支产生：三同力存满走兜底演出（`SlotMachine.ts:509-521`）、
+       * 四同力排到 0 发（`:475`）—— 两档语义不同，所以三同那一档单独数出来。
+       */
+      boostWins: winEvents.filter((event) => event.symbol === 'boost').length,
+      boostRefused: winEvents.filter((event) => event.symbol === 'boost' && event.granted === false).length,
+      boostWinsTier3: winEvents.filter((event) => event.symbol === 'boost' && event.tier === 3).length,
+      boostRefusedTier3: winEvents
+        .filter((event) => event.symbol === 'boost' && event.tier === 3 && event.granted === false)
+        .length,
       ledgerOk: ledgerOk(ledger),
       /*
        * 1b/1c 的逐局读数。**接线证据**：`crossings` 由 `Game.settleCrossing` 加，
@@ -2319,27 +2503,63 @@ async function runEconomy(page) {
        */
       crossings: final?.endless?.crossings ?? -1,
       crossedReported: crossed,
+      /** 逐事件的遥测越线数（`scoreEvents` 每条越线一枚，无上限、每局清）——与 `crossings` 同口径。 */
+      scoreEventCount: scoreEvents.length,
+      /**
+       * **同一时刻**配对读的两个计数（判据吃这一对，不吃上面那两行 —— 那两行来自两个时刻，
+       * 差值是"早一刻 vs 晚一刻"而不是"账不账平"；旧写法把 120/121 读成了账不平）。
+       */
+      pairedCrossings: paired.crossings,
+      pairedScoreEvents: paired.scoreEvents,
+      /** 1b 后半条：收工写的那条成绩记录，内存对象 vs 落盘 JSON（同一次 evaluate 取的）。 */
+      engineRecord: paired.engineRecord,
+      savedRecord: paired.savedRecord,
+      /**
+       * 计划 2b 的「池水」分子：本局**演出真的放上盘面的免费币**枚数。
+       *
+       * ★ 这个口径是干净的，理由在代码里而不是注释里：`spawned` 只统计
+       *   `ShowDirector.spawnOne` 成功从 `CoinPool` 拿到位的**真币**；
+       *   S16 的"视觉币"走 `CoinSpray` 独立通道（`Game.ts:791`「不是币池的资源」、
+       *   `:992`「不需要预算，CoinPool 满不满都照喷」）⇒ 它不进这个数，
+       *   于是"哪些演出算水"不需要再做一次人肉判定（那正是 `xixi.ts` 算式当年糊过的地方）。
+       */
+      showSpawned: (showEvents ?? [])
+        .filter((event) => event.phase === 'completed')
+        .reduce((sum, event) => sum + (event.spawned ?? 0), 0),
       tickets: final?.endless?.tickets ?? 0,
       ticketEarned: final?.endless?.ticketEarned ?? 0,
       ticketSpent: final?.endless?.ticketSpent ?? 0,
       ticketEvery: final?.endless?.ticketEvery ?? 0,
+      /** 引擎盖章的本局间隔**起点**（`RunState.ticketEveryStart = 末值 + 本局减掉的总和`）。 */
+      ticketEveryStart: final?.endless?.ticketEveryStart ?? -1,
+      ticketEveryTightened: final?.endless?.ticketEveryTightened ?? -1,
       ticketEveryInit: final?.endless?.ticketEveryCrossings ?? 0,
       ticketCrossSource: final?.endless?.ticketBySource?.crossing ?? 0,
+      /** 引擎记下的逐张发券凭据 `{at, every}` —— 判据按它逐事件核，不再用 `floor(C/every)` 猜界。 */
+      crossingTicketLog: final?.endless?.crossingTicketLog ?? [],
       waveReached: final?.endless?.wave ?? 0,
       draftsTaken: final?.endless?.draftsTaken ?? 0,
       /** 机器人点了几次卡（与 `draftsTaken` 是**两个真源**：一个来自 DOM 点击，一个来自引擎计数）。 */
-      draftsClicked: final?.draftsClicked ?? 0,
+      draftsPickedByDom: final?.draftsPickedByDom ?? 0,
+      draftsRejected: final?.draftsRejected ?? 0,
       /**
-       * Stage 2 的**接线证据**：催债币从第 `hazardAfterDrops` 投起自动注入，
-       * 所以真打法里 `coinEffects.triggers` 会长出来。这里要的是"每次触发都留了归因"
-       * 在逐局口径上成立 —— 定点门（xixi 的 S2 那条）测不到这条链。
+       * Stage 2 的**接线证据**：效果币按 `effects.ts` 的 `inject` 表自动注入，
+       * 所以真打法里逐效果分账会长出来。这里要的是"每次触发都留了归因"在逐局口径上成立
+       * —— 定点门（xixi 的 S2 那条）测不到这条链。
+       * ⚠️ 分账**按效果 id 键着读**（计划 2d 的"逐效果对账"）：旧的单个 `triggers` 口袋
+       * 在 2c 加第二条效果币之后会把"遇到过催债币"混读成"遇到过某条效果"。
+       * id 名单来自 `endless.coinEffectTable`（表本身），脚本不抄第二份名字。
        */
-      hazardTriggers: final?.endless?.coinEffects?.triggers ?? 0,
-      hazardAttributed: final?.endless?.coinEffects?.attributed ?? 0,
-      hazardEvents: final?.endless?.coinEffects?.events?.length ?? 0,
-      /** 注入尝试 / 拿到池位 —— 三条缺席原因靠它们分开（池满 vs 没走到线 vs 条件没满足）。 */
-      hazardAttempts: final?.endless?.coinEffects?.hazardAttempts ?? 0,
-      hazardSpawned: final?.endless?.coinEffects?.hazardSpawned ?? 0,
+      byEffect: final?.endless?.coinEffects?.byEffect ?? {},
+      coinEffectEvents: final?.endless?.coinEffects?.events ?? [],
+      /** 票券分源里 `effect` 那一格（引擎的口袋），与流水里 `act==='ticket'` 的合计是两个计数。 */
+      ticketBySourceEffect: final?.endless?.ticketBySource?.effect ?? 0,
+      /**
+       * 规避的另一条腿：本局**掉进回落洞**（0 筹码、不计分）的催债币枚数。
+       * 口径是遥测的逐局 drain 事件按 `kind === 'debt'` 数出来的 —— 数的是"发生了但没扣钱"，
+       * 与"越线扣了钱"那条腿（`byEffect[fineId].triggers`）互补；两条腿都非零才叫"规避是真的"（计划 2c）。
+       */
+      hazardDrained: debtKindId === null ? 0 : drainEvents.filter((event) => event.kind === debtKindId).length,
     });
     console.log(
       `  第 ${index + 1} 局：投 ${runs[index].drops} 枚 → 越线 ${crossed} 枚，` +
@@ -2350,6 +2570,45 @@ async function runEconomy(page) {
         `摇奖 ${runs[index].spins}（${(runs[index].spins / Math.max(1, runs[index].drops)).toFixed(3)}/投）` +
         `· 罚金 ${runs[index].slotFines}`,
     );
+  }
+
+  /*
+   * ── 计划 2b 点名的「池水总量」读数：**每投把多少枚免费币放上台面** ──
+   * 分子 = 逐局 `showEvents`（`phase === 'completed'`）的 `spawned` 之和（只数币池真币，
+   * 视觉币走 `CoinSpray` 独立通道 ⇒ 天然不在里面）；分母 = 本批投币数。
+   * 红线从引擎现读（脚本不抄第二份数字）。
+   *
+   * 🔴 **economy 不是这条读数的正确臂，实测过**：n=2 两局都是 `摇奖 0` ⇒ 老虎机一次没响、
+   *   奖励演出根本没发生 ⇒ `spawned` 恒 0。第一版把这个 0 打成「在红线内，= 0.00 × 红线」——
+   *   那是把"没测到"写成"测到且合格"，本项目最贵的一类假绿（记忆里同一形状踩过多次）。
+   *   ⇒ 现在：分子为 0 一律报**缺席**并点名原因，且**不因此立阈、不写合格**；
+   *     要真量这个数得去**有摇奖的臂**（`xixi` 强制集章/摇奖），或给 economy 加强制摇奖。
+   */
+  {
+    const showWater = runs.reduce((sum, run) => sum + run.showSpawned, 0);
+    const spinTotal = runs.reduce((sum, run) => sum + run.spins, 0);
+    const budget = await page.evaluate(async () => {
+      // 红线常量的真源在 `xixi.ts:557`（`constants.ts` 里那处只是指向它的注释）。
+      const m = await import('/src/game/xixi.ts');
+      return m.FAUCET_BUDGET_PER_DROP ?? null;
+    });
+    // 分子为 0 与分母为 0 都算"没测到"——只有两边都有数才谈得上一个比率。
+    const perDrop = showWater > 0 && totalDrops > 0 ? showWater / totalDrops : null;
+    console.log(
+      `  [info] 2b 池水读数（不进判据）：投币 ${totalDrops} 枚｜演出交付免费币 ${showWater} 枚` +
+        `｜本批摇奖 ${spinTotal} 次｜红线 FAUCET_BUDGET_PER_DROP = ${budget ?? '（引擎没给）'}`,
+    );
+    if (perDrop === null) {
+      console.log(
+        `         ⇒ **缺席**：这一臂没有演出交付过币（摇奖 ${spinTotal} 次）` +
+          '⇒ 0/投 是"没发生"不是"合格"，不据此立阈、不写"在红线内"',
+      );
+    } else {
+      console.log(
+        `         ⇒ 实测 ${perDrop.toFixed(4)} 枚/投 = ${(perDrop / budget).toFixed(2)} × 红线` +
+          `；n=${runs.length} 局只当形状证据，立阈要 n≥20 的取值与散布`,
+      );
+    }
   }
 
   /* #66A 的批级读数（一行汇总，不改上面那行的格式 —— 外部解析器吃的是那行）。
@@ -2369,6 +2628,29 @@ async function runEconomy(page) {
         `名义 Σ${face}（事件带 requested 的 ${faceStamped}/${fineCount} 笔）、实扣 Σ${fined}、` +
         `转欠款 Σ${fineDebt} ⇒ 实扣/名义 ${face ? (fined / face).toFixed(3) : '—'}；` +
         `win 拒收 ${refused}/${wins} = ${wins ? (refused / wins).toFixed(3) : '—'}（不进判据，兜底频率分母是中奖数，不是投币数）`,
+    );
+    /*
+     * ② 计划 2b 点名的未结清项。两条比率一起打：`P(已满|力中奖)` 与 `P(已满|三同力中奖)`，
+     * 后者才是 `xixi.ts:266` 那条算式里 `0.485 × P(已满)` 该乘的数。
+     * ⚠️ **只打印、不作判据**：这是频率量，小批必然是零分母，而零分母要打成「缺席」而不是 0.000
+     *   ——「没测到」与「测到全是满」是两件相反的事（记忆 feedback-threshold-margin-not-reading）。
+     *   数值要 n≥20 才有意义，且引用时连 n 与区间一起给。
+     */
+    const boostWins = runs.reduce((sum, run) => sum + run.boostWins, 0);
+    const boostRefused = runs.reduce((sum, run) => sum + run.boostRefused, 0);
+    const boostWins3 = runs.reduce((sum, run) => sum + run.boostWinsTier3, 0);
+    const boostRefused3 = runs.reduce((sum, run) => sum + run.boostRefusedTier3, 0);
+    const spinTotal = runs.reduce((sum, run) => sum + run.spins, 0);
+    // 零分母一律报「缺席」，不报 0。
+    const ratioOf = (numerator, denominator) =>
+      denominator === 0
+        ? '缺席（零分母，不是 0）'
+        : `${numerator}/${denominator} = ${(numerator / denominator).toFixed(3)}`;
+    console.log(
+      `  [info] ② P(加力已满)（不进判据）：力中奖里 ${ratioOf(boostRefused, boostWins)}` +
+        `｜三同力里 ${ratioOf(boostRefused3, boostWins3)} ← 算式「0.485 × P(已满)」吃这一档` +
+        `｜本批 n=${runs.length} 局、摇奖 ${spinTotal} 次` +
+        (runs.length >= 20 ? '' : ' ⇒ 样本不足，只当接线证据，不许据此定档'),
     );
     if (fineCount > 0 && faceStamped === fineCount) {
       check(
@@ -2390,33 +2672,108 @@ async function runEconomy(page) {
   /*
    * ── 1b/1c 的逐局恒等门（**接线证据**：这一批是真打法，票券全部由 `Game.settleCrossing`
    *    → `RunState.noteCrossing` 这条路挣到，与 xixi 模式那三条合成驱动的判据互补）──
-   * 三条各自独立：① 恒等式 `tickets === earned − spent`；② 分源 `crossing === floor(crossings / every)`；
+   * 三条各自独立：① 恒等式 `tickets === earned − spent`；② 分源数落在 `[floor(C/every开局), floor(C/every末了)]`
+   * 这一对界里（引擎按 `crossings % ticketEvery` 发券，而「票孔」会在**局中**把 every 调小 ⇒ 点值等式不成立）；
    * ③ 每一局的 `ticketEvery` 必须还是表初值（票券的强化**只在本局**，跨局累积就是通胀）。
    */
   {
     const identityBad = runs.filter(
       (run) => run.tickets !== run.ticketEarned - run.ticketSpent,
     );
-    const sourceBad = runs.filter(
-      (run) => run.ticketCrossSource !== Math.floor(run.crossings / run.ticketEvery),
-    );
-    const strengthened = runs.filter((run) => run.ticketEvery !== run.ticketEveryInit);
-    const hazardRuns = runs.filter((run) => run.hazardTriggers > 0);
-    const unattributed = runs.filter(
-      (run) =>
-        run.hazardTriggers !== run.hazardAttributed || run.hazardEvents !== run.hazardAttributed,
+    const sourceBad = runs.filter((run) => {
+      /*
+       * 分源核的是**逐张凭据**，不是推出来的界（PLAN ⑭ 的结案）：
+       * 引擎每发一张越线源票券都记下 `{at: 当时本局越线数, every: 当时生效的间隔}`，
+       * 判据只问三件事 —— 每条 `at % every === 0`、`at` 严格递增、条数 == `ticketBySource.crossing`。
+       * ⚠️ 这条不是"比原来松"：原来的界在「票孔」于局中改小间隔时推不干净（n=20 实测有一局落在界外，
+       * 而我证不出那个上界），现在换成引擎自证的凭据，任何一张多发/漏发/早发都会红。
+       */
+      const log = run.crossingTicketLog ?? [];
+      if (log.length !== run.ticketCrossSource) return true;
+      let previousAt = 0;
+      return log.some((entry) => {
+        const bad = entry.at % entry.every !== 0 || entry.at <= previousAt || entry.every <= 0;
+        previousAt = entry.at;
+        return bad;
+      });
+    });
+    const strengthened = runs.filter((run) => run.ticketEveryStart !== run.ticketEveryInit);
+    /*
+     * 「强化不跨局」这半条的口径换了两次，留字在这里免得有人再走回头路：
+     *   第一版拿**末值**比表初值 ⇒ 把合法的局中强化读成通胀；
+     *   第二版在局与局之间读一次 `ticketEvery` 当"开局值" ⇒ 那是**假红**，因为
+     *   `endRun()`（`Game.ts:2203/2207`）第一次收工只亮总结页、**不建新 RunState**，
+     *   而本循环每局只调一次 `quitRun` ⇒ 读到的还是上一局的活状态（实测 12→10 / 10→8）。
+     * 现在读引擎自己盖章的 `RunState.ticketEveryStart`（= 末值 + 本局实际减掉的总和）：
+     * ⚠️ 它**不是常量复读**——如果哪天 `RunState` 被复用或间隔被写进存档，
+     * 起点会不等于表初值 ⇒ 这条会红，而那正是我们要它抓的事。
+     */
+    /*
+     * 逐效果分账的读法。**id 从表里认（`byAct`），不抄字符串** —— 手抄错了不会报错，
+     * 只会让某条腿永远数到 0（探针坏了却看起来像被测代码坏了，同 `debtKindId` 那条的理由）。
+     */
+    const tally = (run, id) => run.byEffect?.[id] ?? { triggers: 0, attributed: 0, events: 0, attempts: 0, spawned: 0 };
+    const sumTally = (id, key) => runs.reduce((sum, run) => sum + tally(run, id)[key], 0);
+    const fineId = fineEffect?.id ?? null;
+    const ticketId = ticketEffect?.id ?? null;
+    const hazardRuns = fineId === null ? [] : runs.filter((run) => tally(run, fineId).triggers > 0);
+    // 计划 2d 的原话是"**逐效果**对账"：每个 id 自己 `触发 === 归因 === 事件数`。
+    // 用总数口袋做不到这条 —— 两条效果的计数会互相顶掉（一条多算一条少算正好抵消）。
+    const unattributed = runs.filter((run) =>
+      [fineId, ticketId].some(
+        (id) =>
+          id !== null &&
+          (tally(run, id).triggers !== tally(run, id).attributed ||
+            tally(run, id).events !== tally(run, id).attributed),
+      ),
     );
     const earnedTotal = runs.reduce((sum, run) => sum + run.ticketEarned, 0);
     const waves = runs.map((run) => run.waveReached).sort((a, b) => a - b);
     check(
-      '1b 真打法接线：逐局票券恒等式平、分源数对得上、间隔没跨局累积',
+      '1b 真打法接线：逐局票券恒等式平、分源逐张凭据核过（at % every === 0）、**引擎盖章的开局间隔**还是表初值',
         identityBad.length === 0 &&
         sourceBad.length === 0 &&
         strengthened.length === 0 &&
         earnedTotal > 0,
-        `${RUNS} 局共挣 ${earnedTotal} 张；恒等不平 ${identityBad.length} 局、分源不符 ${sourceBad.length} 局、` +
-          `间隔被带过局 ${strengthened.length} 局（每局 every=${runs.map((r) => r.ticketEvery).slice(0, 4).join('/')}…）；` +
+        `${RUNS} 局共挣 ${earnedTotal} 张；恒等不平 ${identityBad.length} 局、分源逐张核不过 ${sourceBad.length} 局、` +
+          `开局间隔≠表值的局 ${strengthened.length} 局` +
+          `（每局 起点→末了 every=${runs.map((r) => `${r.ticketEveryStart}→${r.ticketEvery}`).slice(0, 4).join(' ')}…）｜` +
           `crossings vs 遥测越线 ${runs.map((r) => `${r.crossings}/${r.crossedReported}`).join(' ')}`,
+    );
+    /*
+     * 1b 的后半条（`../PLAN.md` ㉑）：票券要**进 `SaveStore` 的 run 记录**。
+     * 两条路径对质：引擎内存里那条（`endless.lastRunRecord`）vs 从 localStorage 解析回来的那条。
+     * ★ 为什么必须两条一起看：只看 JSON 抓不到"根本没写这个字段"（两边都缺 ⇒ `undefined === undefined` 恒绿），
+     *   只看内存抓不到"写了但落盘/载入那一趟被吞"（`slice(0, 10)` 与 `parse()` 都是能吞的地方）。
+     * 另加一条存在性正对照：本批至少一局 `ticketEarned > 0` —— 真打法每局越线上百枚、每 12 枚一张券，
+     *   记录里全是 0 说明链路没通，不是玩家运气差。
+     */
+    const recordMismatch = runs.filter(
+      (run) =>
+        run.engineRecord === null ||
+        run.savedRecord === null ||
+        typeof run.engineRecord.ticketEarned !== 'number' ||
+        run.engineRecord.ticketEarned !== run.savedRecord.ticketEarned,
+    );
+    const persistedTickets = runs.reduce(
+      (sum, run) => sum + (run.engineRecord?.ticketEarned ?? 0),
+      0,
+    );
+    check(
+      '1b 落盘对质：收工那条成绩记录的票券列 = 引擎写的 = localStorage 读回的，且本批至少一局 > 0',
+      recordMismatch.length === 0 && persistedTickets > 0,
+      `${RUNS} 局逐局对质，不平 ${recordMismatch.length} 局` +
+        (recordMismatch.length
+          ? `：${recordMismatch
+              .slice(0, 3)
+              .map(
+                (r) =>
+                  `引擎 ${JSON.stringify(r.engineRecord?.ticketEarned)} vs 落盘 ${JSON.stringify(r.savedRecord?.ticketEarned)}`,
+              )
+              .join(' / ')}`
+          : '') +
+        `｜记录里票券合计 ${persistedTickets} 张（老存档的记录没这个键 = ` +
+        '`undefined`，那是"这条早于 1b"，不是 0）',
     );
     /*
      * `RunState.crossings`（由 `Game.settleCrossing` 加）与遥测的越线条数是**两个独立真源**，
@@ -2424,14 +2781,24 @@ async function runEconomy(page) {
      * 其中两局各含催债币越线 ⇒ "effect 型币算不算一次越线"这个口径问题被数据答掉了（算）。
      * 顺带钉住一条更狠的：票券分源数吃的分母就是这个 crossings，两边一漂移，注入率就成假数。
      */
-    const counterBad = runs.filter((run) => run.crossings !== run.crossedReported);
+    const counterBad = runs.filter((run) => run.pairedCrossings !== run.pairedScoreEvents);
+    // 旧写法比的是 `cycles[最后一个].coins` —— 那是**在循环边界上采的样**（`Game.ts:1428`
+    // 拿 `settledCoins` 采，而 `settledCoins` 在 1916 每次越线才加一），
+    // 于是最后一个循环边界之后到读数之间的几枚永远进不了右边 ⇒ 结构性会差 0~N（实测 77/76）。
+    // 现在换成**逐事件**的 `scoreEvents` 条数（与 `crossings` 同一个"一枚一次"口径），
+    // 且两边在**同一次 evaluate** 里读（见上面 `paired` 那段：120/121 就是这么来的）。
+    const cycleLag = runs.map((run) => run.crossings - run.crossedReported);
+    const instantLag = runs.map((run) => run.scoreEventCount - run.crossings);
     check(
-      'S2/1b 口径对质：引擎越线数 === 遥测越线条数（含 effect 型币种的那几次）',
-      counterBad.length === 0,
+      'S2/1b 口径对质：同一时刻配对读的引擎越线数 === 遥测越线**事件**数（含 effect 型币种的那几次）',
+      counterBad.length === 0 && runs.every((run) => run.pairedCrossings > 0),
       `不平的局 ${counterBad.length}/${RUNS}：${runs
-        .filter((r) => r.crossings !== r.crossedReported)
-        .map((r) => `${r.crossings}/${r.crossedReported}`)
-        .join(' ') || '全部逐局相等'}`,
+        .filter((run) => run.pairedCrossings !== run.pairedScoreEvents)
+        .map((r) => `${r.pairedCrossings}/${r.pairedScoreEvents}`)
+        .join(' ') || '全部逐局相等'}` +
+        `｜正对照：每局配对读数都 > 0（${runs.map((r) => r.pairedCrossings).join('/')}）⇒ 不是 0===0 的恒真` +
+        `｜两个时刻之差（跨 quitRun+simTick 那一段）${instantLag.slice(0, 6).join('/')}` +
+        `｜循环样本落差 ${cycleLag.slice(0, 6).join('/')}（后两条只打印，都是采样时刻的差不是账不平）`,
     );
     /*
      * Stage 2 的**真打法覆盖**是一条存在性判据，不能混进恒等门里：
@@ -2441,40 +2808,117 @@ async function runEconomy(page) {
      */
     if (hazardRuns.length > 0) {
       check(
-        'S2 真打法接线：催债币在本批真出现过，且逐局 触发数 === 归因数 === 事件数',
-          unattributed.length === 0,
-          `${hazardRuns.length}/${RUNS} 局遇到催债币，共 ${runs.reduce((s, r) => s + r.hazardTriggers, 0)} 次触发；` +
-            `归因/事件数不等的局 ${unattributed.length} 局`,
+        'S2 真打法接线：催债币在本批真出现过，且逐局逐效果 触发数 === 归因数 === 事件数',
+        unattributed.length === 0,
+        `${hazardRuns.length}/${RUNS} 局遇到催债币，共 ${sumTally(fineId, 'triggers')} 次触发；` +
+          `两条效果的分账（${fineId}：${sumTally(fineId, 'triggers')}/${sumTally(fineId, 'attributed')}/${sumTally(fineId, 'events')}、` +
+          `${ticketId}：${sumTally(ticketId, 'triggers')}/${sumTally(ticketId, 'attributed')}/${sumTally(ticketId, 'events')}）` +
+          `对账不上的局 ${unattributed.length} 局`,
       );
     } else {
       console.log(
         `  [info] S2 真打法接线**缺席**（不报绿也不报红）：本批 ${RUNS} 局一次催债币都没结算过。` +
-          `注入条件满足并尝试过 ${runs.reduce((s, r) => s + r.hazardAttempts, 0)} 次、` +
-          `其中拿到池位 ${runs.reduce((s, r) => s + r.hazardSpawned, 0)} 次 ⇒ ` +
-          (runs.reduce((s, r) => s + r.hazardAttempts, 0) === 0
-            ? '原因是**注入条件没满足**（投数没到 hazardAfterDrops，或取模没对上）'
-            : runs.reduce((s, r) => s + r.hazardSpawned, 0) === 0
+          `注入条件满足并尝试过 ${sumTally(fineId, 'attempts')} 次、` +
+          `其中拿到池位 ${sumTally(fineId, 'spawned')} 次 ⇒ ` +
+          (sumTally(fineId, 'attempts') === 0
+            ? '原因是**注入条件没满足**（投数没到表里的 `afterDrops`，或取模没对上）'
+            : sumTally(fineId, 'spawned') === 0
               ? '原因是**池满**：acquire() 全部返回 null'
               : '币注进去了但**没走完台面**（局先结束）⇒ 要验结算只能靠 xixi 那条定点门，或者把注入点往前挪'),
+      );
+    }
+    /*
+     * 票币那条腿（2c）：它是**发券**的，所以"发生过"的直接证据是 `act === 'ticket'` 的流水非空。
+     * 与催债币同一条纪律 —— 存在性与对账分开写，零触发时报缺席而不是绿。
+     * ⚠️ 这条刻意**不**要求"每局都遇到"：注入表是 `afterDrops`/`everyDrops` 的节奏，
+     * 短局（破产早）本来就走不到那几个投数。
+     */
+    const ticketRuns = ticketId === null ? [] : runs.filter((run) => tally(run, ticketId).triggers > 0);
+    const grantedFromEvents = runs.reduce(
+      (sum, run) =>
+        sum +
+        (run.coinEffectEvents ?? [])
+          .filter((event) => event.act === 'ticket')
+          .reduce((line, event) => line + (event.ticketsGranted ?? 0), 0),
+      0,
+    );
+    const grantedFromSource = runs.reduce((sum, run) => sum + run.ticketBySourceEffect, 0);
+    if (ticketRuns.length > 0) {
+      check(
+        'S2 票币真打法接线：越线发过券、逐效果对账平，且流水记的张数 === 票券分源 `effect` 那一格',
+        unattributed.length === 0 && grantedFromEvents === grantedFromSource && grantedFromEvents > 0,
+        `${ticketRuns.length}/${RUNS} 局遇到票币，共 ${sumTally(ticketId, 'triggers')} 次触发、` +
+          `发券 ${grantedFromEvents} 张（分源口袋 ${grantedFromSource} 张）；` +
+          '筹码账那五个量由下面那条定点门逐笔验（真打法里它是 0 筹码，账上看不出区别）',
+      );
+    } else {
+      console.log(
+        `  [info] S2 票币真打法接线**缺席**（不报绿也不报红）：本批 ${RUNS} 局没有一枚票币越线结算过。` +
+          `尝试 ${sumTally(ticketId, 'attempts')} 次 / 拿到池位 ${sumTally(ticketId, 'spawned')} 次` +
+          `（局太短走不到注入投数、或注进去没走完台面，是两个不同的原因）`,
+      );
+    }
+    /*
+     * 计划 2c 要的「规避可达率」：**两条腿都要非零**。
+     *   触发腿 = 催债币越线、真的按余额比例扣了钱；
+     *   规避腿 `hazardDrained` = 催债币没越线就消失（掉进回落洞：0 筹码、不计分 ⇒ "排掉 = 无损"）。
+     * ⚠️ 这条口径只说"发生过几次"，不说"玩家主动做了什么"：现档两条机关都碰不到这枚币
+     *   （注入带 z ∈ [0.70, 0.95] vs 扫板触达 ≥ 1.00 vs 抓斗触达 ≤ 0.44，五个常数的对账在 README
+     *   催债币一节），所以**规避腿目前是被动的**。主动那条要等 `PLAN.md` 未收尾 ⑥ 拍完才立得住。
+     * 零注入 ⇒ 报缺席，不拿 0 当绿。
+     */
+    const spawnedTotal = sumTally(fineId, 'spawned');
+    const triggeredTotal = sumTally(fineId, 'triggers');
+    const drainedTotal = runs.reduce((sum, run) => sum + run.hazardDrained, 0);
+    // 排掉数为 0 时，先分清"回落洞根本没事件"与"有事件但没有这个币种"——后者才是探针坏了。
+    // ⚠️ `Telemetry.reset()` 每局清 ⇒ 这份分布只代表**末局**，它用来归因"0 是怎么来的"，不当读数用。
+    const drainKinds = await page.evaluate(async () => {
+      const summary = window.__THREE_GAME_TEST_HOOKS__?.telemetry?.();
+      const mod = await import('/src/game/kinds.ts');
+      const seen = {};
+      for (const event of summary?.drainEvents ?? []) {
+        seen[event.kind] = (seen[event.kind] ?? 0) + 1;
+      }
+      return { seen, known: mod.COIN_KINDS.length };
+    });
+    if (spawnedTotal > 0) {
+      check(
+        'S2 规避两条腿：注入过的催债币里，既有越线扣了钱的，也有没越线就被回落洞排掉的',
+        triggeredTotal > 0 && drainedTotal > 0,
+        `拿到池位 ${spawnedTotal} 枚 ⇒ 触发（扣钱）${triggeredTotal} 次、被无损排掉 ${drainedTotal} 枚；` +
+          `本局 drain 事件里的 kind 分布 ${JSON.stringify(drainKinds.seen)}（币种表 ${drainKinds.known} 种）；` +
+          '两条腿都非零才叫"规避是真的"，缺哪条就说明那一侧只是代码里的规则',
+      );
+    } else {
+      console.log(
+        `  [info] S2 规避两条腿**缺席**（不报绿也不报红）：本批 ${RUNS} 局没有一枚催债币拿到池位。` +
+          `drain kind 分布 ${JSON.stringify(drainKinds.seen)}（有事件却数不到这个 kind ⇒ 是探针问题，不是没发生）`,
       );
     }
     // 1c 的波次到达**只报分布**：样本不足时报"缺席"，不拿点值当结论（计划 1d 原话）。
     // ⚠️ 口径要跟着 `ECON_DRAFT` 走：不开领卡时波永远停在 1，那批读数测的是
     //   "没人玩构筑时的自然深度"，**不是**波次目标可达性 —— 两者不能混着引用。
     const draftLeg = process.env.ECON_DRAFT === '1';
-    const clicked = runs.reduce((sum, run) => sum + run.draftsClicked, 0);
+    const pickedDom = runs.reduce((sum, run) => sum + run.draftsPickedByDom, 0);
+    const rejectedDom = runs.reduce((sum, run) => sum + run.draftsRejected, 0);
     const taken = runs.reduce((sum, run) => sum + run.draftsTaken, 0);
+    /*
+     * 「两源对质」吃的是 **DOM 上那句"花 N"的读数** vs **引擎 `draftsTaken`**（渲染文本 vs 账，两条独立路径）。
+     * 原先拿"点击次数"去等，等的是**尝试数**——点了没买成的那批（票券不够）本来就不该进引擎计数，
+     * 10-07 实测 点击 7 ≠ 引擎 3 就是这条假等式；而那批失败的点击当时还会把本局的投数预算烧光
+     * （机器人在领卡分支里 `continue`，一枚币都没投 ⇒ ⑤/⑥/② 连带红）。
+     * 现在：领卡分支只在 DOM 证实买成了才 `continue`，买不起就交回投币路径；判据永远有一条行（不再"不等才 check"）。
+     */
+    check(
+      '1c 领卡两源对质：DOM 读数证实的领卡数 === 引擎 draftsTaken',
+        !draftLeg || pickedDom === taken,
+        `DOM 证实 ${pickedDom} 张 vs 引擎 ${taken} 张｜另有 ${rejectedDom} 次点击因票券不够被拒（不计入领卡）｜` +
+          `ECON_DRAFT=${draftLeg ? '1' : '未开（这条腿本来不会动）'}`,
+    );
     console.log(
       `  [info] 1c 协议标记：ECON_DRAFT=${draftLeg ? '1（机器人会领卡）' : '未开（不领卡）'}｜` +
-        `DOM 点击 ${clicked} 次 vs 引擎 draftsTaken ${taken} 张（两个真源，不等就是领卡腿与账对不上）`,
+        `DOM 证实 ${pickedDom} 次 vs 引擎 draftsTaken ${taken} 张、拒买 ${rejectedDom} 次`,
     );
-    if (draftLeg && clicked !== taken) {
-      check(
-        '1c 领卡两源对质：DOM 点击次数 === 引擎 draftsTaken',
-        false,
-        `点击 ${clicked} ≠ 引擎计 ${taken} ⇒ 有点了没生效的卡（先查票券够不够，再查 CoinEffects.pick）`,
-      );
-    }
     if (runs.length >= 20) {
       const dist = waves.map((w) => `${w}`).join(' ');
       console.log(
@@ -3275,7 +3719,22 @@ async function runXixi(page) {
     if (n > towerColliderPeak) towerColliderPeak = n;
     const t = await readTelemetry(page);
     if ((t?.showEvents ?? []).some((e) => e.id === 'tower' && e.phase === 'completed')) {
-      towerCollidersAfter = n;
+      /*
+       * ★ 采样次序（10-07 撞到并修掉的探针错）：`n` 是在**这一轮迭代开头**读的，
+       * 而 `completed` 事件与柱体的 `removeRigidBody` 落在同一帧 —— "先读碰撞体、后看事件"
+       * 就会把"刚建完还没拆"的那一帧当成终值（实测 峰值 733 → 结束读数 733，红两次可复现；
+       * 而多等几帧就掉回 732）。所以看见 completed 之后**继续追读**到数值离开峰值为止。
+       * ⚠️ 这不是放宽：真泄漏的话它永远不掉回 `峰值 − 1`，照样红。改掉的只是"什么时候算演出结束"。
+       */
+      let settled = n;
+      for (let attempt = 0; attempt < 25; attempt += 1) {
+        settled = await page.evaluate(
+          () => window.__THREE_GAME_TEST_HOOKS__?.countColliders?.() ?? -1,
+        );
+        if (settled !== towerColliderPeak) break;
+        await page.waitForTimeout(80);
+      }
+      towerCollidersAfter = settled;
       break;
     }
     if (Date.now() >= lifecycleDeadline) break;
@@ -3680,24 +4139,46 @@ async function runXixi(page) {
    *    而波间奖励三档换的是别的货币。这一条守的是"water: 0 是真话"，
    *    不是"water 目前恰好没调过"：谁加了 `spawn`/`multMark` 档，这里当场红。
    */
-  const debtReturn = await page.evaluate(() =>
-    window.__THREE_GAME_TEST_HOOKS__?.crossingReturn?.({
-      kind: 'debt',
-      combo: 8,
-      hot: true,
-      betMul: 4,
-      roll: 0,
-    }) ?? null,
+  /*
+   * 效果币的 id / kind 从**表**里拿（`endless.coinEffectTable`，按 `act` 认），
+   * 不在脚本里抄 `'debt'` / `'debtCoin'` —— 2c 之后有两条效果币，抄名字的那条门会在
+   * 加第三条时静默漏掉它（而"漏掉"长得和"通过"一模一样）。
+   */
+  const effectRows = await page.evaluate(
+    () => window.__THREE_GAME_DIAGNOSTICS__?.endless?.coinEffectTable ?? [],
   );
+  const fineRow = effectRows.find((row) => row.act === 'fine') ?? null;
+  const ticketRow = effectRows.find((row) => row.act === 'ticket') ?? null;
   check(
-    'S2 协议：effect 型币种越线返 0，且不吃热度/热区/加注任何一档倍率',
-      debtReturn !== null && debtReturn.chips === 0,
-    `crossingReturn(debt, combo 8, hot, ×4, roll 0) = ${JSON.stringify(debtReturn)}`,
+    'S2 探针自检（定点）：表里按 act 认得出 fine 与 ticket 两条效果币',
+    fineRow?.kind != null && ticketRow?.kind != null,
+    `表 ${JSON.stringify(effectRows.map((row) => `${row.id}→${row.kind}(${row.act})`))}` +
+      '（比的是"这两种 act 各有一个币面"，不是"表里只有两行" ⇒ 加第三条效果币不会把它顶成假红）',
+  );
+  // 协议那条对**每一条**效果币都成立（不是只挑一条来验）：满倍率下越线返 0 筹码。
+  const effectReturns = await page.evaluate((rows) => {
+    const hooks = window.__THREE_GAME_TEST_HOOKS__;
+    return (rows ?? []).map((row) => ({
+      kind: row.kind,
+      result:
+        row.kind === null
+          ? null
+          : hooks?.crossingReturn?.({ kind: row.kind, combo: 8, hot: true, betMul: 4, roll: 0 }) ?? null,
+    }));
+  }, effectRows);
+  const zeroOffenders = effectReturns.filter((item) => item.result?.chips !== 0);
+  check(
+    'S2 协议：每条 effect 型币种越线都返 0，且不吃热度/热区/加注任何一档倍率',
+      effectReturns.length > 0 && zeroOffenders.length === 0,
+    `逐条 crossingReturn(kind, combo 8, hot, ×4, roll 0) = ${JSON.stringify(effectReturns)}` +
+      `｜返值非 0 的 ${JSON.stringify(zeroOffenders.map((item) => item.kind))}`,
   );
   const coinEffect = await page.evaluate(
-    () => window.__THREE_GAME_TEST_HOOKS__?.coinEffectTrigger?.('debtCoin') ?? null,
+    (id) => window.__THREE_GAME_TEST_HOOKS__?.coinEffectTrigger?.(id) ?? null,
+    fineRow?.id ?? '',
   );
   const lastEvent = coinEffect?.report?.events?.at(-1) ?? null;
+  const fineTally = coinEffect?.report?.byEffect?.[fineRow?.id] ?? null;
   const eventIdentity = await page.evaluate(
     ({ balance, progress }) => {
       const rule = window.__THREE_GAME_TEST_HOOKS__?.fineRule?.();
@@ -3706,25 +4187,66 @@ async function runXixi(page) {
     { balance: lastEvent?.balance ?? -1, progress: lastEvent?.progress ?? -1 },
   );
   check(
-    'S2 结算与归因：扣款只进 spent/fines、earned 不动、逐事件对回表、触发数 === 归因数',
+    'S2 结算与归因：扣款只进 spent/fines、earned 与票券都不动、逐事件对回表、触发数 === 归因数',
       coinEffect !== null &&
       coinEffect.fired === true &&
       (coinEffect.after.spent - coinEffect.before.spent) === lastEvent.applied &&
       (coinEffect.after.fines - coinEffect.before.fines) === lastEvent.applied &&
       (coinEffect.after.earned - coinEffect.before.earned) === 0 &&
       (coinEffect.after.debt - coinEffect.before.debt) === lastEvent.debtAdded &&
+      // 罚款档**不该动票券**：这是"两种货币不互相漏"的另一半（票币那条门守反过来的一半）。
+      (coinEffect.after.tickets - coinEffect.before.tickets) === 0 &&
+      (coinEffect.after.ticketEffect - coinEffect.before.ticketEffect) === 0 &&
       lastEvent.applied === lastEvent.requested &&
       lastEvent.requested === eventIdentity &&
-      coinEffect.report.triggers === coinEffect.report.attributed &&
-      coinEffect.report.events.length === coinEffect.report.attributed &&
+      fineTally !== null &&
+      fineTally.triggers === fineTally.attributed &&
+      fineTally.events === fineTally.attributed &&
       coinEffect.statusLine.includes('催债币'),
     `实扣 ${lastEvent?.applied}（spent +${coinEffect ? coinEffect.after.spent - coinEffect.before.spent : '—'}、` +
       `fines +${coinEffect ? coinEffect.after.fines - coinEffect.before.fines : '—'}、` +
       `earned +${coinEffect ? coinEffect.after.earned - coinEffect.before.earned : '—'}、` +
-      `debt +${coinEffect ? coinEffect.after.debt - coinEffect.before.debt : '—'}）` +
+      `debt +${coinEffect ? coinEffect.after.debt - coinEffect.before.debt : '—'}、` +
+      `票券 +${coinEffect ? coinEffect.after.tickets - coinEffect.before.tickets : '—'}）` +
       `= 表算 ${eventIdentity}（余额 ${lastEvent?.balance} × 进度 ${lastEvent?.progress?.toFixed(4)}），` +
-      `触发 ${coinEffect?.report?.triggers} / 归因 ${coinEffect?.report?.attributed} / 事件 ${coinEffect?.report?.events?.length}，` +
-      `HUD="${(coinEffect?.statusLine ?? '').slice(0, 48)}"`,
+      `逐效果分账 ${JSON.stringify(fineTally)}，HUD="${(coinEffect?.statusLine ?? '').slice(0, 48)}"`,
+  );
+  /*
+   * 票币的定点门（2c 的另一侧）：同一条 `dispatchCoin` 分派，但**承重的是票券而不是筹码**。
+   * 三条都要成立，否则"换一种货币"只是文档里的说法：
+   *   ① 筹码账五个量一个都不动（`spent/fines/debt/earned` 不变、余额不变）；
+   *   ② 票券 +1，且**同时**记进分源 `effect` 那一格（不是只加总数 —— 总数加了但分源没加，
+   *      economy 的注入率读数就会把它算成越线源发的）；
+   *   ③ HUD 留了归因，且逐效果分账对得上（2d）。
+   */
+  const ticketEffect = await page.evaluate(
+    (id) => window.__THREE_GAME_TEST_HOOKS__?.coinEffectTrigger?.(id) ?? null,
+    ticketRow?.id ?? '',
+  );
+  const ticketEvent = ticketEffect?.report?.events?.at(-1) ?? null;
+  const ticketTally = ticketEffect?.report?.byEffect?.[ticketRow?.id] ?? null;
+  const delta = (key) => (ticketEffect ? ticketEffect.after[key] - ticketEffect.before[key] : null);
+  check(
+    'S2 票币结算与归因：筹码账五个量全不动、票券 +1 且同时进分源 `effect`、逐效果对账平',
+      ticketEffect !== null &&
+      ticketEffect.fired === true &&
+      delta('chips') === 0 &&
+      delta('spent') === 0 &&
+      delta('fines') === 0 &&
+      delta('debt') === 0 &&
+      delta('earned') === 0 &&
+      delta('tickets') === 1 &&
+      delta('ticketEarned') === 1 &&
+      delta('ticketEffect') === 1 &&
+      ticketEvent?.ticketsGranted === 1 &&
+      ticketEvent?.act === 'ticket' &&
+      ticketTally !== null &&
+      ticketTally.triggers === ticketTally.attributed &&
+      ticketTally.events === ticketTally.attributed &&
+      ticketEffect.statusLine.includes('票币'),
+    `Δ筹码=${delta('chips')} Δspent=${delta('spent')} Δearned=${delta('earned')} ` +
+      `Δ票券=${delta('tickets')} Δ分源effect=${delta('ticketEffect')}（事件记 ${ticketEvent?.ticketsGranted} 张）` +
+      `｜逐效果分账 ${JSON.stringify(ticketTally)}｜HUD="${(ticketEffect?.statusLine ?? '').slice(0, 48)}"`,
   );
   const water = await page.evaluate(() => {
     const s = window.__THREE_GAME_DIAGNOSTICS__;
@@ -3732,16 +4254,95 @@ async function runXixi(page) {
       ? {
           coin: s.endless.coinEffectWaterTotal,
           draft: s.endless.draftWaterTotal,
-          hazardAfter: s.endless.hazardAfterDrops,
-          hazardEvery: s.endless.hazardEveryDrops,
+          table: s.endless.coinEffectTable ?? [],
         }
       : null;
   });
   check(
-    'S2 池水门：两张效果表的水量合计都是 0（催债币是汇不是源；奖励换的是别的货币）',
+    'S2 池水门：两张效果表的水量合计都是 0（催债币与票币都不往筹码账里加东西；奖励换的是别的货币）',
       water !== null && water.coin === 0 && water.draft === 0,
-      `币种效果 Σwater=${water?.coin}、波间奖励 Σwater=${water?.draft}；` +
-        `危险注入表 第 ${water?.hazardAfter} 投起、每 ${water?.hazardEvery} 投一枚（判据读引擎，不抄数）`,
+    `币种效果 Σwater=${water?.coin}、波间奖励 Σwater=${water?.draft}；` +
+      `注入表逐条 ${JSON.stringify(water?.table?.map((row) => `${row.id}:w${row.water}@第${row.afterDrops}投/每${row.everyDrops}投/带${row.aheadOfLine.join('~')}`))}` +
+      '（判据读引擎表，不抄数）',
+  );
+
+  /*
+   * ── 计划 2b 的第二半：把「池水总量」做成**确定性棘轮**，不是抽样比率 ──
+   * 计划原文要的是「economy 加一条『池水总量 ≤ 1.0 × FAUCET_BUDGET_PER_DROP』门」。
+   * 两条实测把它否了（都不是"感觉不行"）：
+   *   ① 现档每投免费币按 `xixi.ts` 的唯一算式落在 [0.43, 1.12] × 红线，**上段本就压过 1.0**，
+   *      照原文装下去就是永久红 —— 而永久红的门等于没有门，还会诱导后人抬阈值消红；
+   *   ② 分子是**每摇 1~40 枚**的重尾量，economy 里摇奖又极稀（n=20 批 2226 投只摇 9 次 ⇒ 0.45 次/局）
+   *      ⇒ 任何贴着均值的抽样界都会随机翻红（记忆 feedback-threshold-margin-not-reading）。
+   * ⇒ 换成的形态：**每个因子都从引擎现读**（outcome 权重、符号权重、四同池、每场枚数、兜底枚数），
+   *   脚本里只保留算术和那一行上限常数 ⇒ 零样本、逐位可复现；
+   *   抬任何一档 `count` 都会先让它红（变异臂：`tower.count` 16→17 ⇒ +0.0062 ⇒ 只有这条门该红）。
+   * ⚠️ 它守的是「**谁都不能悄悄往盘面加水**」，**不**守「总水量 ≤ 红线」——后者今天就是压线的，
+   *   那个事实由 economy 段的 `[info] 2b 池水读数` 打印与 README 的偏离记录承担，别把这条读成那条。
+   */
+  const nominal = await page.evaluate(async () => {
+    const xixi = await import('/src/game/xixi.ts');
+    const shows = await import('/src/systems/ShowDirector.ts');
+    const specs = shows.ShowDirector.showSpecs();
+    const fallback = shows.BOOST_OVERFLOW_FALLBACK;
+    const totalOutcome = xixi.outcomeTotalWeight();
+    const pWin3 = xixi.SLOT_OUTCOME_WEIGHTS.win3 / totalOutcome;
+    const pWin4 = xixi.SLOT_OUTCOME_WEIGHTS.win4 / totalOutcome;
+    const weights = xixi.SLOT_SYMBOL_WEIGHTS;
+    const totalWeight = weights.reduce((sum, entry) => sum + entry.weight, 0);
+    /*
+     * 符号 → 演出的对账口。**只有 `boost` 允许没有演出**（它给的是加力/行程，不是币 ⇒ 记 0 枚，
+     * 与 `xixi.ts` 算式里「力那一档 = 0」同构）。新增符号却忘了配演出时这里返回 null ⇒ 判红不判绿，
+     * 绝不静默按 0 算（那正是"把没测到写成合格"的同族）。
+     */
+    const coinOf = (symbol, jackpotFirst) => {
+      if (symbol === 'boost') return 0;
+      const spec = specs[symbol];
+      return spec ? (jackpotFirst ? (spec.jackpot ?? spec.count) : spec.count) : null;
+    };
+    const probed = [...new Set([...weights.map((entry) => entry.symbol), ...xixi.SLOT_TIER4_SYMBOLS])];
+    const unmapped = probed.filter((symbol) => coinOf(symbol, true) === null);
+    if (unmapped.length > 0) return { unmapped };
+    // 三同：每个符号演自己那一场的 `count`；四同：只在 `SLOT_TIER4_SYMBOLS` 里**等权**
+    //   （泉不在池，理由写在 `xixi.ts` 那段），取 `jackpot ?? count`。
+    const perWin3 = weights.reduce(
+      (sum, entry) => sum + (entry.weight / totalWeight) * coinOf(entry.symbol, false),
+      0,
+    );
+    const tier4 = xixi.SLOT_TIER4_SYMBOLS;
+    const perWin4 = tier4.reduce((sum, symbol) => sum + coinOf(symbol, true), 0) / tier4.length;
+    // 兜底：力三同且加力存满 ⇒ 改派一场 `gate` 小型补货。枚数取活表，P(已满) 按**上界 1** 记
+    //   （真实值测到过但分母只有 2 ⇒ 不能拿点值当界，见 `xixi.ts` 的 ②）。
+    const boostShare = weights.find((entry) => entry.symbol === 'boost').weight / totalWeight;
+    const fallbackUpper = pWin3 * boostShare * fallback.count;
+    const base = pWin3 * perWin3 + pWin4 * perWin4;
+    return {
+      base,
+      upper: base + fallbackUpper,
+      perWin3,
+      perWin4,
+      pWin3,
+      pWin4,
+      fallbackUpper,
+      fallbackShow: fallback.show,
+      counts: Object.entries(specs)
+        .map(([id, spec]) => `${id} ${spec.count}${spec.jackpot ? `/大奖${spec.jackpot}` : ''}`)
+        .join('、'),
+    };
+  });
+  // 上限 3.40 = 现档标定上界（`xixi.ts`：2.911 + 0.485 = 3.396），多出的 0.004 只够四舍五入，**不够加一枚**。
+  check(
+    'S2 名义水量棘轮：每摇奖交付的免费币上界不超过现档标定值（抬任何一档演出枚数都会先红在这里）',
+    nominal !== null && nominal.unmapped === undefined && nominal.upper <= 3.4,
+    nominal === null || nominal.unmapped !== undefined
+      ? nominal?.unmapped
+        ? `符号没有对应演出：${JSON.stringify(nominal.unmapped)} ⇒ 表脱钩，判红不判绿（不静默按 0 算）`
+        : '引擎没给（`ShowDirector.showSpecs()` 或 xixi 权重表读不到）⇒ 判红不判绿'
+      : `名义 ${nominal.base.toFixed(4)} + 兜底上界 ${nominal.fallbackUpper.toFixed(4)} ` +
+          `= **${nominal.upper.toFixed(4)} 枚/摇奖**（上限 3.40）｜三同均 ${nominal.perWin3.toFixed(3)}、` +
+          `四同均 ${nominal.perWin4.toFixed(3)}｜P(3同)=${nominal.pWin3.toFixed(3)} P(4同)=${nominal.pWin4.toFixed(3)}` +
+          `｜兜底走 ${nominal.fallbackShow}｜每场枚数现读 ${nominal.counts}` +
+          `（全部因子读引擎活表，脚本只留算术与这一行上限）`,
   );
 
   /*
@@ -5245,6 +5846,11 @@ async function runAcceptance(page, context) {
     box.bottom <= layout.viewport.height + 1 &&
     box.right <= layout.viewport.width + 1;
   const visible = (box) => box !== null && box.width > 0 && box.height > 0;
+  const insideNames = [
+    ['投币', layout.drop],
+    ['资源', layout.credits],
+    ['加注', layout.bet],
+  ].filter(([, box]) => !inside(box)).map(([name, box]) => `${name}(右 ${Math.round(box?.right ?? -1)}/下 ${Math.round(box?.bottom ?? -1)})`);
   check(
     '⑭ 390×844 下投币/资源/加注都在视窗内，加力未充能时隐藏',
     inside(layout.drop) &&
@@ -5252,6 +5858,8 @@ async function runAcceptance(page, context) {
       inside(layout.bet) &&
       (!visible(layout.boost) || inside(layout.boost)),
     `视窗 ${layout.viewport.width}×${layout.viewport.height}，` +
+      // 红了要一眼看出是哪颗按钮出了界（原来这条只打视口与加力态，归因得再跑一次浏览器）。
+      `出界：${insideNames.join(' ') || '（无）'}｜` +
       `加力${visible(layout.boost) ? '可见' : '隐藏（未充能）'}`,
   );
   await mobile.close();
@@ -5497,6 +6105,13 @@ async function runPayoutCheck(page) {
   // 返币钉在最前沿一行，开局几轮就会掉出来）。
   const collected = [];
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    // ⚠️ 这条循环不是挂死：`playRun` 一局要 4~5 分钟（仿真锁实时），而返币只占盘面 4%，
+    //    最多三局才退出 —— 中间原本**一行都不打**，于是 10~15 分钟的沉默被两次误读成"accept 卡住"
+    //    （10-07 14:09Z 与 14:26Z，第二次我甚至在 16 分钟时把它杀了）。
+    //    补一行进度：沉默必须能自证在推进，不然归因成本比这条判据本身还贵。
+    console.log(
+      `  [info] ⑨ 第 ${attempt + 1}/3 局：找一枚真的越线的绿色返币筹码（每局约 4~5 分钟，锁实时）…`,
+    );
     await playRun(page);
     collected.push(...(await readTelemetry(page)).scoreEvents);
     if (collected.some((event) => event.kind === 'payout')) break;
@@ -7533,7 +8148,7 @@ async function runCamera(page, context) {
    *   —— `:313-314` 那条注释早就说过"灰掉的按钮才读作不能按"，但实现里留着 0.55，
    *   注释与代码各说一套。这条把它钉成静态判据（不依赖"此刻恰好有个禁用按钮"）。
    *
-   * 七条 G-门（本模式这五条 + xixi 段的 G-调色板 / G-计数灯）各配一条 `UI_NEG_ARM` 变异臂，
+   * 八条 G-门（本模式这六条 + xixi 段的 G-调色板 / G-计数灯）各配一条 `UI_NEG_ARM` 变异臂，
    * 臂名与判据的对应写在 `UI_NEG_ARMS` 里；跑法与实测结果记在 README 的验证表。
    */
   await applyUiNegArm(page);
@@ -7666,6 +8281,81 @@ async function runCamera(page, context) {
     'G-字号：#hud 内可见文本的 computed font-size 全部 ≥ 11px（0.6rem 那批 <small> 要换成计数灯）',
       smallText !== null && smallText.length === 0,
       `低于 11px 的节点：${(smallText ?? ['(没有 #hud)']).slice(0, 8).join(' ')}${smallText && smallText.length > 8 ? ' …' : ''}`,
+  );
+
+  /*
+   * G-铭牌（Stage 3b 的最后一格）：机关行每颗按钮的名字必须是 **pixelText 画出来的像素字**，
+   * 而 DOM 里那段文本**还得在**（读屏与将来的判据靠它，画布里的字机器读不到）。
+   *
+   * 三条一起断才不算自证：
+   *   ① 按钮里有 `canvas.nameplate` 且宽高非零 —— 只是"挂了个画布"不够；
+   *   ② 画布上数得出墨（非透明像素 > 0）—— 抓"画布是空的/画歪了/尺寸 0"；
+   *   ③ DOM `<span>` 的文本仍在且被收进"只给读屏"的形态 —— 抓"把文字删了换图"这种
+   *      把无障碍一起丢掉的假统一。
+   * ⚠️ 文案不从判据里抄：断言只说"DOM 有文本、画布有墨"，具体那几个字由 `index.html` 给。
+   */
+  const nameplates = await page.evaluate(() => {
+    const buttons = [...document.querySelectorAll('#mechanism-row button')];
+    return buttons.map((button) => {
+      const canvas = button.querySelector('canvas.nameplate');
+      const name = button.querySelector('span');
+      let inked = 0;
+      if (canvas instanceof HTMLCanvasElement && canvas.width > 0 && canvas.height > 0) {
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+          for (let i = 3; i < data.length; i += 4) if (data[i] > 0) inked += 1;
+        }
+      }
+      const style = name ? getComputedStyle(name) : null;
+      return {
+        id: button.id,
+        hasCanvas: canvas !== null,
+        size: canvas ? `${canvas.width}×${canvas.height}` : '—',
+        inked,
+        text: name?.textContent?.trim() ?? '',
+        hiddenForSight: style !== null && (style.clipPath !== 'none' || style.width === '1px'),
+      };
+    });
+  });
+  check(
+    'G-铭牌：机关行按钮的名字走 pixelText（画布有墨），且 DOM 文本仍在只给读屏的形态',
+      nameplates.length > 0 &&
+      nameplates.every((p) => p.hasCanvas && p.inked > 0 && p.text.length > 0 && p.hiddenForSight),
+    `${nameplates.length} 颗：${nameplates.map((p) => `${p.id}=${p.size}/${p.inked}墨/${p.text}${p.hiddenForSight ? '(藏)' : '(露)'}`).join(' ')}`,
+  );
+
+  /*
+   * G-硬边（Stage 3b 里"圆角 8~14px → 0~2px"那一格）：HUD 里**可见元素**的 computed
+   * `border-radius` 不许超过 2px。
+   *
+   * ★ 为什么必须现读而不是 grep CSS：写这条之前我先用浏览器量了一遍，
+   *   结果是 **10 个可见元素还在 8~12px 与 999px**（四颗机关键 9px、投币键外壳 12px、
+   *   暂停/收藏 8px、`#xixi-marks`/`#mark-note`/`#combo-toast` 三枚胶囊 999px）——
+   *   那轮"硬边化"只改了面板，按钮与胶囊整个漏掉，而 CSS 文本里看不出这个缺口。
+   * ⚠️ 投币键那颗**圆形按钮帽**是 `#drop-button::before` 伪元素画的，伪元素不在这条的取样面里
+   *   （`querySelectorAll` 拿不到它）⇒ 白名单是空的：外壳也要方，圆的只该是那顶帽。
+   */
+  const radii = await page.evaluate(() => {
+    const hud = document.querySelector('#hud');
+    if (!hud) return null;
+    const offenders = [];
+    for (const el of [hud, ...hud.querySelectorAll('*')]) {
+      if (el.offsetParent === null && el !== hud) continue;
+      const style = getComputedStyle(el);
+      for (const corner of ['borderTopLeftRadius', 'borderTopRightRadius', 'borderBottomLeftRadius', 'borderBottomRightRadius']) {
+        const value = parseFloat(style[corner]);
+        if (Number.isFinite(value) && value > 2) {
+          offenders.push(`${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ''}:${corner.replace('border', '').replace('Radius', '')}=${value}`);
+        }
+      }
+    }
+    return offenders;
+  });
+  check(
+    'G-硬边：#hud 内可见元素的 computed border-radius 全部 ≤ 2px（圆形只留给伪元素画的那顶按钮帽）',
+      radii !== null && radii.length === 0,
+    `超过 2px 的角 ${radii?.length ?? '—'} 个：${(radii ?? ['(没有 #hud)']).slice(0, 10).join(' ')}`,
   );
 
   const near = (a, b, eps) => Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= eps;

@@ -2,8 +2,21 @@ import { ENDLESS } from '../game/constants';
 import { spendableOf } from '../game/economy';
 import { COIN_SKINS, CABINET_SKINS } from '../game/cosmetics';
 
-/** 一局的历史记录（排行榜三列：赚进 / 存活投数 / 跪求次数）。 */
-export type RunRecord = { earned: number; drops: number; begs: number };
+/**
+ * 一局的历史记录（排行榜三列：赚进 / 存活投数 / 跪求次数，外加 1b 的票券一列）。
+ *
+ * ★ 字段名叫 `ticketEarned` 而不是"tickets"：一张票券会被三选一**花掉**，所以
+ *   "本局挣了几张"（挣 12 花 9）与"收工还剩几张"（3）是两个数，写进同一份持久化记录里
+ *   只留一个裸名字，下一个读代码的人必然挑错一个。这里记的是**挣**那一头 ——
+ *   记录是成绩单，不是钱包；`RunState.tickets` 那个余额收工即归零、本来也不跨局。
+ *
+ * ⚠️ 为什么是**可选键**而不是必填：载入走的是 `private parse(raw, base)`，它对 `runs` 只做一层
+ *   `Array.isArray(parsed.runs) ? parsed.runs : base.runs`（现读该行在 `:538`），
+ *   **不逐条字段归一化** ⇒ 老存档里的记录就是没有这个键。若改成必填并在载入处补 0，
+ *   会连带改掉 `tests/save-migration.spec.ts:336` 那条 `toEqual` 的精确形状断言 ——
+ *   那是**验证面改动，要用户点头**，所以这里用"缺键 = 这条记录早于 1b"如实描述数据。
+ */
+export type RunRecord = { earned: number; drops: number; begs: number; ticketEarned?: number };
 
 export type SaveData = {
   /**
@@ -403,11 +416,21 @@ export class SaveStore {
     this.write();
   }
 
-  /** 记录一局：最高赚进、排行榜与累计跪求次数。 */
-  recordRun(earned: number, drops: number, begs: number): { best: number; totalBegs: number } {
+  /**
+   * 记录一局：最高赚进、排行榜（赚进 / 存活投数 / 跪求 / **本局挣到的票券**）与累计跪求次数。
+   *
+   * `ticketEarned` 由调用方给**收工那一刻**的 snapshot 值（`Game.endRun` 里同一个对象），
+   * 不在这里现读第二次 —— 那是"同一个动作两个口袋各记一遍"，S4 刚清掉那种。
+   */
+  recordRun(
+    earned: number,
+    drops: number,
+    begs: number,
+    ticketEarned: number,
+  ): { best: number; totalBegs: number } {
     this.data.bestEarned = Math.max(this.data.bestEarned, earned);
     this.data.totalBegs += begs;
-    this.data.runs.unshift({ earned, drops, begs });
+    this.data.runs.unshift({ earned, drops, begs, ticketEarned });
     this.data.runs = this.data.runs.slice(0, 10);
     this.write();
     return { best: this.data.bestEarned, totalBegs: this.data.totalBegs };

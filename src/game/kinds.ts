@@ -13,7 +13,15 @@
 
 import type { CoinEffectId } from './effects';
 
-export type CoinKindId = 'bronze' | 'pattern' | 'payout' | 'bounty' | 'diamond' | 'chest' | 'debt';
+export type CoinKindId =
+  | 'bronze'
+  | 'pattern'
+  | 'payout'
+  | 'bounty'
+  | 'diamond'
+  | 'chest'
+  | 'debt'
+  | 'ticket';
 /** 兼容旧名（`CoinKind` 在 constants 里一直是 `keyof typeof COIN_KIND`）。 */
 export type CoinKind = CoinKindId;
 
@@ -62,7 +70,7 @@ export type CoinKindSpec = {
 };
 
 /**
- * 七种币（10-07 Stage 2 加了催债币）。**返值数值刻意放在这里**（而不是 `ENDLESS`）：
+ * 八种币（10-07 Stage 2 加了催债币与票币）。**返值数值刻意放在这里**（而不是 `ENDLESS`）：
  * 「这个币种值多少」是币种自身的属性，数值与身份分家就是「5 处清单」的根源。
  * `ENDLESS` 只留模式级调参（买入、连落窗口、注入率等）。
  *
@@ -289,7 +297,7 @@ export const KINDS: Record<CoinKindId, CoinKindSpec> = {
     // ★ Stage 2：`effect` 形态的第一个真用户 —— 越线**不返筹码**，反而按余额比例扣一笔
     //   （同一张 `fineRatio` 表，见 `xixi.ts`；扣减走 `RunState.settleFine` 那条唯一出口，
     //   所以三账本恒等式一个字不改）。它是**汇**不是源：不往盘面加币，`water` 为 0。
-    //   深度到 `HAZARD_AFTER_DROPS` 之后按 `HAZARD_EVERY_DROPS` 注入，越深的局越凶。
+    //   深度到 `COIN_EFFECT_SPECS.debtCoin.inject.afterDrops` 之后按 `everyDrops` 注入，越深的局越凶。
     payout: { mode: 'effect', effect: 'debtCoin' },
     glyph: '债',
     // 红色是玩法里的"危险"色（与 `--danger` 同支），但它**不进 ClimaxTone**：
@@ -298,6 +306,24 @@ export const KINDS: Record<CoinKindId, CoinKindSpec> = {
     glow: { color: '#d0674a', intensity: 0.55 },
     lockedPalette: { base: '#7c3a2c', dark: '#38160f', ink: '#f2d9c8' },
     audioHz: 180,
+    climax: null,
+  },
+  ticket: {
+    id: 'ticket',
+    label: '票币',
+    // ★ Stage 2c 的第二档效果币：越线**返 0 筹码**，改发 1 张票券（`COIN_EFFECT_SPECS.ticketCoin`）。
+    //   它是"四个票券源"里唯一挂在**盘面**上的那一个 —— 另外三条（每 N 枚越线、连落到档、四同）
+    //   都不需要一枚专门的币。所以这条的真实作用是**端到端验证 `effect` 协议的另一侧**：
+    //   同一条分派链，一条走 `settleFine`（出账），一条走 `earnTicket`（另一种货币）。
+    //   ⚠️ 筹码账为 0 不代表"没给东西"：票券有它自己的恒等式 `tickets === earned − spent`，
+    //   池水门数的是筹码，两条互不挤占（理由见 `effects.ts` 文件头）。
+    payout: { mode: 'effect', effect: 'ticketCoin' },
+    glyph: '票',
+    // 薄荷绿：与 `payout` 的"返币绿"分开一档色相，避免"看着像会返筹码的绿币却不返"这种骗人画面。
+    // 和催债币一样**不进 ClimaxTone**（那四处联动的成本由"要不要全屏闪"决定，不靠它做识别）。
+    glow: { color: '#79d6bd', intensity: 0.5 },
+    lockedPalette: { base: '#2f6f66', dark: '#173b36', ink: '#eafaf5' },
+    audioHz: 660,
     climax: null,
   },
 };
@@ -314,12 +340,27 @@ export const COIN_KIND = Object.fromEntries(
 export const FIXED_KINDS = COIN_KINDS.filter((id) => KINDS[id].payout.mode === 'fixed');
 
 /**
- * 效果型币种（返 0 筹码，派发演出）。
+ * 效果型币种（返 0 筹码，改由 `CoinEffects.dispatchCoin` 结算）。
  *
- * ⚠️ **S16 起是空数组**（宝箱改成 `fixed` 50 之后没有币种再用 `effect`）。
- * 保留它是因为 `Game` / `economy` 的分派分支也保留了 —— 见 `KindPayout` 的注释。
+ * ⚠️ 这条注释曾写"S16 起是空数组"——**已失效**：Stage 2 之后 `debt`（催债币）重新用 `effect`，
+ * 10-07 的 2c 又加了 `ticket`（票币），所以现在有两条。保留它是因为 `Game` / `economy` 的
+ * 分派分支也一直在 —— 见 `KindPayout` 的注释。
  */
 export const EFFECT_KINDS = COIN_KINDS.filter((id) => KINDS[id].payout.mode === 'effect');
+
+/**
+ * 效果 id → 币种（注入表用它拿币面，**不在第二处写 kind 名**）。
+ *
+ * 反方向（`kindForEffect`）是真源：`payout.effect` 已经写在上面那张表里，这里只是查它。
+ * 某个效果 id 没有对应币种时返回 `undefined` —— 那不该发生，`xixi` 的映射门逐 id 断言它非空，
+ * 而调用方（`Game.spawnEffectCoin`）在拿不到时**什么都不注入**，绝不套一个错的币面骗人。
+ */
+export function kindForEffect(effect: CoinEffectId): CoinKindId | undefined {
+  return COIN_KINDS.find((id) => {
+    const payout = KINDS[id].payout;
+    return payout.mode === 'effect' && payout.effect === effect;
+  });
+}
 
 export function kindSpec(kind: CoinKindId): CoinKindSpec {
   return KINDS[kind];
